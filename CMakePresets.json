@@ -1,0 +1,55 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "win-x64-debug",
+            "displayName": "Windows x64 (Debug)",
+            "binaryDir": "${sourceDir}/build/win-x64-debug",
+            "generator": "Ninja",
+            "toolchainFile": "${sourceDir}/third_party/vcpkg/scripts/buildsystems/vcpkg.cmake",
+            "cacheVariables": {
+                "VCPKG_TARGET_TRIPLET": "x64-windows-static-md",
+                "CMAKE_BUILD_TYPE": "Debug"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "win-x64-release",
+            "inherits": "win-x64-debug",
+            "displayName": "Windows x64 (Release)",
+            "binaryDir": "${sourceDir}/build/win-x64-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "mac-arm64-release",
+            "displayName": "macOS arm64 (Release)",
+            "binaryDir": "${sourceDir}/build/mac-arm64-release",
+            "generator": "Ninja",
+            "toolchainFile": "${sourceDir}/third_party/vcpkg/scripts/buildsystems/vcpkg.cmake",
+            "cacheVariables": {
+                "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/overlay-triplets",
+                "VCPKG_TARGET_TRIPLET": "arm64-osx",
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "CMAKE_OSX_DEPLOYMENT_TARGET": "11.0"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "win-x64-debug",     "configurePreset": "win-x64-debug" },
+        { "name": "win-x64-release",   "configurePreset": "win-x64-release" },
+        { "name": "mac-arm64-release", "configurePreset": "mac-arm64-release" }
+    ]
+}

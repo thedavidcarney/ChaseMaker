@@ -1,0 +1,57 @@
+# --- Vendored SDKs (license-restricted, must NEVER be committed) ---
+third_party/AfterEffectsSDK/
+
+# --- Build outputs ---
+build/
+out/
+cmake-build-*/
+release/
+
+# --- Visual Studio / VS Code local state ---
+.vs/
+.vscode/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+CMakeUserPresets.json
+
+# --- vcpkg ---
+vcpkg/
+vcpkg_installed/
+
+# --- macOS / Xcode (for when we build on Mac) ---
+.DS_Store
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# --- Compiled plugin binaries ---
+*.aex
+*.plugin
+*.bundle
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.dylib
+*.so
+*.exp
+*.pdb
+*.idb
+*.ilk
+
+# --- Misc ---
+*.log
+Thumbs.db
+
+# --- Claude Code per-user state (settings.json IS shareable; .local.json is not) ---
+.claude/settings.local.json
+
+# --- Python diagnostic tooling cache ---
+__pycache__/
+*.pyc

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "chasemaker",
+  "version": "0.1.0",
+  "description": "AEGP panel plugin for building virtual light chases from per-light EXR passes",
+  "homepage": "https://github.com/thedavidcarney/ChaseMaker",
+  "license": "MIT",
+  "dependencies": [
+    "openexr",
+    "imath"
+  ]
+}
