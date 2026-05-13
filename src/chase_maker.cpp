@@ -22,6 +22,8 @@
 #include "AE_Macros.h"
 #include "AEGP_SuiteHandler.h"
 
+#include "panel_renderer.h"
+
 // Match name (panel-suite calls): A_u_char* / UTF-8 byte string.
 // Menu label (command-suite calls): A_char* / signed char.
 // The SDK signs them differently so we keep two typed handles.
@@ -164,24 +166,28 @@ private:
     }
 
     static A_Err S_CreatePanelHook(
-        AEGP_GlobalRefcon plugin_refcon,
+        AEGP_GlobalRefcon /*plugin_refcon*/,
         AEGP_CreatePanelRefcon /*refcon*/,
-        AEGP_PlatformViewRef /*container*/,
+        AEGP_PlatformViewRef container,
         AEGP_PanelH /*panelH*/,
         AEGP_PanelFunctions1* outFunctionTable,
         AEGP_PanelRefcon* outRefcon)
     {
-        // Hello-world: no per-panel state, no platform child view.
-        // Just wire the function table to no-op stubs and hand AE
-        // back the plugin pointer as the refcon (anything non-null
-        // works; AE doesn't deref it).
         if (outFunctionTable) {
             outFunctionTable->GetSnapSizes    = PanelGetSnapSizes;
             outFunctionTable->PopulateFlyout  = PanelPopulateFlyout;
             outFunctionTable->DoFlyoutCommand = PanelDoFlyoutCommand;
         }
+
+        // Hand the platform container to the renderer factory. On
+        // Win, container is HWND; on Mac, NSView*. CreatePanelRenderer
+        // does the platform-specific bring-up (DX11 swap chain or
+        // MTKView + Metal device) and wires Dear ImGui to it.
+        PanelRenderer* renderer = CreatePanelRenderer(
+            reinterpret_cast<void*>(container));
+
         if (outRefcon) {
-            *outRefcon = reinterpret_cast<AEGP_PanelRefcon>(plugin_refcon);
+            *outRefcon = reinterpret_cast<AEGP_PanelRefcon>(renderer);
         }
         return A_Err_NONE;
     }

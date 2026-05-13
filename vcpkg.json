@@ -7,6 +7,26 @@
   "license": "MIT",
   "dependencies": [
     "openexr",
-    "imath"
+    "imath",
+    {
+      "name": "imgui",
+      "default-features": false,
+      "features": [
+        "docking-experimental",
+        "dx11-binding",
+        "win32-binding"
+      ],
+      "platform": "windows"
+    },
+    {
+      "name": "imgui",
+      "default-features": false,
+      "features": [
+        "docking-experimental",
+        "metal-binding",
+        "osx-binding"
+      ],
+      "platform": "osx"
+    }
   ]
 }

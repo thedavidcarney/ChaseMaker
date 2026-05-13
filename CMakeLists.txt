@@ -27,6 +27,7 @@ endif()
 # ----- Dependencies -----
 find_package(OpenEXR CONFIG REQUIRED)
 find_package(Imath CONFIG REQUIRED)
+find_package(imgui CONFIG REQUIRED)
 
 # ----- AE SDK location (gitignored, dropped in by user per third_party/README.md) -----
 set(AE_SDK_ROOT "${CMAKE_SOURCE_DIR}/third_party/AfterEffectsSDK")
@@ -64,6 +65,12 @@ add_library(ChaseMaker MODULE
     "${AE_SDK_UTIL}/MissingSuiteError.cpp"
 )
 
+if(WIN32)
+    target_sources(ChaseMaker PRIVATE src/panel_renderer_win.cpp)
+elseif(APPLE)
+    target_sources(ChaseMaker PRIVATE src/panel_renderer_mac.mm)
+endif()
+
 target_include_directories(ChaseMaker PRIVATE
     "${AE_SDK_HEADERS}"
     "${AE_SDK_HEADERS}/SP"
@@ -75,6 +82,7 @@ target_include_directories(ChaseMaker PRIVATE
 target_link_libraries(ChaseMaker PRIVATE
     OpenEXR::OpenEXR
     Imath::Imath
+    imgui::imgui
 )
 
 if(WIN32)
@@ -84,6 +92,9 @@ if(WIN32)
         SUFFIX ".aex"
         PREFIX ""
     )
+
+    # DX11 + DXGI for the ImGui DirectX backend.
+    target_link_libraries(ChaseMaker PRIVATE d3d11 dxgi d3dcompiler)
 
     # ----- PiPL build pipeline (Windows) -----
     # Apple Resource (.r) -> .rr -> PiPLtool -> .rrc -> Windows .rc
@@ -118,6 +129,11 @@ elseif(APPLE)
     set_source_files_properties(src/chase_maker.cpp PROPERTIES
         LANGUAGE OBJCXX)
 
+    # The Mac panel renderer uses ObjC ARC for tidy ownership of the
+    # MTKView / device / delegate references stored in the C++ class.
+    set_source_files_properties(src/panel_renderer_mac.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc")
+
     # Build a proper .plugin bundle (not a bare .dylib). AE looks for
     # CFBundlePackageType = "eFKT" inside the bundle's Info.plist.
     set_target_properties(ChaseMaker PROPERTIES
@@ -133,9 +149,21 @@ elseif(APPLE)
 
     # Frameworks: AppKit (Cocoa) for any native UI bridging, CoreFoundation
     # for A_UTF16Char path conversion in AEGP file-picker callbacks.
+    # Metal/MetalKit/QuartzCore for the ImGui Metal renderer.
+    # GameController is a link-only dependency: imgui_impl_osx.mm imports
+    # <GameController/GameController.h> at the top of the file for
+    # optional gamepad input, and the reference exists in the .o even
+    # though our code never calls into GCController. The framework is
+    # lazy-loaded by the OS — no runtime cost until something actually
+    # uses it, which we don't. No way to drop the link without patching
+    # ImGui upstream.
     target_link_libraries(ChaseMaker PRIVATE
         "-framework Cocoa"
         "-framework CoreFoundation"
+        "-framework Metal"
+        "-framework MetalKit"
+        "-framework QuartzCore"
+        "-framework GameController"
     )
 
     # ----- PiPL build pipeline (macOS) -----
