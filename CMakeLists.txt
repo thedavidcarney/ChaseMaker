@@ -113,6 +113,11 @@ elseif(APPLE)
     target_include_directories(ChaseMaker PRIVATE "${AE_SDK_HEADERS}/Mac")
     target_compile_definitions(ChaseMaker PRIVATE macintosh)
 
+    # AE_GeneralPlugPanels.h pulls in <Cocoa/Cocoa.h> on Mac, so
+    # anything that includes it has to be compiled as Objective-C++.
+    set_source_files_properties(src/chase_maker.cpp PROPERTIES
+        LANGUAGE OBJCXX)
+
     # Build a proper .plugin bundle (not a bare .dylib). AE looks for
     # CFBundlePackageType = "eFKT" inside the bundle's Info.plist.
     set_target_properties(ChaseMaker PROPERTIES
