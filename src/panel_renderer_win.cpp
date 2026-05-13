@@ -8,6 +8,10 @@
 // chaining WM_PAINT to the old proc.
 
 #include "panel_renderer.h"
+#include "panel_state.h"
+#include "panel_ui.h"
+#include "file_dialog.h"
+#include "exr_scan.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -68,7 +72,12 @@ public:
 
         switch (msg) {
         case WM_PAINT: {
-            RenderFrame();
+            // Skip our own DX11 paint while a modal file dialog is
+            // pumping messages — the OS still delivers WM_PAINT to
+            // expose-uncovered regions and we'd reenter ImGui.
+            if (!i_in_dialog) {
+                RenderFrame();
+            }
             ValidateRect(i_host, nullptr);
             return 0;
         }
@@ -186,30 +195,21 @@ private:
     void RenderFrame()
     {
         if (!i_imguiCtx || !i_rtv) return;
+        if (i_frame_in_progress) return;   // skip reentrant calls
+        i_frame_in_progress = true;
         ImGui::SetCurrentContext(i_imguiCtx);
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // Hello-world content. Will be replaced by the real Chase
-        // Maker UI in a later bite. Single full-panel window pinned
-        // to the host's client area so the layout follows panel
-        // resizes for free.
         RECT rc;
         GetClientRect(i_host, &rc);
-        const ImVec2 size(
+        panel_ui::RenderFrame(&i_state,
             static_cast<float>(rc.right - rc.left),
-            static_cast<float>(rc.bottom - rc.top));
-        ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(size);
-        ImGui::Begin("ChaseMakerRoot", nullptr,
-            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-            ImGuiWindowFlags_NoBringToFrontOnFocus);
-        ImGui::Text("Hello, Chase Maker (Windows / DX11)");
-        ImGui::Text("Panel: %.0f x %.0f", size.x, size.y);
-        ImGui::End();
+            static_cast<float>(rc.bottom - rc.top),
+            i_host,
+            "Windows / DX11");
 
         ImGui::Render();
 
@@ -218,6 +218,34 @@ private:
         i_context->ClearRenderTargetView(i_rtv, clearColor);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         i_swapChain->Present(1, 0);
+
+        i_frame_in_progress = false;
+
+        // Drain any deferred actions the UI requested this frame.
+        // These spin nested message loops (file dialog) or do disk
+        // I/O (sidecar) — must not run while ImGui is mid-frame.
+        HandleDeferredActions();
+    }
+
+    void HandleDeferredActions()
+    {
+        if (i_state.want_pick_exr.exchange(false)) {
+            // KillTimer so WM_TIMER doesn't fire (and trigger paint)
+            // while the dialog's modal loop is spinning.
+            KillTimer(i_host, kRedrawTimerId);
+            i_in_dialog = true;
+            std::string path = file_dialog::PickExr(i_host);
+            i_in_dialog = false;
+            SetTimer(i_host, kRedrawTimerId, kRedrawIntervalMs, nullptr);
+            if (!path.empty()) {
+                exr_scan::StartScan(path, &i_state);
+            }
+            InvalidateRect(i_host, nullptr, FALSE);
+        }
+        if (i_state.want_write_sidecar.exchange(false)) {
+            exr_scan::WriteLuminositySidecar(&i_state);
+            InvalidateRect(i_host, nullptr, FALSE);
+        }
     }
 
     void Subclass()
@@ -256,6 +284,9 @@ private:
     ID3D11RenderTargetView* i_rtv = nullptr;
     ImGuiContext*           i_imguiCtx = nullptr;
     bool                    i_ready = false;
+    bool                    i_frame_in_progress = false;
+    bool                    i_in_dialog = false;
+    PanelState              i_state;
 };
 
 } // namespace

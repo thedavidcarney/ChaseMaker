@@ -7,6 +7,10 @@
 // releases them in turn.
 
 #include "panel_renderer.h"
+#include "panel_state.h"
+#include "panel_ui.h"
+#include "file_dialog.h"
+#include "exr_scan.h"
 
 #import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
@@ -38,6 +42,7 @@ private:
     id<MTLCommandQueue> __strong       i_commandQueue = nil;
     ChaseMakerMTKViewDelegate* __strong i_delegate = nil;
     ImGuiContext*                      i_imguiCtx = nullptr;
+    PanelState                         i_state;
 };
 
 } // namespace
@@ -150,22 +155,13 @@ void MacPanelRenderer::RenderFrame(MTKView* view)
     ImGui_ImplOSX_NewFrame(view);
     ImGui::NewFrame();
 
-    // Hello-world content. Single full-panel window pinned to the
-    // MTKView's drawable size so layout follows panel resizes.
     const CGSize size = view.drawableSize;
     const CGFloat scale = view.window.backingScaleFactor ?: 1.0;
-    const ImVec2 imSize(
+    panel_ui::RenderFrame(&i_state,
         static_cast<float>(size.width / scale),
-        static_cast<float>(size.height / scale));
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(imSize);
-    ImGui::Begin("ChaseMakerRoot", nullptr,
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoBringToFrontOnFocus);
-    ImGui::Text("Hello, Chase Maker (macOS / Metal)");
-    ImGui::Text("Panel: %.0f x %.0f", imSize.x, imSize.y);
-    ImGui::End();
+        static_cast<float>(size.height / scale),
+        (__bridge void*)i_mtkView,
+        "macOS / Metal");
 
     ImGui::Render();
 
@@ -175,6 +171,22 @@ void MacPanelRenderer::RenderFrame(MTKView* view)
 
     [cmd presentDrawable:view.currentDrawable];
     [cmd commit];
+
+    // Drain deferred UI actions AFTER the frame is fully submitted.
+    // Same rationale as the Windows path: NSOpenPanel.runModal spins
+    // its own event loop and we don't want ImGui's frame state to
+    // be mid-update during that.
+    if (i_state.want_pick_exr.exchange(false)) {
+        i_mtkView.paused = YES;
+        std::string path = file_dialog::PickExr((__bridge void*)i_mtkView);
+        i_mtkView.paused = NO;
+        if (!path.empty()) {
+            exr_scan::StartScan(path, &i_state);
+        }
+    }
+    if (i_state.want_write_sidecar.exchange(false)) {
+        exr_scan::WriteLuminositySidecar(&i_state);
+    }
 }
 
 } // namespace

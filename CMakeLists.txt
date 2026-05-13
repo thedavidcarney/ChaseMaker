@@ -60,15 +60,22 @@ endif()
 # Source files land in Bite 3.
 add_library(ChaseMaker MODULE
     src/chase_maker.cpp
+    src/hash.cpp
+    src/exr_scan.cpp
+    src/panel_ui.cpp
     "${AE_SDK_UTIL}/AEGP_SuiteHandler.cpp"
     "${AE_SDK_UTIL}/AEFX_SuiteHelper.c"
     "${AE_SDK_UTIL}/MissingSuiteError.cpp"
 )
 
 if(WIN32)
-    target_sources(ChaseMaker PRIVATE src/panel_renderer_win.cpp)
+    target_sources(ChaseMaker PRIVATE
+        src/panel_renderer_win.cpp
+        src/file_dialog_win.cpp)
 elseif(APPLE)
-    target_sources(ChaseMaker PRIVATE src/panel_renderer_mac.mm)
+    target_sources(ChaseMaker PRIVATE
+        src/panel_renderer_mac.mm
+        src/file_dialog_mac.mm)
 endif()
 
 target_include_directories(ChaseMaker PRIVATE
@@ -129,10 +136,13 @@ elseif(APPLE)
     set_source_files_properties(src/chase_maker.cpp PROPERTIES
         LANGUAGE OBJCXX)
 
-    # The Mac panel renderer uses ObjC ARC for tidy ownership of the
-    # MTKView / device / delegate references stored in the C++ class.
-    set_source_files_properties(src/panel_renderer_mac.mm PROPERTIES
-        COMPILE_FLAGS "-fobjc-arc")
+    # The Mac panel renderer + file dialog use ObjC ARC for tidy
+    # ownership of the MTKView / NSOpenPanel / delegate references
+    # stored in C++ classes / autoreleasepool scopes.
+    set_source_files_properties(
+        src/panel_renderer_mac.mm
+        src/file_dialog_mac.mm
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
     # Build a proper .plugin bundle (not a bare .dylib). AE looks for
     # CFBundlePackageType = "eFKT" inside the bundle's Info.plist.
@@ -164,6 +174,7 @@ elseif(APPLE)
         "-framework MetalKit"
         "-framework QuartzCore"
         "-framework GameController"
+        "-framework UniformTypeIdentifiers"
     )
 
     # ----- PiPL build pipeline (macOS) -----
