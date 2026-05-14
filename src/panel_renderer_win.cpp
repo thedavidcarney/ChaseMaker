@@ -17,6 +17,8 @@
 #include <d3d11.h>
 #include <dxgi.h>
 
+#include <vector>
+
 #include "imgui.h"
 #include "imgui_internal.h"   // ImGui::ClearActiveID
 #include "imgui_impl_win32.h"
@@ -59,6 +61,7 @@ public:
     {
         KillTimer(i_host, kRedrawTimerId);
         Unsubclass();
+        ReleaseAllThumbnailTextures();
         ShutdownImGui();
         Cleanup();
     }
@@ -247,6 +250,8 @@ private:
         i_frame_in_progress = true;
         ImGui::SetCurrentContext(i_imguiCtx);
 
+        EnsureThumbnailTextures();
+
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -273,6 +278,58 @@ private:
         // These spin nested message loops (file dialog) or do disk
         // I/O (sidecar) — must not run while ImGui is mid-frame.
         HandleDeferredActions();
+    }
+
+    void ReleaseAllThumbnailTextures()
+    {
+        for (auto* srv : i_thumb_srvs) {
+            if (srv) srv->Release();
+        }
+        i_thumb_srvs.clear();
+        i_last_scan_gen = -1;
+    }
+
+    void EnsureThumbnailTextures()
+    {
+        if (!i_state || !i_device) return;
+        const int gen = i_state->scan_generation.load();
+        if (gen != i_last_scan_gen) {
+            ReleaseAllThumbnailTextures();
+            i_last_scan_gen = gen;
+        }
+
+        std::lock_guard<std::mutex> lk(i_state->mu);
+        for (size_t idx = 0; idx < i_state->layers.size(); ++idx) {
+            LayerInfo& L = i_state->layers[idx];
+            if (L.texture_id != 0) continue;
+            if (L.thumb_rgba.empty() || L.thumb_w <= 0 || L.thumb_h <= 0) continue;
+
+            D3D11_TEXTURE2D_DESC desc{};
+            desc.Width = L.thumb_w;
+            desc.Height = L.thumb_h;
+            desc.MipLevels = 1;
+            desc.ArraySize = 1;
+            desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.SampleDesc.Count = 1;
+            desc.Usage = D3D11_USAGE_IMMUTABLE;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+            D3D11_SUBRESOURCE_DATA srd{};
+            srd.pSysMem = L.thumb_rgba.data();
+            srd.SysMemPitch = L.thumb_w * 4;
+
+            ID3D11Texture2D* tex = nullptr;
+            if (FAILED(i_device->CreateTexture2D(&desc, &srd, &tex)) || !tex) {
+                continue;
+            }
+            ID3D11ShaderResourceView* srv = nullptr;
+            HRESULT hr = i_device->CreateShaderResourceView(tex, nullptr, &srv);
+            tex->Release();
+            if (FAILED(hr) || !srv) continue;
+
+            i_thumb_srvs.push_back(srv);
+            L.texture_id = reinterpret_cast<uint64_t>(srv);
+        }
     }
 
     void HandleDeferredActions()
@@ -335,6 +392,8 @@ private:
     bool                    i_frame_in_progress = false;
     bool                    i_in_dialog = false;
     PanelState*             i_state = nullptr;
+    std::vector<ID3D11ShaderResourceView*> i_thumb_srvs;
+    int                     i_last_scan_gen = -1;
 };
 
 } // namespace

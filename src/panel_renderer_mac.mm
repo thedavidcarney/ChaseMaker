@@ -83,6 +83,8 @@ private:
     id<MTLCommandQueue> __strong       i_commandQueue = nil;
     ChaseMakerMTKViewDelegate* __strong i_delegate = nil;
     id __strong                        i_consume_monitor = nil;
+    NSMutableArray<id<MTLTexture>>* __strong i_thumb_textures = nil;
+    int                                i_last_scan_gen = -1;
     ImGuiContext*                      i_imguiCtx = nullptr;
     PanelState*                        i_state = nullptr;
     bool                               i_imgui_inited = false;
@@ -127,6 +129,7 @@ namespace {
 MacPanelRenderer::MacPanelRenderer(NSView* container, PanelState* state)
     : i_container(container), i_state(state)
 {
+    i_thumb_textures = [NSMutableArray array];
     i_device = MTLCreateSystemDefaultDevice();
     if (!i_device) return;
 
@@ -228,6 +231,37 @@ void MacPanelRenderer::RenderFrame(MTKView* view)
     }
     if (!i_imguiCtx) return;
     ImGui::SetCurrentContext(i_imguiCtx);
+
+    // ---- Thumbnail texture cache ----
+    if (i_state) {
+        const int gen = i_state->scan_generation.load();
+        if (gen != i_last_scan_gen) {
+            [i_thumb_textures removeAllObjects];
+            i_last_scan_gen = gen;
+        }
+        std::lock_guard<std::mutex> lk(i_state->mu);
+        for (LayerInfo& L : i_state->layers) {
+            if (L.texture_id != 0) continue;
+            if (L.thumb_rgba.empty() || L.thumb_w <= 0 || L.thumb_h <= 0) continue;
+            MTLTextureDescriptor* td =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                   width:(NSUInteger)L.thumb_w
+                                                                  height:(NSUInteger)L.thumb_h
+                                                               mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead;
+            id<MTLTexture> tex = [i_device newTextureWithDescriptor:td];
+            if (!tex) continue;
+            [tex replaceRegion:MTLRegionMake2D(0, 0, L.thumb_w, L.thumb_h)
+                   mipmapLevel:0
+                     withBytes:L.thumb_rgba.data()
+                   bytesPerRow:L.thumb_w * 4];
+            [i_thumb_textures addObject:tex];
+            // Bridge the texture pointer through to a uint64 ImTextureID.
+            // Lifetime is owned by i_thumb_textures; ImGui never deref's
+            // the value itself.
+            L.texture_id = (uint64_t)(uintptr_t)(__bridge void*)tex;
+        }
+    }
 
     // Re-publish the platform handle each frame to whatever window
     // the MTKView is currently in. ImGui_ImplOSX_HandleEvent filters

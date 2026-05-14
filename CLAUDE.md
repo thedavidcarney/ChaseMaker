@@ -66,20 +66,31 @@ conversation that led to this repo:
 
 Don't re-litigate those without strong new information.
 
-## UI framework — leaning Dear ImGui
+## UI framework — Dear ImGui (integrated)
 
-For a solo dev shipping a focused tool, **Dear ImGui** is the default:
+Dear ImGui is wired in via vcpkg with platform backends:
 
-- MIT license (no LGPL dynamic-link relink dance)
-- Lightweight, immediate-mode, no widget framework to fight
-- Excellent for tool UIs with live data (thumbnail grids, centroid
-  overlays, real-time previews)
-- What most game-engine editors and DCC in-app tools use
+- **Windows**: subclasses AE's container HWND directly (no child
+  window). DX11 swap chain bound to that HWND; `ImGui_ImplDX11` +
+  `ImGui_ImplWin32`. `~60 Hz` `WM_TIMER` drives redraws.
+- **macOS**: adds an MTKView (`ChaseMakerMTKView` subclass) as a
+  subview of AE's container NSView. Metal + `ImGui_ImplMetal` +
+  `ImGui_ImplOSX`. Display link drives redraws.
+- Cross-platform UI code lives in `src/panel_ui.cpp` and works
+  against the shared `PanelState`; both platform renderers just call
+  `panel_ui::RenderFrame()` from their per-frame hook.
 
-**Qt** is what Element 3D uses but they had a team. Heavier, LGPL
-licensing matters (LGPL dynamic-link is fine for distribution but
-commercial Qt avoids the relink-mechanism requirement). Decide once
-we know v0.1 feature scope; don't lock in early.
+Keyboard input was hard-won. See the
+[ImGui keyboard input inside an AE panel](C:\Users\User\.claude\projects\C--Users-User-Documents-GitHub-ChaseMaker\memory\imgui_keyboard_focus.md)
+memory for the working recipe (Windows deferred SetFocus + consume-
+on-WantCapture; Mac lazy-init + KeyEventResponder firstResponder
+routing; *no* NSEvent consume-monitor on Mac — it breaks the
+`interpretKeyEvents:` → `insertText:` character-input path).
+
+Qt was the original alternative and remains a known-good fallback if
+ImGui ever gets in the way, but ImGui has carried us through panel
+chrome, table, modal file picker, sidecar JSON UI, thumbnails (GPU-
+uploaded textures), and the entire sort-mode UX without complaint.
 
 ## Communication contracts with EXRDemux
 
@@ -104,9 +115,15 @@ Sidecar path: `<exr_path>.luminosity.json` next to the EXR.
   "image_size": [w, h],
   "layers": {
     "<display_name>": {"cx": 0..1, "cy": 0..1, "total": <luminance>}
-  }
+  },
+  "active_order": ["<display_name>", ...]
 }
 ```
+
+`active_order` is the user-curated included subset in the order it
+should play in the chase. Additive to the original contract —
+readers that don't know about it can fall back to sorting `layers`
+by cx themselves.
 
 Display names use the `X.X -> X` dedup convention (matches EXRDemux's
 layer picker — e.g. raw EXR layer key `World.World` becomes display
@@ -128,34 +145,108 @@ If Chase Maker computes hashes itself (likely, when applying Demux to
 layers via AEGP), match the C++ reference exactly. A mismatch means
 saved selections silently point at wrong layers.
 
-## Centroid algorithm (validated, ready to port)
+## Per-layer metrics & sort modes
 
-Used for spatial sorting modes (left-to-right, top-to-bottom). Validated
-against the Wall_Curtains 52-light reference scene; sort order matched
-the actual scene layout by eye.
+Computed once per scan in `src/exr_scan.cpp::ComputeMetrics`. All
+sort modes are pure comparator changes over the cached values —
+switching modes is instant.
 
-- For each RGB layer (skip cryptos, Image, Alpha): luminance =
-  `0.2126*R + 0.7152*G + 0.0722*B` (Rec.709)
-- Clamp negative pixels to 0 (filter ringing in float EXRs)
-- `cx = Σ(L*x) / ΣL`, `cy = Σ(L*y) / ΣL`, normalized by `(w-1)`, `(h-1)`
-- Skip layers where `ΣL <= 0` (all-black this frame)
+Per layer:
+- **Whole-layer centroid** (`cx`, `cy`) — luminance-weighted, Rec.709
+  (`0.2126*R + 0.7152*G + 0.0722*B`), negative pixels clamped to 0,
+  `cx = Σ(L*x) / ΣL`, normalized to `[0,1]`. Pulls toward broad
+  spread (spill, bounce).
+- **Hotspot centroid** (`cx_hot`, `cy_hot`) — same formula but only
+  over pixels at ≥ 50% of the layer's peak luminance. Snaps to the
+  bright concentrated source; ignores soft glow.
+- **Peak position** (`peak_x`, `peak_y`) — single brightest pixel.
+- **Total luminance** (`total`) — sum of L over the whole layer.
 
-Reference Python implementation:
-`EXRDemux/scripts/dev/luminance_centroid.py`. No need for log-luminance
-or percentile thresholding; raw luminance centroid is enough for the
-first cut.
+Sort modes exposed in the UI:
+- Centroid (Left → Right) / (Top → Bottom)
+- Hotspot (Left → Right) / (Top → Bottom)
+- Brightness (Brightest first)
+- Radial Sweep (atan2 angle around image center)
+- Distance from Center (in → out)
+- Random (deterministic per-session seed; re-shuffle button reseeds)
 
-## Build (TBD — fill in as scaffolding lands)
+Plus a universal **Reverse** toggle that flips any sort.
 
-Conventions inherited from EXRDemux:
-- CMake (cross-platform from day one — Windows x64 + macOS arm64)
-- vcpkg for OpenEXR / Imath / any other libs
-- AE SDK lives in `third_party/` (can copy or git-submodule from the
-  publicly-distributed Adobe AE SDK; do NOT keep duplicate paths in
-  sync with EXRDemux — each repo is independent)
-- Mac build pins `VCPKG_OSX_DEPLOYMENT_TARGET=11.0` via an overlay
-  triplet — without it, vcpkg builds against the build host's SDK and
-  the binaries fail at runtime on older macOS
+Skip list (no centroid computed, layer doesn't appear in the active
+table): `Image`, `Alpha`, `World`, `HDRI`, `Ambient`, anything
+containing `Crypto*`. Matches EXRDemux JSX's "pinned at bottom +
+disabled by default" set.
+
+Validated against the Wall_Curtains 52-light reference scene; sort
+order matches the actual scene layout by eye. Reference Python
+implementation: `EXRDemux/scripts/dev/luminance_centroid.py`
+(centroid only — the hotspot/peak variants exist only in
+ChaseMaker).
+
+## Build
+
+```sh
+# Windows (from Developer Command Prompt or a vcvars64-initialized shell)
+cmake --preset win-x64-release
+cmake --build --preset win-x64-release
+
+# macOS
+cmake --preset mac-arm64-release
+cmake --build --preset mac-arm64-release
+```
+
+POST_BUILD on Windows auto-installs `ChaseMaker.aex` to
+`C:\Program Files\Adobe\Adobe After Effects 2025\Support Files\Plug-ins\ChaseMaker\`.
+Disable with `-DCHASEMAKER_AE_PLUGIN_DIR=`. **AE has to be closed**
+when the install step runs (Windows memory-maps the .aex).
+
+vcpkg deps: `openexr`, `imath`, `imgui` (with `docking-experimental`
++ platform backends). Mac additionally links Cocoa, CoreFoundation,
+Metal, MetalKit, QuartzCore, GameController (`imgui_impl_osx.mm`
+imports `<GameController/GameController.h>` unconditionally — lazy-
+loaded at runtime, no cost),  UniformTypeIdentifiers.
+
+Mac build pins `VCPKG_OSX_DEPLOYMENT_TARGET=11.0` via an overlay
+triplet — without it, vcpkg builds against the build host's SDK and
+the binaries fail at runtime on older macOS.
+
+Build stamp: `cmake/gen_build_stamp.cmake` regenerates
+`generated/chase_maker_build_stamp.h` on every build, baked into the
+panel title via `AEGP_SetTitle` so each test cycle is visually
+distinct.
+
+## Source map
+
+- `src/chase_maker.cpp` — AEGP plugin entry point. EntryPointFunc,
+  ChaseMakerPlugin class, panel hook registration. Owns the panel
+  state global (`i_panel_state`) so state survives a panel close/
+  reopen even when AE destroys the platform view.
+- `src/chase_maker.r` — PiPL resource. `Kind { AEGP }`.
+- `src/panel_renderer.h` — abstract factory. `CreatePanelRenderer(void*, PanelState*)`.
+- `src/panel_renderer_win.cpp` — Windows backend (DX11 + ImGui).
+  Subclasses AE's HWND; manages DX11 thumbnail texture cache.
+- `src/panel_renderer_mac.mm` — macOS backend (Metal + ImGui).
+  MTKView subview; manages NSMutableArray<MTLTexture> thumbnail
+  cache. Compiled with `-fobjc-arc`.
+- `src/panel_state.h` — `LayerInfo`, `PanelState`, `SortMode`,
+  `SortLayers()`, `LayerDisplayX/Y()`. The mutex-guarded data the
+  scanner and UI share.
+- `src/panel_ui.h/.cpp` — cross-platform ImGui drawing. Header
+  (open EXR / status / sidecar), sort-mode combo, preview controls,
+  layer table, centroid scatter canvas, thumbnail preview pane.
+- `src/exr_scan.h/.cpp` — EXR multipart enumeration (Blender 5.x
+  multipart compatible), per-layer metrics (`ComputeMetrics`),
+  thumbnail downsample (`GenerateThumbnail`), sidecar JSON writer.
+  Worker-thread scan kicked off by `StartScan`.
+- `src/hash.h/.cpp` — FNV-1a 32-bit, byte-for-byte compatible with
+  EXRDemux's `HashLayerName`.
+- `src/file_dialog.h` + `src/file_dialog_win.cpp` + `src/file_dialog_mac.mm`
+  — native open-file picker.
+- `cmake/gen_build_stamp.cmake` — regenerated header injected as
+  `CM_BUILD_STAMP`.
+- `cmake/MacInfoPlist.in` — bundle plist. `CFBundlePackageType = AEgx`
+  (NOT `eFKT` — that's the PF effect package type, AE silently
+  filters AEGP bundles that get it wrong).
 
 ## Reference test scene
 
@@ -228,27 +319,39 @@ this repo's memory directory starts empty:
 - **Cryptos are out of scope.** Already said above; saying it again
   because it comes up a lot.
 
-## What does NOT exist yet
+## What's in vs. what's not
 
-This is a brand-new repo. Don't pretend any of the following exist when
-proposing changes:
+**In** as of May 2026:
+- AEGP panel scaffolding (Win + Mac), Dear ImGui rendering, keyboard
+  input cross-platform, file picker, scrollable layer table, click-
+  to-select, exclusion checkbox + filter-by-substring buttons.
+- EXR multipart scan on a worker thread, per-layer metrics (whole-
+  layer centroid, hotspot centroid, peak, total luminance), GPU
+  thumbnail textures cached per platform with `scan_generation`
+  lifecycle, preview-cycle animation with adjustable speed and
+  thumbnail resolution.
+- Eight sort modes plus universal Reverse and stable Random.
+- JSON sidecar writer with `active_order`.
+- Build-stamp generator + auto-install POST_BUILD.
 
-- Any source code
-- A CMake setup
-- A PiPL resource
-- AEGP plugin scaffolding
-- A UI (no framework integrated yet)
-- An install path on this PC
-- A version-numbering scheme
-- A release process
-- CI
+**Not yet**:
+- Driving AE itself — no `AEGP_*` calls to create comps, apply
+  EXRDemux effects, set layer hashes, etc. The hand-off into AE is
+  the next big design pass (David hasn't sat down with this).
+- Sub-groups (multiple ordered groups, e.g. "fire group" with its
+  own sort, played alongside the main chase). Today's "exclude" is
+  a binary toggle; there's nowhere for the excluded set to *be*.
+- Notarization (Mac builds still ad-hoc signed).
+- A version-numbering scheme + release process + CI.
 
-Bootstrap accordingly. Phase A (build infra), Phase B (hello-world
-panel), Phase C (proof of comm path with AE) are the first three
-milestones — see the linked design discussion in
-`EXRDemux/<somewhere>` if you need to go deeper. (TODO: pull design
-notes into a docs/ file in this repo once it's set up.)
+## Working notes from this session (2026-05-13)
 
-## Where to look
-
-(Empty for now — fill in as code lands.)
+- The kbd input saga revealed a lot about how AE handles events.
+  Captured in the `imgui_keyboard_focus.md` memory; if any text
+  input ever breaks again, start there.
+- David explicitly liked the diverse sort modes (Hotspot vs.
+  Centroid, Radial Sweep, etc.). Sort modes are a low-effort high-
+  visibility area to keep enriching.
+- David flagged but did NOT design sub-grouping — wants the actual
+  chase-building flow figured out first so groups fall out of it
+  naturally. **Don't pre-empt that with speculative group UX.**

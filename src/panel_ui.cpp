@@ -2,8 +2,6 @@
 
 #include "panel_state.h"
 
-#include "imgui_internal.h"   // GetActiveID()
-
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -45,6 +43,15 @@ int IncludedCount(const std::vector<LayerInfo>& layers)
     int n = 0;
     for (const auto& L : layers) if (L.included) ++n;
     return n;
+}
+
+int IndexOfHash(const std::vector<LayerInfo>& layers, uint32_t hash)
+{
+    if (hash == 0) return -1;
+    for (int i = 0; i < (int)layers.size(); ++i) {
+        if (layers[i].fnv1a_hash == hash) return i;
+    }
+    return -1;
 }
 
 int FullIndexOfIncluded(const std::vector<LayerInfo>& layers, int included_idx)
@@ -135,6 +142,8 @@ void PublishInclusionChanges(PanelState* state,
 void DrawCentroidCanvas(const std::vector<LayerInfo>& layers,
                         int image_w, int image_h,
                         int highlight_full_index,
+                        int selected_index,
+                        PanelState::SortMode sort_mode,
                         float requested_height)
 {
     const float pane_w = ImGui::GetContentRegionAvail().x;
@@ -169,19 +178,30 @@ void DrawCentroidCanvas(const std::vector<LayerInfo>& layers,
 
     for (int i = 0; i < static_cast<int>(layers.size()); ++i) {
         const LayerInfo& L = layers[i];
-        const float x = origin.x + L.cx * canvas_w;
-        const float y = origin.y + L.cy * canvas_h;
+        const float x = origin.x + LayerDisplayX(L, sort_mode) * canvas_w;
+        const float y = origin.y + LayerDisplayY(L, sort_mode) * canvas_h;
         if (!L.included) {
             dl->AddCircleFilled(ImVec2(x, y), 2.5f, IM_COL32(80, 80, 86, 200));
         } else {
             dl->AddCircleFilled(ImVec2(x, y), 3.0f, IM_COL32(220, 200, 80, 220));
         }
     }
+    // Selection marker (cool blue) — drawn BEFORE the playback
+    // marker so that if both indices fall on the same layer, the
+    // warm playback glow wins visually.
+    if (selected_index >= 0 &&
+        selected_index < static_cast<int>(layers.size())) {
+        const LayerInfo& L = layers[selected_index];
+        const float x = origin.x + LayerDisplayX(L, sort_mode) * canvas_w;
+        const float y = origin.y + LayerDisplayY(L, sort_mode) * canvas_h;
+        dl->AddCircleFilled(ImVec2(x, y), 7.f, IM_COL32(120, 180, 255, 70));
+        dl->AddCircle(ImVec2(x, y), 7.f, IM_COL32(120, 180, 255, 255), 0, 2.f);
+    }
     if (highlight_full_index >= 0 &&
         highlight_full_index < static_cast<int>(layers.size())) {
         const LayerInfo& L = layers[highlight_full_index];
-        const float x = origin.x + L.cx * canvas_w;
-        const float y = origin.y + L.cy * canvas_h;
+        const float x = origin.x + LayerDisplayX(L, sort_mode) * canvas_w;
+        const float y = origin.y + LayerDisplayY(L, sort_mode) * canvas_h;
         dl->AddCircleFilled(ImVec2(x, y), 8.f, IM_COL32(255, 240, 160, 90));
         dl->AddCircle(ImVec2(x, y), 8.f, IM_COL32(255, 240, 160, 255), 0, 2.f);
     }
@@ -189,7 +209,10 @@ void DrawCentroidCanvas(const std::vector<LayerInfo>& layers,
     ImGui::Dummy(ImVec2(canvas_w, canvas_h));
 }
 
-void DrawCentroidBar(float cx)
+// Renders a small 0..1 strip with a marker at `pos`. Used as the
+// "position" column in the table — its meaning depends on the active
+// sort mode (cx, cy, hotspot variants, or normalized brightness).
+void DrawPositionBar(float pos)
 {
     constexpr float kBarHeight = 8.f;
     ImGui::Dummy(ImVec2(0.f, 2.f));
@@ -198,7 +221,7 @@ void DrawCentroidBar(float cx)
     const ImVec2 p_max(p_min.x + avail, p_min.y + kBarHeight);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(p_min, p_max, IM_COL32(60, 60, 65, 255), 2.f);
-    const float clamped = cx < 0.f ? 0.f : (cx > 1.f ? 1.f : cx);
+    const float clamped = pos < 0.f ? 0.f : (pos > 1.f ? 1.f : pos);
     const float marker_x = p_min.x + clamped * avail;
     dl->AddRectFilled(ImVec2(marker_x - 1.f, p_min.y - 1.f),
                       ImVec2(marker_x + 1.f, p_max.y + 1.f),
@@ -206,28 +229,74 @@ void DrawCentroidBar(float cx)
     ImGui::Dummy(ImVec2(avail, kBarHeight + 2.f));
 }
 
-void DrawLayersTable(std::vector<LayerInfo>& layers,
-                     int highlight_full_index,
-                     float table_height)
+// Returns the 0..1 "sort position" for a layer under a given sort mode.
+// For Brightness, normalize against the brightest in the set so the
+// bars stay visually comparable; pass max_brightness > 0 for that.
+// For Random and other non-position sorts the value isn't meaningful
+// and we return -1 (the caller hides the bar instead).
+float SortPosition(const LayerInfo& L, PanelState::SortMode mode,
+                   double max_brightness)
 {
-    if (layers.empty()) return;
+    switch (mode) {
+    case PanelState::SortMode::CentroidX:  return L.cx;
+    case PanelState::SortMode::CentroidY:  return L.cy;
+    case PanelState::SortMode::HotspotX:   return L.cx_hot;
+    case PanelState::SortMode::HotspotY:   return L.cy_hot;
+    case PanelState::SortMode::Brightness:
+        return max_brightness > 0.0
+            ? static_cast<float>(L.total / max_brightness)
+            : 0.f;
+    case PanelState::SortMode::RadialSweep: {
+        // atan2 -> [0, 1], wrapping at the +X axis.
+        float a = std::atan2(L.cy - 0.5f, L.cx - 0.5f);
+        constexpr float kPi = 3.14159265f;
+        return (a + kPi) / (2.f * kPi);
+    }
+    case PanelState::SortMode::DistanceFromCenter: {
+        float dx = L.cx - 0.5f, dy = L.cy - 0.5f;
+        // Max distance from center to corner is sqrt(0.5).
+        return std::sqrt(dx * dx + dy * dy) / std::sqrt(0.5f);
+    }
+    case PanelState::SortMode::Random:
+        return -1.f;
+    }
+    return 0.f;
+}
+
+// Returns the index of the row that was clicked this frame (-1 if
+// nothing was clicked). The caller persists the selection on the
+// PanelState; the table just reports the click event.
+int DrawLayersTable(std::vector<LayerInfo>& layers,
+                    int highlight_full_index,
+                    int selected_index,
+                    PanelState::SortMode sort_mode,
+                    float table_height)
+{
+    int clicked = -1;
+    if (layers.empty()) return clicked;
 
     constexpr ImGuiTableFlags kTableFlags =
         ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersV |
         ImGuiTableFlags_BordersOuterH | ImGuiTableFlags_SizingStretchProp |
         ImGuiTableFlags_ScrollY;
 
+    // Brightness normalization for the position-bar column.
+    double max_brightness = 0.0;
+    for (const auto& L : layers) {
+        if (L.total > max_brightness) max_brightness = L.total;
+    }
+
     if (!ImGui::BeginTable("layers", 6, kTableFlags,
                            ImVec2(0.f, table_height))) {
-        return;
+        return clicked;
     }
 
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("#",   ImGuiTableColumnFlags_WidthFixed, 32.f);
     ImGui::TableSetupColumn("On",  ImGuiTableColumnFlags_WidthFixed, 28.f);
     ImGui::TableSetupColumn("Layer", ImGuiTableColumnFlags_WidthStretch, 3.0f);
-    ImGui::TableSetupColumn("cx",  ImGuiTableColumnFlags_WidthFixed, 48.f);
-    ImGui::TableSetupColumn("cy",  ImGuiTableColumnFlags_WidthFixed, 48.f);
+    ImGui::TableSetupColumn("X",   ImGuiTableColumnFlags_WidthFixed, 48.f);
+    ImGui::TableSetupColumn("Y",   ImGuiTableColumnFlags_WidthFixed, 48.f);
     ImGui::TableSetupColumn("position", ImGuiTableColumnFlags_WidthStretch, 2.0f);
     ImGui::TableHeadersRow();
 
@@ -235,20 +304,39 @@ void DrawLayersTable(std::vector<LayerInfo>& layers,
         LayerInfo& L = layers[i];
         ImGui::TableNextRow();
 
+        // Row tint priority: playback highlight > user selection
+        // > excluded. Selected uses a cooler blue so it's visually
+        // distinct from the playback warm-orange.
         if (i == highlight_full_index) {
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
                                    IM_COL32(120, 80, 30, 80));
+        } else if (i == selected_index) {
+            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                   IM_COL32(40, 80, 120, 90));
         } else if (!L.included) {
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
                                    IM_COL32(40, 40, 44, 120));
         }
 
         ImGui::TableNextColumn();
+        // Invisible row-spanning selectable handles the click; the
+        // index text is drawn on top via SameLine. AllowOverlap lets
+        // the checkbox and any item tooltips still receive their own
+        // input.
+        ImGui::PushID(i);
+        const bool is_selected = (i == selected_index);
+        if (ImGui::Selectable("##row", is_selected,
+                ImGuiSelectableFlags_SpanAllColumns |
+                ImGuiSelectableFlags_AllowOverlap)) {
+            clicked = i;
+        }
+        ImGui::SameLine();
         if (L.included) ImGui::Text("%d", i + 1);
         else            ImGui::TextDisabled("%d", i + 1);
+        ImGui::PopID();
 
         ImGui::TableNextColumn();
-        ImGui::PushID(i);
+        ImGui::PushID(i + 100000);
         ImGui::Checkbox("##on", &L.included);
         ImGui::PopID();
 
@@ -260,18 +348,28 @@ void DrawLayersTable(std::vector<LayerInfo>& layers,
                               L.fnv1a_hash, L.total);
         }
 
-        ImGui::TableNextColumn();
-        if (L.included) ImGui::Text("%.3f", L.cx);
-        else            ImGui::TextDisabled("%.3f", L.cx);
+        const float dx = LayerDisplayX(L, sort_mode);
+        const float dy = LayerDisplayY(L, sort_mode);
 
         ImGui::TableNextColumn();
-        if (L.included) ImGui::Text("%.3f", L.cy);
-        else            ImGui::TextDisabled("%.3f", L.cy);
+        if (L.included) ImGui::Text("%.3f", dx);
+        else            ImGui::TextDisabled("%.3f", dx);
 
         ImGui::TableNextColumn();
-        DrawCentroidBar(L.cx);
+        if (L.included) ImGui::Text("%.3f", dy);
+        else            ImGui::TextDisabled("%.3f", dy);
+
+        ImGui::TableNextColumn();
+        const float pos = SortPosition(L, sort_mode, max_brightness);
+        if (pos >= 0.f) {
+            DrawPositionBar(pos);
+        } else {
+            // Random / non-spatial: show ordinal instead of a bar.
+            ImGui::TextDisabled("#%d", i + 1);
+        }
     }
     ImGui::EndTable();
+    return clicked;
 }
 
 void DrawSkippedSection(const std::vector<SkippedLayer>& skipped)
@@ -303,22 +401,6 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-    // ---- Keyboard-input diagnostic strip ----
-    // Surfaces whether ImGui's IO sees keys at all and whether any
-    // ImGui widget is currently asking for text input. ActiveID
-    // non-zero means some widget is "claimed" (e.g. focused
-    // InputText); it should clear when you click outside.
-    {
-        ImGuiIO& io = ImGui::GetIO();
-        ImGui::TextDisabled(
-            "kbd: WantText=%d WantCapture=%d  active=0x%08x  focus=%d  recent: %s",
-            (int)io.WantTextInput, (int)io.WantCaptureKeyboard,
-            (unsigned)ImGui::GetActiveID(), (int)io.AppFocusLost ? 0 : 1,
-            io.InputQueueCharacters.Size > 0 ? "yes" :
-                (ImGui::IsKeyDown(ImGuiKey_A) || ImGui::IsKeyDown(ImGuiKey_Space) ||
-                 ImGui::IsKeyDown(ImGuiKey_Enter) ? "down" : "(none)"));
-    }
-
     FrameSnapshot snap = TakeSnapshot(state);
 
     const int included_now = IncludedCount(snap.layers);
@@ -329,6 +411,10 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
         highlight_full_index = FullIndexOfIncluded(snap.layers,
                                                    state->preview_index);
     }
+
+    // Resolve user's selection (tracked by FNV hash so it survives
+    // re-sorts) to the current array index.
+    const int selected_index = IndexOfHash(snap.layers, state->selected_hash);
 
     // ---- Header + pick button ----
     ImGui::BeginDisabled(snap.scanning);
@@ -408,6 +494,67 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
             for (auto& L : snap.layers) L.included = false;
         }
 
+        // ---- Sort mode ----
+        ImGui::Separator();
+        static const char* kSortLabels[] = {
+            "Centroid (Left to Right)",
+            "Centroid (Top to Bottom)",
+            "Hotspot (Left to Right)",
+            "Hotspot (Top to Bottom)",
+            "Brightness (Brightest first)",
+            "Radial Sweep (angle around center)",
+            "Distance from Center (in to out)",
+            "Random",
+        };
+        int sort_choice = static_cast<int>(state->sort_mode);
+        ImGui::SetNextItemWidth(280.f);
+        bool resort_now = false;
+        if (ImGui::Combo("sort by", &sort_choice, kSortLabels,
+                         IM_ARRAYSIZE(kSortLabels))) {
+            state->sort_mode = static_cast<PanelState::SortMode>(sort_choice);
+            // When entering Random for the first time (or via mode
+            // switch), pick a fresh seed.
+            if (state->sort_mode == PanelState::SortMode::Random) {
+                std::random_device rd;
+                state->random_seed = rd();
+            }
+            resort_now = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("reverse", &state->sort_reverse)) {
+            resort_now = true;
+        }
+        if (state->sort_mode == PanelState::SortMode::Random) {
+            ImGui::SameLine();
+            if (ImGui::Button("Re-shuffle")) {
+                std::random_device rd;
+                state->random_seed = rd();
+                resort_now = true;
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("?");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Centroid: luminance-weighted average over the whole layer.\n"
+                "  Pulls toward broad-spread contribution (spill, bounce).\n"
+                "Hotspot: centroid of pixels at >= 50%% of peak luminance.\n"
+                "  Snaps to the bright concentrated source.\n"
+                "Brightness: total luminance, brightest first.\n"
+                "Radial Sweep: angle from image center (atan2). Pairs\n"
+                "  well with Reverse for clockwise vs counterclockwise.\n"
+                "Distance from Center: nearest-to-center first.\n"
+                "Random: stable shuffle for this session. Hit Re-shuffle\n"
+                "  for a new arrangement.\n"
+                "\n"
+                "All metrics are pre-computed in the scan; switching is instant.");
+        }
+        if (resort_now) {
+            std::lock_guard<std::mutex> lk(state->mu);
+            SortLayers(state->layers, state->sort_mode,
+                       state->sort_reverse, state->random_seed);
+        }
+
         // ---- Preview controls ----
         ImGui::Separator();
         const char* play_label = state->preview_playing
@@ -422,10 +569,19 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
             state->preview_accum_ms = 0.f;
         }
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(160.f);
+        ImGui::SetNextItemWidth(140.f);
         ImGui::SliderFloat("ms/light", &state->preview_ms_step,
                            20.f, 2000.f, "%.0f ms",
                            ImGuiSliderFlags_Logarithmic);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.f);
+        ImGui::SliderInt("thumb px", &state->thumb_max_width,
+                         64, 1024, "%d", ImGuiSliderFlags_Logarithmic);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Max thumbnail width.\n"
+                              "Applies to the next scan — re-open the EXR\n"
+                              "to regenerate at the new size.");
+        }
         if (state->preview_playing && included_now > 0) {
             ImGui::SameLine();
             ImGui::TextDisabled("now: %d / %d",
@@ -440,15 +596,63 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
                                 ImGui::GetContentRegionAvail().x - canvas_w - 12.f);
 
         ImGui::BeginChild("table_pane", ImVec2(table_w, pane_h), false);
-        DrawLayersTable(snap.layers, highlight_full_index, pane_h - 8.f);
+        const int row_clicked = DrawLayersTable(
+            snap.layers, highlight_full_index,
+            selected_index, state->sort_mode, pane_h - 8.f);
+        if (row_clicked >= 0 && row_clicked < (int)snap.layers.size()) {
+            state->selected_hash = snap.layers[row_clicked].fnv1a_hash;
+        }
         ImGui::EndChild();
 
         ImGui::SameLine();
 
         ImGui::BeginChild("canvas_pane", ImVec2(canvas_w, pane_h), false);
+
+        // Pick a layer to show in the thumbnail. Priority:
+        //   1. Currently-animated layer (playback in progress)
+        //   2. User-clicked selection
+        //   3. First included layer (so the pane never sits empty)
+        int preview_layer = highlight_full_index;
+        if (preview_layer < 0 && selected_index >= 0) {
+            preview_layer = selected_index;
+        }
+        if (preview_layer < 0) {
+            for (int i = 0; i < (int)snap.layers.size(); ++i) {
+                if (snap.layers[i].included) { preview_layer = i; break; }
+            }
+            if (preview_layer < 0 && !snap.layers.empty()) preview_layer = 0;
+        }
+
+        // ---- Thumbnail (top of pane) ----
+        if (preview_layer >= 0 && preview_layer < (int)snap.layers.size()) {
+            const LayerInfo& L = snap.layers[preview_layer];
+            ImGui::TextDisabled("preview: %s", L.display_name.c_str());
+            const float pane_w = ImGui::GetContentRegionAvail().x;
+            if (L.texture_id != 0 && L.thumb_w > 0 && L.thumb_h > 0) {
+                const float aspect = float(L.thumb_h) / float(L.thumb_w);
+                float w = pane_w;
+                float h = w * aspect;
+                // Cap to roughly half the pane height so the centroid
+                // map below still gets meaningful real estate.
+                const float max_h = pane_h * 0.55f;
+                if (h > max_h) { h = max_h; w = h / aspect; }
+                ImGui::Image((ImTextureID)L.texture_id, ImVec2(w, h));
+            } else {
+                ImGui::Dummy(ImVec2(pane_w, 40.f));
+                ImGui::TextDisabled("(thumbnail not ready)");
+            }
+        } else {
+            ImGui::TextDisabled("preview: (no layers)");
+        }
+
+        ImGui::Separator();
+
+        // ---- Centroid map (bottom of pane) ----
         ImGui::TextDisabled("Centroid map  (yellow = included)");
         DrawCentroidCanvas(snap.layers, snap.image_width, snap.image_height,
-                           highlight_full_index, pane_h - 30.f);
+                           highlight_full_index, selected_index,
+                           state->sort_mode,
+                           std::max(80.f, ImGui::GetContentRegionAvail().y - 8.f));
         ImGui::EndChild();
     }
 
