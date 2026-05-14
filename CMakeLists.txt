@@ -53,6 +53,20 @@ if(NOT EXISTS "${AE_SDK_HEADERS}/AE_Effect.h")
         "See third_party/README.md for SDK setup instructions.")
 endif()
 
+# ----- Build stamp generator -----
+# Regenerates a one-define header on every build so the title bar
+# can show the actual link-time, not the last time chase_maker.cpp
+# was edited. Without this, __DATE__/__TIME__ in chase_maker.cpp
+# only updates when that specific source file recompiles.
+set(BUILD_STAMP_HEADER "${CMAKE_BINARY_DIR}/generated/chase_maker_build_stamp.h")
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
+add_custom_target(chase_maker_build_stamp ALL
+    BYPRODUCTS "${BUILD_STAMP_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DOUT=${BUILD_STAMP_HEADER}
+        -P ${CMAKE_SOURCE_DIR}/cmake/gen_build_stamp.cmake
+    COMMENT "Refreshing build stamp")
+
 # ----- Plugin target -----
 # AEGP panel plugin (not a PF effect). Matches the shape of
 # Stardust_panel.aex / Element 3D's editor panel: registered via
@@ -84,7 +98,9 @@ target_include_directories(ChaseMaker PRIVATE
     "${AE_SDK_RESOURCES}"
     "${AE_SDK_UTIL}"
     src
+    "${CMAKE_BINARY_DIR}/generated"
 )
+add_dependencies(ChaseMaker chase_maker_build_stamp)
 
 target_link_libraries(ChaseMaker PRIVATE
     OpenEXR::OpenEXR

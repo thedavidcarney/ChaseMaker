@@ -18,6 +18,7 @@
 #include <dxgi.h>
 
 #include "imgui.h"
+#include "imgui_internal.h"   // ImGui::ClearActiveID
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 
@@ -31,12 +32,13 @@ namespace {
 constexpr UINT_PTR kRedrawTimerId = 0xC4A5E;     // arbitrary
 constexpr UINT     kRedrawIntervalMs = 16;       // ~60 Hz
 constexpr char     kHostHwndProp[] = "ChaseMakerPanelRenderer";
+constexpr UINT     kMsgGrabFocus = WM_USER + 1;
 
 class WinPanelRenderer : public PanelRenderer
 {
 public:
-    explicit WinPanelRenderer(HWND host)
-        : i_host(host)
+    WinPanelRenderer(HWND host, PanelState* state)
+        : i_host(host), i_state(state)
     {
         if (!CreateDeviceAndSwapChain()) {
             Cleanup();
@@ -63,10 +65,56 @@ public:
 
     LRESULT WndProc(UINT msg, WPARAM wparam, LPARAM lparam)
     {
+        // Handle our deferred-focus message. Fires AFTER the message
+        // that triggered the focus request has fully returned, so
+        // AE's WM_KILLFOCUS handler doesn't run nested inside our
+        // mouse-down handler — that nesting was the AE hang.
+        if (msg == kMsgGrabFocus) {
+            if (GetFocus() != i_host) SetFocus(i_host);
+            return 0;
+        }
+
+        // Grab OS-level keyboard focus on mouse-down inside our
+        // panel — deferred via PostMessage so the focus change
+        // runs OUTSIDE the current message handler (synchronous
+        // SetFocus from inside the click handler hung AE earlier).
+        if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
+            msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN) {
+            if (GetFocus() != i_host) {
+                PostMessage(i_host, kMsgGrabFocus, 0, 0);
+            }
+        }
+
         if (i_imguiCtx) {
             ImGui::SetCurrentContext(i_imguiCtx);
             if (ImGui_ImplWin32_WndProcHandler(i_host, msg, wparam, lparam)) {
                 return 0;
+            }
+
+            // ImGui's WndProcHandler updates IO state but doesn't
+            // consume keyboard messages by default — meaning the
+            // keystroke also falls through to AE and is processed
+            // as a hotkey. Block that pass-through when ImGui
+            // actually wants the key (text input or any active
+            // keyboard capture).
+            const bool is_keyboard =
+                msg == WM_KEYDOWN  || msg == WM_KEYUP    ||
+                msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP ||
+                msg == WM_CHAR     || msg == WM_DEADCHAR ||
+                msg == WM_SYSCHAR  || msg == WM_UNICHAR;
+            if (is_keyboard) {
+                ImGuiIO& io = ImGui::GetIO();
+                if (io.WantCaptureKeyboard || io.WantTextInput) {
+                    return 0;
+                }
+            }
+
+            // When we lose OS focus (user clicked outside the panel),
+            // clear ImGui's active widget so the previously-active
+            // InputText releases — otherwise WantTextInput would stay
+            // 1 forever and we'd keep eating keystrokes.
+            if (msg == WM_KILLFOCUS) {
+                ImGui::ClearActiveID();
             }
         }
 
@@ -205,7 +253,7 @@ private:
 
         RECT rc;
         GetClientRect(i_host, &rc);
-        panel_ui::RenderFrame(&i_state,
+        panel_ui::RenderFrame(i_state,
             static_cast<float>(rc.right - rc.left),
             static_cast<float>(rc.bottom - rc.top),
             i_host,
@@ -229,7 +277,7 @@ private:
 
     void HandleDeferredActions()
     {
-        if (i_state.want_pick_exr.exchange(false)) {
+        if (i_state->want_pick_exr.exchange(false)) {
             // KillTimer so WM_TIMER doesn't fire (and trigger paint)
             // while the dialog's modal loop is spinning.
             KillTimer(i_host, kRedrawTimerId);
@@ -238,12 +286,12 @@ private:
             i_in_dialog = false;
             SetTimer(i_host, kRedrawTimerId, kRedrawIntervalMs, nullptr);
             if (!path.empty()) {
-                exr_scan::StartScan(path, &i_state);
+                exr_scan::StartScan(path, i_state);
             }
             InvalidateRect(i_host, nullptr, FALSE);
         }
-        if (i_state.want_write_sidecar.exchange(false)) {
-            exr_scan::WriteLuminositySidecar(&i_state);
+        if (i_state->want_write_sidecar.exchange(false)) {
+            exr_scan::WriteLuminositySidecar(i_state);
             InvalidateRect(i_host, nullptr, FALSE);
         }
     }
@@ -286,14 +334,14 @@ private:
     bool                    i_ready = false;
     bool                    i_frame_in_progress = false;
     bool                    i_in_dialog = false;
-    PanelState              i_state;
+    PanelState*             i_state = nullptr;
 };
 
 } // namespace
 
-PanelRenderer* CreatePanelRenderer(void* container)
+PanelRenderer* CreatePanelRenderer(void* container, PanelState* state)
 {
     HWND hwnd = static_cast<HWND>(container);
-    if (!hwnd || !IsWindow(hwnd)) return nullptr;
-    return new WinPanelRenderer(hwnd);
+    if (!hwnd || !IsWindow(hwnd) || !state) return nullptr;
+    return new WinPanelRenderer(hwnd, state);
 }

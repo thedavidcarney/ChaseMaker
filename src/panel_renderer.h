@@ -5,11 +5,18 @@
 // stays free of <windows.h> / <Cocoa/Cocoa.h>; the platform-specific
 // .cpp/.mm files do the cast.
 //
-// Lifetime: one PanelRenderer per AEGP_PanelH AE creates. The
+// Lifetime: one PanelRenderer per AEGP panel-create event. The
 // AEGP_PanelFunctions1 table has no destroy callback, so a renderer
-// effectively lives for the AE session once instantiated.
+// effectively lives for the AE session — but AE may create a fresh
+// platform view (and call CreatePanelHook again) if the user closes
+// the panel via its X button. To survive that, the data the user
+// has built up (scan results, exclusion choices, preview state) is
+// owned by the global ChaseMakerPlugin via a PanelState* the
+// renderer borrows, NOT by the renderer itself.
 
 #pragma once
+
+struct PanelState;
 
 class PanelRenderer
 {
@@ -22,4 +29,4 @@ protected:
     PanelRenderer& operator=(const PanelRenderer&) = delete;
 };
 
-PanelRenderer* CreatePanelRenderer(void* container);
+PanelRenderer* CreatePanelRenderer(void* container, PanelState* state);

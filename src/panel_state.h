@@ -20,6 +20,7 @@ struct LayerInfo {
     float       cx = 0.f;         // luminance centroid, normalized [0,1]
     float       cy = 0.f;
     double      total = 0.0;      // sum of luminance over the layer
+    bool        included = true;  // false = excluded from main chase order
 };
 
 struct SkippedLayer {
@@ -47,4 +48,14 @@ struct PanelState {
     // RenderFrame calls and a crash on Windows.
     std::atomic<bool>          want_pick_exr{false};
     std::atomic<bool>          want_write_sidecar{false};
+
+    // ---- Preview animation (cycles through included layers) ----
+    // Touched only from the UI thread; no synchronisation needed.
+    bool   preview_playing  = false;
+    int    preview_index    = 0;     // index into the included-only sequence
+    float  preview_ms_step  = 250.f; // dwell per layer in ms
+    float  preview_accum_ms = 0.f;   // accumulator across frames
+
+    // Bulk-exclude filter buffer (ImGui input). Empty = no filter.
+    char   exclude_filter[128] = {};
 };

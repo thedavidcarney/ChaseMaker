@@ -23,6 +23,10 @@
 #include "AEGP_SuiteHandler.h"
 
 #include "panel_renderer.h"
+#include "panel_state.h"
+#include "chase_maker_build_stamp.h"   // CM_BUILD_STAMP
+
+#include <cstdio>
 
 // Match name (panel-suite calls): A_u_char* / UTF-8 byte string.
 // Menu label (command-suite calls): A_char* / signed char.
@@ -127,6 +131,14 @@ private:
     AEGP_PanelSuite1*   i_panel_suiteP;
     AEGP_Command        i_command;
 
+public:
+    // PanelState lives on the plugin global so it survives a panel
+    // close/reopen within an AE session. The renderer borrows a
+    // pointer to it via CreatePanelRenderer.
+    PanelState          i_panel_state;
+
+private:
+
     static SPAPI A_Err S_CommandHook(
         AEGP_GlobalRefcon /*plugin_refcon*/,
         AEGP_CommandRefcon refcon,
@@ -166,10 +178,10 @@ private:
     }
 
     static A_Err S_CreatePanelHook(
-        AEGP_GlobalRefcon /*plugin_refcon*/,
+        AEGP_GlobalRefcon plugin_refcon,
         AEGP_CreatePanelRefcon /*refcon*/,
         AEGP_PlatformViewRef container,
-        AEGP_PanelH /*panelH*/,
+        AEGP_PanelH panelH,
         AEGP_PanelFunctions1* outFunctionTable,
         AEGP_PanelRefcon* outRefcon)
     {
@@ -179,12 +191,31 @@ private:
             outFunctionTable->DoFlyoutCommand = PanelDoFlyoutCommand;
         }
 
-        // Hand the platform container to the renderer factory. On
-        // Win, container is HWND; on Mac, NSView*. CreatePanelRenderer
-        // does the platform-specific bring-up (DX11 swap chain or
-        // MTKView + Metal device) and wires Dear ImGui to it.
+        auto* self = reinterpret_cast<ChaseMakerPlugin*>(plugin_refcon);
+
+        // Override the panel's tab label so users see "Chase Maker"
+        // (plus a build stamp) instead of the internal match name
+        // ("tdcarney Chase Maker"). Build stamp uses the source's
+        // compile time so different rebuilds are visually distinct
+        // — handy when iterating quickly and verifying which build
+        // is actually loaded.
+        if (self && self->i_panel_suiteP) {
+            char title[128];
+            std::snprintf(title, sizeof(title),
+                "Chase Maker  (build %s)", CM_BUILD_STAMP);
+            self->i_panel_suiteP->AEGP_SetTitle(panelH,
+                reinterpret_cast<const A_u_char*>(title));
+        }
+
+        // Hand the platform container to the renderer factory along
+        // with a pointer to the plugin-owned PanelState. The renderer
+        // borrows the state; ownership stays here so user data (scan
+        // results, exclusion choices, preview state) survives a
+        // panel close/reopen — AE may destroy the platform view and
+        // call this hook again with a fresh one.
         PanelRenderer* renderer = CreatePanelRenderer(
-            reinterpret_cast<void*>(container));
+            reinterpret_cast<void*>(container),
+            self ? &self->i_panel_state : nullptr);
 
         if (outRefcon) {
             *outRefcon = reinterpret_cast<AEGP_PanelRefcon>(renderer);

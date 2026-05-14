@@ -441,7 +441,23 @@ bool WriteLuminositySidecar(PanelState* state)
         if (i + 1 < layers_copy.size()) out << ",";
         out << "\n";
     }
-    out << "  }\n";
+    out << "  },\n";
+
+    // active_order: the included subset in the user's chosen
+    // playback order (currently the scan-sorted order with excluded
+    // layers filtered out). Additive to the contract documented in
+    // CLAUDE.md — readers that don't know about this field can fall
+    // back to sorting `layers` by cx themselves.
+    out << "  \"active_order\": [\n";
+    bool first = true;
+    for (const auto& L : layers_copy) {
+        if (!L.included) continue;
+        if (!first) out << ",\n";
+        out << "    \"" << JsonEscape(L.display_name) << "\"";
+        first = false;
+    }
+    if (!first) out << "\n";
+    out << "  ]\n";
     out << "}\n";
 
     if (!out.good()) {
