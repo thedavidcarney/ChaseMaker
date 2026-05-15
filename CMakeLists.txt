@@ -76,6 +76,8 @@ add_library(ChaseMaker MODULE
     src/chase_maker.cpp
     src/hash.cpp
     src/exr_scan.cpp
+    src/session_io.cpp
+    src/ae_build.cpp
     src/panel_ui.cpp
     "${AE_SDK_UTIL}/AEGP_SuiteHandler.cpp"
     "${AE_SDK_UTIL}/AEFX_SuiteHelper.c"

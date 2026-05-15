@@ -11,6 +11,7 @@
 #include "panel_ui.h"
 #include "file_dialog.h"
 #include "exr_scan.h"
+#include "session_io.h"
 
 #include <atomic>
 
@@ -25,12 +26,28 @@
 
 @class ChaseMakerMTKViewDelegate;
 
+namespace { class MacPanelRenderer; }
+
 // Subclass MTKView so the view participates in the first-responder
 // chain. Without this, the AE panel can host the view but key
 // events never reach ImGui — the text-input field looks editable
 // but rejects keystrokes.
+//
+// Also doubles as the drag destination — registers for file URLs in
+// the C++ renderer's constructor and forwards drops back via
+// `renderer` (assign, raw C++ pointer; renderer dtor sets it to nil).
 @interface ChaseMakerMTKView : MTKView
+@property (assign, nonatomic) MacPanelRenderer* renderer;
 @end
+
+// Forward-declared C++ helpers so the @implementation can call into
+// MacPanelRenderer before its class body is in scope. Defined after
+// MacPanelRenderer is complete.
+namespace {
+void DispatchDroppedPaths(MacPanelRenderer* renderer,
+                          const std::vector<std::string>& paths);
+void DispatchUnknownDrop(MacPanelRenderer* renderer, NSPasteboard* pb);
+}
 
 @implementation ChaseMakerMTKView
 - (BOOL)acceptsFirstResponder { return YES; }
@@ -42,6 +59,49 @@
 // user has to click the input twice to get a usable text cursor
 // when returning from another AE panel that's in a different window.
 - (BOOL)acceptsFirstMouse:(NSEvent*)event { return YES; }
+
+// ---- NSDraggingDestination (file-URL drops) ----
+//
+// The renderer registers our accepted types in its constructor; the
+// methods below are wired up by the responder chain because we're
+// the registered destination.
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender
+{
+    NSPasteboard* pb = [sender draggingPasteboard];
+    if ([[pb types] containsObject:NSPasteboardTypeFileURL]) {
+        return NSDragOperationCopy;
+    }
+    return NSDragOperationNone;
+}
+
+- (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender
+{
+    (void)sender;
+    return YES;
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender
+{
+    NSPasteboard* pb = [sender draggingPasteboard];
+    NSArray<NSURL*>* urls = [pb readObjectsForClasses:@[[NSURL class]]
+                                             options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    std::vector<std::string> paths;
+    for (NSURL* url in urls) {
+        if (url.fileURL && url.path) {
+            const char* u8 = url.path.UTF8String;
+            if (u8 && *u8) paths.emplace_back(u8);
+        }
+    }
+    if (!paths.empty() && self.renderer) {
+        DispatchDroppedPaths(self.renderer, paths);
+        return YES;
+    }
+    if (self.renderer) {
+        DispatchUnknownDrop(self.renderer, pb);
+    }
+    return NO;
+}
 
 // On click, route firstResponder to ImGui's internal
 // KeyEventResponder subview (added by ImGui_ImplOSX_Init). That
@@ -73,17 +133,25 @@ public:
 
     void RenderFrame(MTKView* view);
 
+    // Called by ChaseMakerMTKView when a file-URL drop completes.
+    void OnDroppedFiles(const std::vector<std::string>& paths);
+    // Called when a drop arrives without a file-URL format; logs the
+    // available pasteboard types into state.last_status so we can
+    // identify and add explicit support for AE's drag format.
+    void OnUnknownDrop(NSPasteboard* pb);
+
 private:
     void InitImGui();
     void ShutdownImGui();
 
     NSView* __strong                   i_container = nil;
-    MTKView* __strong                  i_mtkView = nil;
+    ChaseMakerMTKView* __strong        i_mtkView = nil;
     id<MTLDevice> __strong             i_device = nil;
     id<MTLCommandQueue> __strong       i_commandQueue = nil;
     ChaseMakerMTKViewDelegate* __strong i_delegate = nil;
     id __strong                        i_consume_monitor = nil;
     NSMutableArray<id<MTLTexture>>* __strong i_thumb_textures = nil;
+    id<MTLTexture> __strong            i_chase_composite_tex = nil;
     int                                i_last_scan_gen = -1;
     ImGuiContext*                      i_imguiCtx = nullptr;
     PanelState*                        i_state = nullptr;
@@ -147,6 +215,11 @@ MacPanelRenderer::MacPanelRenderer(NSView* container, PanelState* state)
     i_delegate = [[ChaseMakerMTKViewDelegate alloc] initWithRenderer:this];
     i_mtkView.delegate = i_delegate;
 
+    // Wire the drop destination — view forwards drops via the assign
+    // back-pointer set here. Cleared in dtor before this destructs.
+    i_mtkView.renderer = this;
+    [i_mtkView registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
+
     [i_container addSubview:i_mtkView];
 
     // Don't InitImGui here — i_mtkView.window may still be nil at
@@ -160,12 +233,52 @@ MacPanelRenderer::MacPanelRenderer(NSView* container, PanelState* state)
 MacPanelRenderer::~MacPanelRenderer()
 {
     if (i_mtkView) {
+        i_mtkView.renderer = nullptr;
+        [i_mtkView unregisterDraggedTypes];
         i_mtkView.paused = YES;
         i_mtkView.delegate = nil;
         [i_mtkView removeFromSuperview];
     }
     ShutdownImGui();
     // __strong members release on destruction.
+}
+
+void MacPanelRenderer::OnDroppedFiles(const std::vector<std::string>& paths)
+{
+    for (const auto& p : paths) {
+        if (p.empty()) continue;
+        exr_scan::StartScan(p, i_state, /*append=*/true, /*source_id=*/0);
+    }
+    if (!paths.empty() && i_state) {
+        std::lock_guard<std::mutex> lk(i_state->mu);
+        i_state->last_status = "Dropped " + std::to_string(paths.size()) +
+                               " file(s) — scanning...";
+        i_state->last_error.clear();
+    }
+}
+
+void MacPanelRenderer::OnUnknownDrop(NSPasteboard* pb)
+{
+    if (!pb || !i_state) return;
+    std::string msg = "Drop received but no file URL. Types:";
+    NSArray<NSPasteboardType>* types = [pb types];
+    for (NSPasteboardType t in types) {
+        const char* c = t.UTF8String;
+        if (c) { msg += " ["; msg += c; msg += "]"; }
+    }
+    std::lock_guard<std::mutex> lk(i_state->mu);
+    i_state->last_status = msg;
+}
+
+void DispatchDroppedPaths(MacPanelRenderer* renderer,
+                          const std::vector<std::string>& paths)
+{
+    if (renderer) renderer->OnDroppedFiles(paths);
+}
+
+void DispatchUnknownDrop(MacPanelRenderer* renderer, NSPasteboard* pb)
+{
+    if (renderer) renderer->OnUnknownDrop(pb);
 }
 
 void MacPanelRenderer::InitImGui()
@@ -232,15 +345,46 @@ void MacPanelRenderer::RenderFrame(MTKView* view)
     if (!i_imguiCtx) return;
     ImGui::SetCurrentContext(i_imguiCtx);
 
+    // ---- Chase preview composite texture ----
+    if (i_state && i_state->chase_composite_dirty.exchange(false)) {
+        i_chase_composite_tex = nil;
+        const int cw = i_state->chase_composite_w;
+        const int ch = i_state->chase_composite_h;
+        if (cw > 0 && ch > 0 && !i_state->chase_composite_rgba.empty()) {
+            MTLTextureDescriptor* td =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                   width:(NSUInteger)cw
+                                                                  height:(NSUInteger)ch
+                                                               mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead;
+            i_chase_composite_tex = [i_device newTextureWithDescriptor:td];
+            if (i_chase_composite_tex) {
+                [i_chase_composite_tex replaceRegion:MTLRegionMake2D(0, 0, cw, ch)
+                                         mipmapLevel:0
+                                           withBytes:i_state->chase_composite_rgba.data()
+                                         bytesPerRow:cw * 4];
+                i_state->chase_composite_texture_id =
+                    (uint64_t)(uintptr_t)(__bridge void*)i_chase_composite_tex;
+            } else {
+                i_state->chase_composite_texture_id = 0;
+            }
+        } else {
+            i_state->chase_composite_texture_id = 0;
+        }
+    }
+
     // ---- Thumbnail texture cache ----
     if (i_state) {
         const int gen = i_state->scan_generation.load();
         if (gen != i_last_scan_gen) {
             [i_thumb_textures removeAllObjects];
+            i_chase_composite_tex = nil;
+            i_state->chase_composite_texture_id = 0;
             i_last_scan_gen = gen;
         }
         std::lock_guard<std::mutex> lk(i_state->mu);
-        for (LayerInfo& L : i_state->layers) {
+        Source* src = ActiveSource(*i_state);
+        if (src) for (LayerInfo& L : src->layers) {
             if (L.texture_id != 0) continue;
             if (L.thumb_rgba.empty() || L.thumb_w <= 0 || L.thumb_h <= 0) continue;
             MTLTextureDescriptor* td =
@@ -335,17 +479,43 @@ void MacPanelRenderer::RenderFrame(MTKView* view)
     // Same rationale as the Windows path: NSOpenPanel.runModal spins
     // its own event loop and we don't want ImGui's frame state to
     // be mid-update during that.
-    if (i_state->want_pick_exr.exchange(false)) {
+    auto run_dialog = [&](auto&& dialog_call) {
         i_mtkView.paused = YES;
-        std::string path = file_dialog::PickExr((__bridge void*)i_mtkView);
+        auto result = dialog_call();
         i_mtkView.paused = NO;
+        return result;
+    };
+    if (i_state->want_pick_exr.exchange(false)) {
+        std::string path = run_dialog([&](){
+            return file_dialog::PickExr((__bridge void*)i_mtkView);
+        });
         if (!path.empty()) {
-            exr_scan::StartScan(path, i_state);
+            exr_scan::StartScan(path, i_state, /*append=*/true, /*source_id=*/0);
         }
     }
     if (i_state->want_write_sidecar.exchange(false)) {
         exr_scan::WriteLuminositySidecar(i_state);
     }
+    if (i_state->want_save_session.exchange(false)) {
+        std::string path;
+        {
+            std::lock_guard<std::mutex> lk(i_state->mu);
+            path = i_state->session_save_path;
+        }
+        if (path.empty()) {
+            path = run_dialog([&](){
+                return file_dialog::PickSessionSavePath((__bridge void*)i_mtkView);
+            });
+        }
+        if (!path.empty()) session_io::WriteSession(i_state, path);
+    }
+    if (i_state->want_load_session.exchange(false)) {
+        std::string path = run_dialog([&](){
+            return file_dialog::PickSessionLoadPath((__bridge void*)i_mtkView);
+        });
+        if (!path.empty()) session_io::LoadSession(i_state, path);
+    }
+    // want_build_* drained by the AEGP idle hook in chase_maker.cpp.
 }
 
 } // namespace

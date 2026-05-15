@@ -17,8 +17,10 @@ std::string PickExr(void* parent)
         panel.title = @"Pick a multilayer EXR";
 
         if (@available(macOS 11.0, *)) {
-            UTType* exrType = [UTType typeWithFilenameExtension:@"exr"];
-            if (exrType) panel.allowedContentTypes = @[exrType];
+            NSMutableArray<UTType*>* types = [NSMutableArray array];
+            if (UTType* t = [UTType typeWithFilenameExtension:@"exr"]) [types addObject:t];
+            if (UTType* t = [UTType typeWithFilenameExtension:@"png"]) [types addObject:t];
+            if (types.count) panel.allowedContentTypes = types;
         }
 
         // Make the sheet modal to the host view's window if we can,
@@ -37,6 +39,52 @@ std::string PickExr(void* parent)
         NSModalResponse resp = [panel runModal];
         if (resp != NSModalResponseOK) return {};
 
+        NSURL* url = panel.URLs.firstObject;
+        if (!url) return {};
+        NSString* path = url.path;
+        if (!path) return {};
+        return std::string(path.UTF8String ? path.UTF8String : "");
+    }
+}
+
+std::string PickSessionSavePath(void* parent)
+{
+    @autoreleasepool {
+        NSSavePanel* panel = [NSSavePanel savePanel];
+        panel.title = @"Save Chase Maker session";
+        panel.nameFieldStringValue = @"session.chasemaker.json";
+        if (@available(macOS 11.0, *)) {
+            if (UTType* t = [UTType typeWithFilenameExtension:@"json"]) {
+                panel.allowedContentTypes = @[t];
+            }
+        }
+        (void)parent;
+        NSModalResponse resp = [panel runModal];
+        if (resp != NSModalResponseOK) return {};
+        NSURL* url = panel.URL;
+        if (!url) return {};
+        NSString* path = url.path;
+        if (!path) return {};
+        return std::string(path.UTF8String ? path.UTF8String : "");
+    }
+}
+
+std::string PickSessionLoadPath(void* parent)
+{
+    @autoreleasepool {
+        NSOpenPanel* panel = [NSOpenPanel openPanel];
+        panel.canChooseFiles = YES;
+        panel.canChooseDirectories = NO;
+        panel.allowsMultipleSelection = NO;
+        panel.title = @"Load Chase Maker session";
+        if (@available(macOS 11.0, *)) {
+            if (UTType* t = [UTType typeWithFilenameExtension:@"json"]) {
+                panel.allowedContentTypes = @[t];
+            }
+        }
+        (void)parent;
+        NSModalResponse resp = [panel runModal];
+        if (resp != NSModalResponseOK) return {};
         NSURL* url = panel.URLs.firstObject;
         if (!url) return {};
         NSString* path = url.path;

@@ -372,7 +372,8 @@ ScanMetrics ComputeMetrics(const std::vector<float>& r,
     return m;
 }
 
-void DoScan(const std::string& path, PanelState* state)
+void DoScan(const std::string& path, PanelState* state,
+            bool append, uint32_t fixed_source_id)
 {
     try {
         Imf::MultiPartInputFile file(path.c_str());
@@ -476,22 +477,42 @@ void DoScan(const std::string& path, PanelState* state)
 
         {
             std::lock_guard<std::mutex> lk(state->mu);
-            state->exr_path     = path;
-            state->image_width  = img_w;
-            state->image_height = img_h;
-            state->layers       = std::move(layers);
-            state->skipped      = std::move(skipped);
+            Source src;
+            if (fixed_source_id != 0) {
+                src.source_id = fixed_source_id;
+                if (state->next_source_id <= fixed_source_id) {
+                    state->next_source_id = fixed_source_id + 1;
+                }
+            } else {
+                src.source_id = state->next_source_id++;
+            }
+            src.path         = path;
+            src.image_width  = img_w;
+            src.image_height = img_h;
+            src.layers       = std::move(layers);
+            src.skipped      = std::move(skipped);
+            if (!append) {
+                state->sources.clear();
+            }
+            state->sources.push_back(std::move(src));
+            state->active_source_index = (int)state->sources.size() - 1;
             state->last_error.clear();
             state->last_status  = "Scan complete.";
             state->sidecar_written = false;
         }
+        // Auto-tag-by-name once the source is published. Idempotent
+        // against repeated calls (existing tags get new members added,
+        // not duplicated). Locks state.mu internally, so call here
+        // outside our own publish lock.
+        AutotagByName(state);
     } catch (const std::exception& e) {
         std::lock_guard<std::mutex> lk(state->mu);
         state->last_error  = std::string("EXR scan failed: ") + e.what();
         state->last_status = "Scan failed.";
-        state->layers.clear();
-        state->skipped.clear();
-        state->image_width = state->image_height = 0;
+        if (!append) {
+            state->sources.clear();
+            state->active_source_index = -1;
+        }
     }
 }
 
@@ -526,7 +547,8 @@ std::string JsonEscape(const std::string& s)
 
 } // namespace
 
-void StartScan(const std::string& path, PanelState* state)
+void StartScan(const std::string& path, PanelState* state,
+               bool append, uint32_t source_id)
 {
     if (!state) return;
     if (state->scanning.exchange(true)) {
@@ -541,10 +563,98 @@ void StartScan(const std::string& path, PanelState* state)
         state->last_status = "Opening EXR...";
         state->last_error.clear();
     }
-    std::thread([state, path]() {
-        DoScan(path, state);
+    std::thread([state, path, append, source_id]() {
+        DoScan(path, state, append, source_id);
         state->scanning = false;
     }).detach();
+}
+
+bool IncludeSkippedLayer(PanelState* state, uint32_t source_id,
+                         const std::string& display_name)
+{
+    if (!state) return false;
+
+    std::string exr_path;
+    int target_thumb_width = 384;
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        const Source* src = FindSourceById(*state, source_id);
+        if (!src) {
+            state->last_error = "Source not found.";
+            return false;
+        }
+        exr_path = src->path;
+        target_thumb_width = state->thumb_max_width;
+    }
+    if (exr_path.empty()) return false;
+
+    try {
+        Imf::MultiPartInputFile file(exr_path.c_str());
+        std::vector<RgbGroup> groups = BuildRgbGroups(file);
+
+        const RgbGroup* match = nullptr;
+        for (const auto& g : groups) {
+            if (g.display_name == display_name) { match = &g; break; }
+        }
+        if (!match) {
+            std::lock_guard<std::mutex> lk(state->mu);
+            state->last_error = "Layer not found in EXR: " + display_name;
+            return false;
+        }
+        if (!match->complete) {
+            std::lock_guard<std::mutex> lk(state->mu);
+            state->last_error = "Layer is not RGB-complete: " + display_name;
+            return false;
+        }
+
+        std::vector<float> r_buf, g_buf, b_buf;
+        int w = 0, h = 0;
+        if (!ReadRgbPart(file, *match, w, h, r_buf, g_buf, b_buf)) {
+            std::lock_guard<std::mutex> lk(state->mu);
+            state->last_error = "Read failed for layer: " + display_name;
+            return false;
+        }
+
+        ScanMetrics m = ComputeMetrics(r_buf, g_buf, b_buf, w, h);
+
+        LayerInfo info;
+        info.display_name = display_name;
+        info.fnv1a_hash   = FNV1a32(display_name);
+        info.cx           = m.cx;
+        info.cy           = m.cy;
+        info.cx_hot       = m.cx_hot;
+        info.cy_hot       = m.cy_hot;
+        info.peak_x       = m.peak_x;
+        info.peak_y       = m.peak_y;
+        info.peak_lum     = m.peak_lum;
+        info.total        = m.total;
+        int tw = 0, th = 0;
+        GenerateThumbnail(r_buf, g_buf, b_buf, w, h, target_thumb_width,
+                          info.thumb_rgba, tw, th);
+        info.thumb_w = tw;
+        info.thumb_h = th;
+
+        std::lock_guard<std::mutex> lk(state->mu);
+        Source* src = FindSourceById(*state, source_id);
+        if (!src) return false;
+        // Remove from skipped (match by display_name).
+        for (auto it = src->skipped.begin(); it != src->skipped.end(); ) {
+            if (it->display_name == display_name) it = src->skipped.erase(it);
+            else ++it;
+        }
+        src->layers.push_back(std::move(info));
+        // Re-sort with the active mode so the new row lands in the
+        // expected position.
+        SortLayers(src->layers, state->sort_mode,
+                   state->sort_reverse, state->random_seed);
+        state->last_status = "Included '" + display_name + "' from skipped list.";
+        state->last_error.clear();
+        return true;
+    } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lk(state->mu);
+        state->last_error = std::string("Include failed: ") + e.what();
+        return false;
+    }
 }
 
 bool WriteLuminositySidecar(PanelState* state)
@@ -556,14 +666,15 @@ bool WriteLuminositySidecar(PanelState* state)
     std::vector<LayerInfo> layers_copy;
     {
         std::lock_guard<std::mutex> lk(state->mu);
-        if (state->exr_path.empty() || state->layers.empty()) {
+        const Source* src = ActiveSource(*state);
+        if (!src || src->path.empty() || src->layers.empty()) {
             state->last_error = "Nothing to write (no scan results).";
             return false;
         }
-        path = state->exr_path;
-        w = state->image_width;
-        h = state->image_height;
-        layers_copy = state->layers;
+        path = src->path;
+        w = src->image_width;
+        h = src->image_height;
+        layers_copy = src->layers;
     }
 
     namespace fs = std::filesystem;

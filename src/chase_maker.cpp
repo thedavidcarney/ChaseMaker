@@ -24,6 +24,7 @@
 
 #include "panel_renderer.h"
 #include "panel_state.h"
+#include "ae_build.h"
 #include "chase_maker_build_stamp.h"   // CM_BUILD_STAMP
 
 #include <cstdio>
@@ -75,6 +76,11 @@ public:
           i_command(0)
     {
         A_Err err = A_Err_NONE;
+        // Stash the SPBasicSuite + plugin_id on PanelState so the
+        // ae_build module can re-acquire AEGP suites later without
+        // routing back through the plugin object.
+        i_panel_state.pica_basicP    = pica_basicP;
+        i_panel_state.aegp_plugin_id = static_cast<int>(plugin_id);
 
         // Acquire the panel suite (AEGP_PanelSuite1, frozen in AE 8.0).
         // AcquireSuite is a C function pointer — no implicit `this`.
@@ -110,6 +116,18 @@ public:
         err = i_sp.RegisterSuite5()->AEGP_RegisterUpdateMenuHook(
             i_plugin_id,
             &ChaseMakerPlugin::S_UpdateMenuHook,
+            nullptr);
+        if (err != A_Err_NONE) throw err;
+
+        // Idle hook — AE calls this periodically with a valid AEGP
+        // context. We drain the panel's deferred build flags here so
+        // ae_build's AEGP calls (project/folder/comp/footage queries)
+        // run from inside an AE-registered hook. Calling AEGP from
+        // the panel's render thread directly returns "num_proj=0"
+        // because AE doesn't expose the project state outside hooks.
+        err = i_sp.RegisterSuite5()->AEGP_RegisterIdleHook(
+            i_plugin_id,
+            &ChaseMakerPlugin::S_IdleHook,
             nullptr);
         if (err != A_Err_NONE) throw err;
 
@@ -155,6 +173,33 @@ private:
         A_Err err = self->i_panel_suiteP->AEGP_ToggleVisibility(kChaseMakerMatchName);
         if (handledPB) *handledPB = TRUE;
         return err;
+    }
+
+    static A_Err S_IdleHook(
+        AEGP_GlobalRefcon plugin_refcon,
+        AEGP_IdleRefcon /*refcon*/,
+        A_long* max_sleepPL)
+    {
+        auto* self = reinterpret_cast<ChaseMakerPlugin*>(plugin_refcon);
+        if (!self) return A_Err_NONE;
+
+        // Drain UI-side build requests. ae_build's AEGP calls (proj /
+        // item / comp / footage / effect) all succeed from this
+        // hook's context. If nothing's pending we just return; AE
+        // will call us again soon.
+        if (int idx = self->i_panel_state.want_build_chase_index.exchange(-1);
+            idx >= 0)
+        {
+            ae_build::BuildChase(&self->i_panel_state, idx);
+        }
+        if (self->i_panel_state.want_build_all_chases.exchange(false)) {
+            ae_build::BuildAllChases(&self->i_panel_state);
+        }
+        // max_sleep is in 60ths of a second. Asking AE to wake us at
+        // up to 6/60s = 100ms keeps latency low between UI click and
+        // build start without burning idle CPU.
+        if (max_sleepPL && *max_sleepPL > 6) *max_sleepPL = 6;
+        return A_Err_NONE;
     }
 
     static A_Err S_UpdateMenuHook(

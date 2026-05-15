@@ -12,11 +12,17 @@
 #include "panel_ui.h"
 #include "file_dialog.h"
 #include "exr_scan.h"
+#include "session_io.h"
 
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <ole2.h>          // OleInitialize / RegisterDragDrop / IDropTarget
+#include <shellapi.h>      // DragQueryFile* / CF_HDROP
+#include <shlobj.h>
 
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "imgui.h"
@@ -36,6 +42,57 @@ constexpr UINT     kRedrawIntervalMs = 16;       // ~60 Hz
 constexpr char     kHostHwndProp[] = "ChaseMakerPanelRenderer";
 constexpr UINT     kMsgGrabFocus = WM_USER + 1;
 
+// Forward declaration so the drop target can call back into the
+// renderer to start scans.
+class WinPanelRenderer;
+
+// IDropTarget impl. Holds a raw pointer to the renderer; the
+// renderer's destructor calls DetachOwner before releasing us.
+class CMDropTarget : public IDropTarget
+{
+public:
+    explicit CMDropTarget(WinPanelRenderer* owner) : i_owner(owner), i_ref(1) {}
+    void DetachOwner() { i_owner = nullptr; }
+
+    // IUnknown
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDropTarget) {
+            *ppv = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++i_ref; }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG r = --i_ref;
+        if (r == 0) delete this;
+        return r;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject*, DWORD, POINTL,
+                                        DWORD* pdwEffect) override
+    {
+        if (pdwEffect) *pdwEffect = DROPEFFECT_COPY;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD* pdwEffect) override
+    {
+        if (pdwEffect) *pdwEffect = DROPEFFECT_COPY;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject*, DWORD, POINTL, DWORD*) override;
+
+private:
+    WinPanelRenderer* i_owner;
+    ULONG             i_ref;
+};
+
 class WinPanelRenderer : public PanelRenderer
 {
 public:
@@ -49,6 +106,19 @@ public:
         InitImGui();
         Subclass();
 
+        // Drag-and-drop registration. OleInitialize is per-thread,
+        // ref-counted; safe to call even if AE already initialized it.
+        if (SUCCEEDED(OleInitialize(nullptr))) {
+            i_ole_initialized = true;
+        }
+        i_drop_target = new CMDropTarget(this);
+        // RegisterDragDrop AddRefs the target; we keep our own ref so
+        // we can DetachOwner before AE-side teardown.
+        if (RegisterDragDrop(i_host, i_drop_target) != S_OK) {
+            i_drop_target->Release();
+            i_drop_target = nullptr;
+        }
+
         // Drive ~60 Hz redraws so ImGui animations (cursor blink,
         // hover transitions) run smoothly. If this proves too chatty
         // later we can switch to redraw-on-demand only.
@@ -60,10 +130,67 @@ public:
     ~WinPanelRenderer() override
     {
         KillTimer(i_host, kRedrawTimerId);
+        if (i_drop_target) {
+            RevokeDragDrop(i_host);
+            i_drop_target->DetachOwner();
+            i_drop_target->Release();
+            i_drop_target = nullptr;
+        }
+        if (i_ole_initialized) {
+            OleUninitialize();
+            i_ole_initialized = false;
+        }
         Unsubclass();
         ReleaseAllThumbnailTextures();
         ShutdownImGui();
         Cleanup();
+    }
+
+    // Called by CMDropTarget after a successful drop with one or more
+    // file paths. Each path becomes a new source via the existing scan.
+    void OnDroppedFiles(const std::vector<std::string>& paths)
+    {
+        for (const auto& p : paths) {
+            if (p.empty()) continue;
+            exr_scan::StartScan(p, i_state, /*append=*/true, /*source_id=*/0);
+        }
+        // Status update so user sees feedback even if scan is queued.
+        if (!paths.empty() && i_state) {
+            std::lock_guard<std::mutex> lk(i_state->mu);
+            i_state->last_status = "Dropped " + std::to_string(paths.size()) +
+                                   " file(s) — scanning...";
+            i_state->last_error.clear();
+        }
+        InvalidateRect(i_host, nullptr, FALSE);
+    }
+
+    // Called by CMDropTarget when a drop arrived with no file-path
+    // format. Logs the available format names so we can identify
+    // AE's drag format and add support for it.
+    void OnUnknownDrop(IDataObject* obj)
+    {
+        if (!obj || !i_state) return;
+        std::string msg = "Drop received but no file path. Formats:";
+        IEnumFORMATETC* enumFmt = nullptr;
+        if (SUCCEEDED(obj->EnumFormatEtc(DATADIR_GET, &enumFmt)) && enumFmt) {
+            FORMATETC fmt;
+            int count = 0;
+            while (enumFmt->Next(1, &fmt, nullptr) == S_OK && count < 32) {
+                char name[256] = {};
+                if (fmt.cfFormat >= 0xC000) {
+                    GetClipboardFormatNameA(fmt.cfFormat, name, sizeof(name) - 1);
+                } else {
+                    std::snprintf(name, sizeof(name), "CF_%u", fmt.cfFormat);
+                }
+                msg += " ["; msg += name; msg += "]";
+                if (fmt.ptd) CoTaskMemFree(fmt.ptd);
+                ++count;
+            }
+            enumFmt->Release();
+        }
+        std::lock_guard<std::mutex> lk(i_state->mu);
+        i_state->last_status = msg;
+        InvalidateRect(i_host, nullptr, FALSE);
     }
 
     LRESULT WndProc(UINT msg, WPARAM wparam, LPARAM lparam)
@@ -99,7 +226,10 @@ public:
             // keystroke also falls through to AE and is processed
             // as a hotkey. Block that pass-through when ImGui
             // actually wants the key (text input or any active
-            // keyboard capture).
+            // keyboard capture), AND for our panel-global
+            // shortcuts (Spacebar, Ctrl+Z, Ctrl+Y) when our HWND
+            // owns OS focus — otherwise AE's spacebar starts comp
+            // preview instead of our staging/chase preview.
             const bool is_keyboard =
                 msg == WM_KEYDOWN  || msg == WM_KEYUP    ||
                 msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP ||
@@ -109,6 +239,15 @@ public:
                 ImGuiIO& io = ImGui::GetIO();
                 if (io.WantCaptureKeyboard || io.WantTextInput) {
                     return 0;
+                }
+                if (GetFocus() == i_host &&
+                    (msg == WM_KEYDOWN || msg == WM_KEYUP ||
+                     msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP ||
+                     msg == WM_CHAR))
+                {
+                    const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                    if (wparam == VK_SPACE) return 0;
+                    if (ctrl && (wparam == 'Z' || wparam == 'Y')) return 0;
                 }
             }
 
@@ -251,6 +390,7 @@ private:
         ImGui::SetCurrentContext(i_imguiCtx);
 
         EnsureThumbnailTextures();
+        UpdateChasePreviewTexture();
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -287,6 +427,52 @@ private:
         }
         i_thumb_srvs.clear();
         i_last_scan_gen = -1;
+        if (i_chase_composite_srv) {
+            i_chase_composite_srv->Release();
+            i_chase_composite_srv = nullptr;
+        }
+        if (i_state) i_state->chase_composite_texture_id = 0;
+    }
+
+    void UpdateChasePreviewTexture()
+    {
+        if (!i_state || !i_device) return;
+        if (!i_state->chase_composite_dirty.exchange(false)) return;
+        if (i_chase_composite_srv) {
+            i_chase_composite_srv->Release();
+            i_chase_composite_srv = nullptr;
+        }
+        const int w = i_state->chase_composite_w;
+        const int h = i_state->chase_composite_h;
+        if (w <= 0 || h <= 0 || i_state->chase_composite_rgba.empty()) {
+            i_state->chase_composite_texture_id = 0;
+            return;
+        }
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = w;
+        desc.Height = h;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_IMMUTABLE;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA srd{};
+        srd.pSysMem = i_state->chase_composite_rgba.data();
+        srd.SysMemPitch = w * 4;
+        ID3D11Texture2D* tex = nullptr;
+        if (FAILED(i_device->CreateTexture2D(&desc, &srd, &tex)) || !tex) {
+            i_state->chase_composite_texture_id = 0;
+            return;
+        }
+        if (FAILED(i_device->CreateShaderResourceView(tex, nullptr, &i_chase_composite_srv))) {
+            tex->Release();
+            i_state->chase_composite_texture_id = 0;
+            return;
+        }
+        tex->Release();
+        i_state->chase_composite_texture_id =
+            reinterpret_cast<uint64_t>(i_chase_composite_srv);
     }
 
     void EnsureThumbnailTextures()
@@ -299,8 +485,10 @@ private:
         }
 
         std::lock_guard<std::mutex> lk(i_state->mu);
-        for (size_t idx = 0; idx < i_state->layers.size(); ++idx) {
-            LayerInfo& L = i_state->layers[idx];
+        Source* src = ActiveSource(*i_state);
+        if (!src) return;
+        for (size_t idx = 0; idx < src->layers.size(); ++idx) {
+            LayerInfo& L = src->layers[idx];
             if (L.texture_id != 0) continue;
             if (L.thumb_rgba.empty() || L.thumb_w <= 0 || L.thumb_h <= 0) continue;
 
@@ -334,16 +522,22 @@ private:
 
     void HandleDeferredActions()
     {
-        if (i_state->want_pick_exr.exchange(false)) {
-            // KillTimer so WM_TIMER doesn't fire (and trigger paint)
-            // while the dialog's modal loop is spinning.
+        auto run_dialog = [&](auto&& dialog_call) {
+            // Kill the redraw timer so WM_TIMER doesn't reentrantly
+            // trigger a paint while the dialog's nested message loop
+            // is spinning. Restore after.
             KillTimer(i_host, kRedrawTimerId);
             i_in_dialog = true;
-            std::string path = file_dialog::PickExr(i_host);
+            auto result = dialog_call();
             i_in_dialog = false;
             SetTimer(i_host, kRedrawTimerId, kRedrawIntervalMs, nullptr);
+            return result;
+        };
+
+        if (i_state->want_pick_exr.exchange(false)) {
+            std::string path = run_dialog([&](){ return file_dialog::PickExr(i_host); });
             if (!path.empty()) {
-                exr_scan::StartScan(path, i_state);
+                exr_scan::StartScan(path, i_state, /*append=*/true, /*source_id=*/0);
             }
             InvalidateRect(i_host, nullptr, FALSE);
         }
@@ -351,6 +545,33 @@ private:
             exr_scan::WriteLuminositySidecar(i_state);
             InvalidateRect(i_host, nullptr, FALSE);
         }
+        if (i_state->want_save_session.exchange(false)) {
+            std::string path;
+            {
+                std::lock_guard<std::mutex> lk(i_state->mu);
+                path = i_state->session_save_path;
+            }
+            if (path.empty()) {
+                path = run_dialog([&](){ return file_dialog::PickSessionSavePath(i_host); });
+            }
+            if (!path.empty()) {
+                session_io::WriteSession(i_state, path);
+            }
+            InvalidateRect(i_host, nullptr, FALSE);
+        }
+        if (i_state->want_load_session.exchange(false)) {
+            std::string path = run_dialog([&](){
+                return file_dialog::PickSessionLoadPath(i_host);
+            });
+            if (!path.empty()) {
+                session_io::LoadSession(i_state, path);
+            }
+            InvalidateRect(i_host, nullptr, FALSE);
+        }
+        // want_build_* flags are drained by the AEGP idle hook in
+        // chase_maker.cpp — calling ae_build from this render-thread
+        // context returns "no project" because AE only exposes the
+        // project handle inside registered hooks.
     }
 
     void Subclass()
@@ -394,7 +615,58 @@ private:
     PanelState*             i_state = nullptr;
     std::vector<ID3D11ShaderResourceView*> i_thumb_srvs;
     int                     i_last_scan_gen = -1;
+    ID3D11ShaderResourceView* i_chase_composite_srv = nullptr;
+    CMDropTarget*           i_drop_target = nullptr;
+    bool                    i_ole_initialized = false;
 };
+
+// Now that WinPanelRenderer is complete, define CMDropTarget::Drop.
+HRESULT STDMETHODCALLTYPE CMDropTarget::Drop(IDataObject* pDataObj,
+                                              DWORD, POINTL,
+                                              DWORD* pdwEffect)
+{
+    if (pdwEffect) *pdwEffect = DROPEFFECT_NONE;
+    if (!pDataObj || !i_owner) return S_OK;
+
+    // Try CF_HDROP first: Explorer-style file drops, and probably what
+    // AE's Project panel uses for footage items (since AE's underlying
+    // representation of an imported footage is a file path).
+    FORMATETC fmt = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    STGMEDIUM medium = {};
+    std::vector<std::string> paths;
+    if (SUCCEEDED(pDataObj->GetData(&fmt, &medium))) {
+        HDROP hdrop = reinterpret_cast<HDROP>(GlobalLock(medium.hGlobal));
+        if (hdrop) {
+            UINT count = DragQueryFileW(hdrop, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < count; ++i) {
+                UINT len = DragQueryFileW(hdrop, i, nullptr, 0);
+                if (len == 0) continue;
+                std::vector<wchar_t> wbuf(static_cast<size_t>(len) + 1);
+                DragQueryFileW(hdrop, i, wbuf.data(),
+                               static_cast<UINT>(wbuf.size()));
+                int u8len = WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), -1,
+                                                nullptr, 0, nullptr, nullptr);
+                if (u8len > 1) {
+                    std::string p(static_cast<size_t>(u8len - 1), '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), -1,
+                                        p.data(), u8len, nullptr, nullptr);
+                    paths.push_back(std::move(p));
+                }
+            }
+            GlobalUnlock(medium.hGlobal);
+        }
+        ReleaseStgMedium(&medium);
+    }
+    if (!paths.empty()) {
+        i_owner->OnDroppedFiles(paths);
+        if (pdwEffect) *pdwEffect = DROPEFFECT_COPY;
+    } else {
+        // No file-path format — log everything so we can identify the
+        // AE Project panel's drag format and add explicit support.
+        i_owner->OnUnknownDrop(pDataObj);
+    }
+    return S_OK;
+}
 
 } // namespace
 
