@@ -238,6 +238,23 @@ endif()
 # Quiet a few MSVC warnings the SDK headers trip but we can't fix.
 if(MSVC)
     target_compile_options(ChaseMaker PRIVATE /W3)
+
+    # Emit a matching PDB for the OPTIMIZED build too. Default
+    # CMAKE_BUILD_TYPE=Release has no /Zi or linker /DEBUG, so AE
+    # crash dumps of ChaseMaker.aex are unsymbolizable — we spent
+    # many debugging cycles blind on exactly this. /Zi keeps full
+    # optimization (it only adds debug info); the linker needs
+    # /DEBUG to write the .pdb, and /DEBUG silently disables
+    # /OPT:REF + /OPT:ICF, so we re-enable them to keep the shipped
+    # binary byte-for-byte the same release build, just symbolized.
+    # Scoped to non-Debug configs (Debug already has its own
+    # debug-info flags from CMake's defaults).
+    target_compile_options(ChaseMaker PRIVATE
+        $<$<NOT:$<CONFIG:Debug>>:/Zi>)
+    target_link_options(ChaseMaker PRIVATE
+        $<$<NOT:$<CONFIG:Debug>>:/DEBUG>
+        $<$<NOT:$<CONFIG:Debug>>:/OPT:REF>
+        $<$<NOT:$<CONFIG:Debug>>:/OPT:ICF>)
 endif()
 
 # ----- Post-build install (dev iteration loop) -----

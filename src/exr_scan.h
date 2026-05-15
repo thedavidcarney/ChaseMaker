@@ -36,11 +36,6 @@ namespace exr_scan {
 void StartScan(const std::string& path, PanelState* state,
                bool append = true, uint32_t source_id = 0);
 
-// Write `<path>.luminosity.json` next to the EXR, matching the
-// sidecar contract documented in CLAUDE.md. Returns true on success.
-// Sets state.last_error / state.sidecar_written.
-bool WriteLuminositySidecar(PanelState* state);
-
 // Force-include a layer that the auto-skip heuristic dropped (e.g.
 // a light named "Crypto_Bounce" that got false-matched as a
 // cryptomatte). Re-reads only this one layer from disk, computes

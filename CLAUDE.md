@@ -30,9 +30,9 @@ between tools are file-format / API contracts, not shared code:
    JSX (`SplitAndSortPassesToPrecomps.jsx`) that splits an EXR's layers
    into precomps + a Master Comp. Hand-off in: EXR file.
 3. **Chase Maker** (this repo) — AEGP panel plugin. Reads EXRs, computes
-   derived data, drives EXRDemux precomp setup via the AEGP API and/or
-   the JSON sidecar contract below, builds the chase animations.
-   Hand-off in: EXR file + the precomp structure EXRDemux's JSX builds.
+   derived data, builds the chase comps directly via the AEGP API
+   (the "dumb comps" builder), applying the `tdcarney EXRDemux` effect
+   and setting layer hashes itself. Hand-off in: the EXR file.
 
 Different platforms, different SDKs, different license obligations
 (Blender's API drags GPL into the Blender tool; the AE plugins can be
@@ -71,11 +71,33 @@ Don't re-litigate those without strong new information.
 Dear ImGui is wired in via vcpkg with platform backends:
 
 - **Windows**: subclasses AE's container HWND directly (no child
-  window). DX11 swap chain bound to that HWND; `ImGui_ImplDX11` +
-  `ImGui_ImplWin32`. `~60 Hz` `WM_TIMER` drives redraws.
+  window). `ImGui_ImplDX11` + `ImGui_ImplWin32`, `~30 Hz` `WM_TIMER`.
+  **The D3D11 device is the WARP software rasterizer, NOT the
+  hardware GPU driver — this is load-bearing, do not change it.**
+  A second *hardware* D3D device in AE's process (alongside AE's own
+  GPU use) destabilized the NVIDIA driver and froze/crashed all of
+  AE; every crash dump faulted inside `nvwgf2umx.dll`. The panel is
+  a 2D ImGui UI with zero need for GPU accel, so WARP is correct and
+  removes us from the GPU driver entirely. Swap chain is flip-model
+  with a frame-latency *waitable* (polled non-blocking — never block
+  AE's UI thread in Present). See the
+  [panel renderer lifecycle + GPU invariants](C:\Users\User\.claude\projects\C--Users-User-Documents-GitHub-ChaseMaker\memory\panel_close_reopen_lifecycle.md)
+  memory before touching the renderer.
 - **macOS**: adds an MTKView (`ChaseMakerMTKView` subclass) as a
   subview of AE's container NSView. Metal + `ImGui_ImplMetal` +
-  `ImGui_ImplOSX`. Display link drives redraws.
+  `ImGui_ImplOSX`. Display link drives redraws. (No WARP analog —
+  Metal is fine; the GPU-driver issue was Windows/NVIDIA-specific.)
+
+**Renderer lifecycle invariant (both backends):** AEGP has no
+panel-destroy callback; AE destroys the container and makes a new
+one on reopen. The Windows renderer self-destructs on `WM_NCDESTROY`.
+`PanelState` (a plugin global) outlives the renderer, so any
+per-renderer GPU handle cached on it (`LayerInfo::texture_id`,
+`chase_composite_texture_id`) MUST be zeroed when the renderer
+releases its textures — on Win *and* Mac — or a reopened panel draws
+a freed cross-renderer texture and crashes AE. `src/diag_log.h`
+writes load-path/teardown milestones to
+`<temp>/chasemaker_load.log` for diagnosing any regression.
 - Cross-platform UI code lives in `src/panel_ui.cpp` and works
   against the shared `PanelState`; both platform renderers just call
   `panel_ui::RenderFrame()` from their per-frame hook.
@@ -89,41 +111,21 @@ routing; *no* NSEvent consume-monitor on Mac — it breaks the
 
 Qt was the original alternative and remains a known-good fallback if
 ImGui ever gets in the way, but ImGui has carried us through panel
-chrome, table, modal file picker, sidecar JSON UI, thumbnails (GPU-
-uploaded textures), and the entire sort-mode UX without complaint.
+chrome, table, modal file picker, thumbnails (GPU-uploaded
+textures), and the entire sort-mode UX without complaint.
 
-## Communication contracts with EXRDemux
+## Communication contract with EXRDemux
 
-Two paths, both valid, can coexist:
+**AEGP API at runtime.** Chase Maker reads project state and calls
+AEGP suites to apply `tdcarney EXRDemux` effects, build comps, set
+layer hashes, etc. In-process, immediate. This is the only path.
 
-1. **AEGP API at runtime.** Chase Maker reads project state, calls AEGP
-   suites to apply `tdcarney EXRDemux` effects, build precomps, set
-   layer hashes, etc. In-process, immediate.
-2. **JSON sidecar.** Chase Maker writes a sidecar next to the EXR;
-   EXRDemux's JSX picks it up. Lets external/batch tools participate in
-   the same contract.
-
-### JSON sidecar contract (stable across the boundary)
-
-Sidecar path: `<exr_path>.luminosity.json` next to the EXR.
-
-```json
-{
-  "version": 1,
-  "source": "<filename.exr>",
-  "source_mtime_utc": <unix_seconds>,
-  "image_size": [w, h],
-  "layers": {
-    "<display_name>": {"cx": 0..1, "cy": 0..1, "total": <luminance>}
-  },
-  "active_order": ["<display_name>", ...]
-}
-```
-
-`active_order` is the user-curated included subset in the order it
-should play in the chase. Additive to the original contract —
-readers that don't know about it can fall back to sorting `layers`
-by cx themselves.
+> The old JSON luminosity sidecar (`<exr>.luminosity.json` consumed
+> by EXRDemux's JSX) has been **removed** — superseded by the
+> in-process "dumb comps" AEGP builder. Don't reintroduce a sidecar
+> or JSX hand-off; if external/batch participation is ever needed,
+> design it fresh against the then-current builder, not this dropped
+> contract.
 
 Display names use the `X.X -> X` dedup convention (matches EXRDemux's
 layer picker — e.g. raw EXR layer key `World.World` becomes display
@@ -223,20 +225,26 @@ distinct.
   reopen even when AE destroys the platform view.
 - `src/chase_maker.r` — PiPL resource. `Kind { AEGP }`.
 - `src/panel_renderer.h` — abstract factory. `CreatePanelRenderer(void*, PanelState*)`.
-- `src/panel_renderer_win.cpp` — Windows backend (DX11 + ImGui).
-  Subclasses AE's HWND; manages DX11 thumbnail texture cache.
+- `src/panel_renderer_win.cpp` — Windows backend (ImGui on a **WARP**
+  D3D11 device, flip-model waitable swapchain). Subclasses AE's HWND;
+  self-destructs on WM_NCDESTROY; zeroes PanelState texture ids on
+  release. (Do not switch to a hardware D3D device — see UI section.)
 - `src/panel_renderer_mac.mm` — macOS backend (Metal + ImGui).
-  MTKView subview; manages NSMutableArray<MTLTexture> thumbnail
-  cache. Compiled with `-fobjc-arc`.
+  MTKView subview; NSMutableArray<MTLTexture> thumbnail cache; same
+  zero-PanelState-texture-ids-on-release rule. `-fobjc-arc`.
+- `src/diag_log.h` — header-only, crash-resilient load-path/teardown
+  logger → `<temp>/chasemaker_load.log` (Win+Mac). Diagnostic aid.
 - `src/panel_state.h` — `LayerInfo`, `PanelState`, `SortMode`,
-  `SortLayers()`, `LayerDisplayX/Y()`. The mutex-guarded data the
-  scanner and UI share.
+  `SortLayers()`, `Chase`/`ChaseStage`/`ScatterHit`, `Regenerate
+  Scatter()` (shared inline — builder regenerates it too), Binds/
+  Tags/overrides, undo snapshot. Mutex-guarded shared data. NOTE:
+  must stay free of `std::max`/`std::min` (windows.h macro clash).
 - `src/panel_ui.h/.cpp` — cross-platform ImGui drawing. Header
-  (open EXR / status / sidecar), sort-mode combo, preview controls,
+  (open EXR / status), sort-mode combo, preview controls,
   layer table, centroid scatter canvas, thumbnail preview pane.
 - `src/exr_scan.h/.cpp` — EXR multipart enumeration (Blender 5.x
   multipart compatible), per-layer metrics (`ComputeMetrics`),
-  thumbnail downsample (`GenerateThumbnail`), sidecar JSON writer.
+  thumbnail downsample (`GenerateThumbnail`).
   Worker-thread scan kicked off by `StartScan`.
 - `src/hash.h/.cpp` — FNV-1a 32-bit, byte-for-byte compatible with
   EXRDemux's `HashLayerName`.
@@ -321,37 +329,61 @@ this repo's memory directory starts empty:
 
 ## What's in vs. what's not
 
-**In** as of May 2026:
-- AEGP panel scaffolding (Win + Mac), Dear ImGui rendering, keyboard
-  input cross-platform, file picker, scrollable layer table, click-
-  to-select, exclusion checkbox + filter-by-substring buttons.
-- EXR multipart scan on a worker thread, per-layer metrics (whole-
-  layer centroid, hotspot centroid, peak, total luminance), GPU
-  thumbnail textures cached per platform with `scan_generation`
-  lifecycle, preview-cycle animation with adjustable speed and
-  thumbnail resolution.
-- Eight sort modes plus universal Reverse and stable Random.
-- JSON sidecar writer with `active_order`.
-- Build-stamp generator + auto-install POST_BUILD.
+**In** as of 2026-05-15 (the chase-building flow is now substantially
+built — this section was very stale before):
+- AEGP panel scaffolding (Win WARP+ImGui / Mac Metal+ImGui), keyboard
+  input, native file picker, layer table with shift/ctrl multi-select
+  + drag-reorder, exclusion + substring filter, centroid scatter map.
+- EXR multipart scan (worker thread), per-layer metrics (whole-layer
+  + hotspot centroid, peak, total luminance), thumbnail textures with
+  `scan_generation` lifecycle, preview animation.
+- Tags: auto-tag by name prefix AND a single-member tag per
+  unique-named layer (every light is reachable from the wizard's tag
+  filter — no untagged bucket).
+- Session-level Binds + a separate **chase-local "Bind"** weld (same
+  Staging multi-select UX, but welds only that chase — NOT a session
+  bind; see feedback_chase_editor_ux.md).
+- Chases: color-coded tabs, New-Chase wizard with multi-select tag
+  filter (All/None) and templates: Left→Right, Top→Bottom, **Center
+  Out** (HotspotX, symmetric mirrored pairs), 3 Step, **Random**
+  (the stratified scatter generator — its own editor: loop length,
+  density, seed/reseed, seamless wrap), Custom. Manual stage editing
+  (drag-reorder + chase-local Bind/Unbind, `manual_stages`
+  persistence), `symmetric_pairs`, `desired_stage_count`.
+- Chase preview: live composite + click-to-pin a light; centroid map
+  filtered to that chase's lights. Opacity + Exposure-gamma envelope.
+- **"Dumb comps" AEGP builder is wired and working** (per-chase
+  "Build in AE" + session "Build all chases"): comps/footage/layers,
+  EXRDemux applied + FNV hashes set, opacity/gamma keyframes, black
+  solid + Lighten, ChaseMaker folder ALWAYS at project root +
+  versioned, scatter build path with seamless-loop wrap layers.
+- Preview FPS tracks the active comp (throttled idle poll). Session
+  save/load (JSON), undo/redo. Tab-X delete confirmation (the only
+  delete affordance). Build-stamp + auto-install POST_BUILD. Windows
+  build emits a matching PDB; load-path diagnostic log (diag_log.h).
 
 **Not yet**:
-- Driving AE itself — no `AEGP_*` calls to create comps, apply
-  EXRDemux effects, set layer hashes, etc. The hand-off into AE is
-  the next big design pass (David hasn't sat down with this).
-- Sub-groups (multiple ordered groups, e.g. "fire group" with its
-  own sort, played alongside the main chase). Today's "exclude" is
-  a binary toggle; there's nowhere for the excluded set to *be*.
-- Notarization (Mac builds still ad-hoc signed).
-- A version-numbering scheme + release process + CI.
+- Bind → precomp emission. Binds currently expand as flat stacked
+  layers; one reusable precomp per bind is still planned (see
+  project_dumb_comps_builder.md).
+- Sub-groups beyond chase-local Bind (multiple independent ordered
+  groups with their own sort played alongside the main chase).
+- Random "pleasantness": brightness/spatial weighting was explicitly
+  deferred — v1 scatter is temporal-only stratification.
+- Notarization (Mac ad-hoc signed). Version scheme + release + CI.
 
-## Working notes from this session (2026-05-13)
+## Working notes (current — 2026-05-15)
 
-- The kbd input saga revealed a lot about how AE handles events.
-  Captured in the `imgui_keyboard_focus.md` memory; if any text
-  input ever breaks again, start there.
-- David explicitly liked the diverse sort modes (Hotspot vs.
-  Centroid, Radial Sweep, etc.). Sort modes are a low-effort high-
-  visibility area to keep enriching.
-- David flagged but did NOT design sub-grouping — wants the actual
-  chase-building flow figured out first so groups fall out of it
-  naturally. **Don't pre-empt that with speculative group UX.**
+- **The multi-day AE crash/freeze saga is RESOLVED** and
+  user-confirmed stable on Win + Mac. Root cause + the (3) fixes +
+  the do-not-revert directives are in
+  `panel_close_reopen_lifecycle.md`. Read it before touching the
+  renderer. WARP on Windows is load-bearing.
+- Keyboard-input recipe: `imgui_keyboard_focus.md` if text input
+  ever breaks again.
+- David likes the diverse sort modes (Hotspot/Centroid/Radial/etc.) —
+  low-effort high-visibility area to keep enriching.
+- Chase-local "Bind" is deliberately chase-scoped, not a session
+  bind, despite reusing Staging's pattern + name. Don't "unify" them.
+- "Random" = the scatter generator, not a sort mode. Don't revert it
+  to random-sort-one-per-stage.

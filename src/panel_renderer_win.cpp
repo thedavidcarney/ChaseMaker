@@ -13,10 +13,12 @@
 #include "file_dialog.h"
 #include "exr_scan.h"
 #include "session_io.h"
+#include "diag_log.h"
 
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_3.h>     // IDXGISwapChain2 — frame-latency waitable object
 #include <ole2.h>          // OleInitialize / RegisterDragDrop / IDropTarget
 #include <shellapi.h>      // DragQueryFile* / CF_HDROP
 #include <shlobj.h>
@@ -38,7 +40,10 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 namespace {
 
 constexpr UINT_PTR kRedrawTimerId = 0xC4A5E;     // arbitrary
-constexpr UINT     kRedrawIntervalMs = 16;       // ~60 Hz
+constexpr UINT     kRedrawIntervalMs = 33;       // ~30 Hz — halve the
+// per-frame GPU + Present pressure we put on AE's main UI thread
+// (RenderFrame runs there). 30 Hz is plenty for a tool panel and
+// markedly cuts contention with AE's own GPU rendering.
 constexpr char     kHostHwndProp[] = "ChaseMakerPanelRenderer";
 constexpr UINT     kMsgGrabFocus = WM_USER + 1;
 
@@ -99,12 +104,18 @@ public:
     WinPanelRenderer(HWND host, PanelState* state)
         : i_host(host), i_state(state)
     {
+        CM_DIAG_LOG("WinRenderer ctor: enter (host=%p)", (void*)host);
+        CM_DIAG_LOG("WinRenderer ctor: -> D3D11CreateDeviceAndSwapChain");
         if (!CreateDeviceAndSwapChain()) {
+            CM_DIAG_LOG("WinRenderer ctor: D3D init FAILED — bailing");
             Cleanup();
             return;
         }
+        CM_DIAG_LOG("WinRenderer ctor: D3D ok -> InitImGui");
         InitImGui();
+        CM_DIAG_LOG("WinRenderer ctor: ImGui ok -> Subclass");
         Subclass();
+        CM_DIAG_LOG("WinRenderer ctor: subclassed");
 
         // Drag-and-drop registration. OleInitialize is per-thread,
         // ref-counted; safe to call even if AE already initialized it.
@@ -125,25 +136,35 @@ public:
         SetTimer(i_host, kRedrawTimerId, kRedrawIntervalMs, nullptr);
 
         i_ready = true;
+        CM_DIAG_LOG("WinRenderer ctor: ready (timer armed)");
     }
 
     ~WinPanelRenderer() override
     {
+        CM_DIAG_LOG("dtor: begin (renderer=%p host=%p)",
+                    (void*)this, (void*)i_host);
         KillTimer(i_host, kRedrawTimerId);
+        CM_DIAG_LOG("dtor: timer killed");
         if (i_drop_target) {
             RevokeDragDrop(i_host);
             i_drop_target->DetachOwner();
             i_drop_target->Release();
             i_drop_target = nullptr;
         }
+        CM_DIAG_LOG("dtor: drag-drop revoked");
         if (i_ole_initialized) {
             OleUninitialize();
             i_ole_initialized = false;
         }
+        CM_DIAG_LOG("dtor: OLE uninit");
         Unsubclass();
+        CM_DIAG_LOG("dtor: unsubclassed");
         ReleaseAllThumbnailTextures();
+        CM_DIAG_LOG("dtor: thumbnails released");
         ShutdownImGui();
+        CM_DIAG_LOG("dtor: ImGui shutdown");
         Cleanup();
+        CM_DIAG_LOG("dtor: done (D3D released)");
     }
 
     // Called by CMDropTarget after a successful drop with one or more
@@ -274,8 +295,12 @@ public:
         case WM_SIZE: {
             if (i_device && wparam != SIZE_MINIMIZED) {
                 ReleaseRenderTarget();
+                // Must keep the WAITABLE flag on resize, else the
+                // frame-latency object stops working. The waitable
+                // handle itself stays valid across ResizeBuffers.
                 HRESULT hr = i_swapChain->ResizeBuffers(
-                    0, LOWORD(lparam), HIWORD(lparam), DXGI_FORMAT_UNKNOWN, 0);
+                    0, LOWORD(lparam), HIWORD(lparam), DXGI_FORMAT_UNKNOWN,
+                    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
                 if (SUCCEEDED(hr)) {
                     CreateRenderTarget();
                 }
@@ -291,6 +316,25 @@ public:
         }
         case WM_ERASEBKGND:
             return 1; // DX11 paints the full client area; skip GDI erase.
+        case WM_NCDESTROY: {
+            // AE destroyed the panel's container window (panel closed).
+            // Nothing tears this renderer down otherwise — there's no
+            // AEGP panel-destroy callback and AE makes a brand-new
+            // container on reopen. Without this we leak the renderer
+            // (D3D device, ImGui ctx, subclass, timer) every close and
+            // a zombie WM_TIMER keeps racing the next renderer over
+            // the shared PanelState. Canonical Win32 subclass teardown:
+            // delete self, then chain to the original wndproc. Capture
+            // what we need first — `this` is gone after delete.
+            WNDPROC prev = i_prevWndProc;
+            HWND h = i_host;
+            CM_DIAG_LOG("WM_NCDESTROY: enter (renderer=%p host=%p) "
+                        "-> delete this", (void*)this, (void*)h);
+            delete this;   // ~WinPanelRenderer: Unsubclass + release all
+            CM_DIAG_LOG("WM_NCDESTROY: deleted; chaining prev wndproc");
+            if (prev) return CallWindowProc(prev, h, msg, wparam, lparam);
+            return DefWindowProc(h, msg, wparam, lparam);
+        }
         }
 
         if (i_prevWndProc) {
@@ -311,7 +355,17 @@ private:
         desc.OutputWindow = i_host;
         desc.SampleDesc.Count = 1;
         desc.Windowed = TRUE;
-        desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        // FLIP model + a frame-latency WAITABLE object. This is the
+        // real fix for the AE-wide freeze: three symbolized dumps showed
+        // AE's main UI thread parked in dxgi!Present -> nvwgf2umx from
+        // our RenderFrame (bitblt DISCARD + sync-interval/DO_NOT_WAIT
+        // tweaks could NOT stop it). With the waitable + max-latency 1,
+        // we poll the waitable non-blocking at the top of RenderFrame
+        // and only ever render/Present when the swapchain says the GPU
+        // is ready — so Present never has an outstanding frame to block
+        // on, and AE's thread is never parked in the driver.
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
         UINT flags = 0;
 #ifdef _DEBUG
@@ -323,12 +377,48 @@ private:
             D3D_FEATURE_LEVEL_10_0,
         };
         D3D_FEATURE_LEVEL gotLevel;
+        // Use the WARP software rasterizer, NOT the hardware (NVIDIA)
+        // driver. EVERY crash/hang dump in this investigation faults
+        // or blocks inside nvwgf2umx.dll (the NVIDIA D3D UMD): AE alone
+        // runs the project fine forever, but our panel adding a SECOND
+        // hardware D3D11 device on the same driver in AE's process
+        // destabilises it (UI-thread Present hangs, then a stack
+        // overflow inside the driver's own worker thread — confirmed
+        // by the AE/Sentry fault dump, 0 ChaseMaker frames on it).
+        // Our panel is a trivial 2D ImGui UI — it does not need GPU
+        // acceleration. WARP keeps us entirely off nvwgf2umx; AE still
+        // owns the GPU for its rendering. If WARP somehow fails, fall
+        // back to hardware so the panel at least draws.
+        CM_DIAG_LOG("D3D: D3D11CreateDeviceAndSwapChain call (WARP)");
         HRESULT hr = D3D11CreateDeviceAndSwapChain(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+            nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
             featureLevels, ARRAYSIZE(featureLevels), D3D11_SDK_VERSION,
             &desc, &i_swapChain, &i_device, &gotLevel, &i_context);
+        CM_DIAG_LOG("D3D: WARP create hr=0x%08lx", (unsigned long)hr);
+        if (FAILED(hr)) {
+            CM_DIAG_LOG("D3D: WARP failed -> falling back to HARDWARE");
+            hr = D3D11CreateDeviceAndSwapChain(
+                nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+                featureLevels, ARRAYSIZE(featureLevels), D3D11_SDK_VERSION,
+                &desc, &i_swapChain, &i_device, &gotLevel, &i_context);
+            CM_DIAG_LOG("D3D: HARDWARE fallback hr=0x%08lx",
+                        (unsigned long)hr);
+        }
         if (FAILED(hr)) {
             return false;
+        }
+        // Grab the frame-latency waitable + cap queued frames at 1.
+        {
+            IDXGISwapChain2* sc2 = nullptr;
+            if (SUCCEEDED(i_swapChain->QueryInterface(IID_PPV_ARGS(&sc2))) &&
+                sc2)
+            {
+                sc2->SetMaximumFrameLatency(1);
+                i_frameLatencyWaitable = sc2->GetFrameLatencyWaitableObject();
+                sc2->Release();
+            }
+            CM_DIAG_LOG("D3D: flip-model swapchain, waitable=%p",
+                        (void*)i_frameLatencyWaitable);
         }
         CreateRenderTarget();
         return true;
@@ -354,6 +444,10 @@ private:
         if (i_swapChain) { i_swapChain->Release(); i_swapChain = nullptr; }
         if (i_context)   { i_context->Release();   i_context = nullptr; }
         if (i_device)    { i_device->Release();    i_device = nullptr; }
+        if (i_frameLatencyWaitable) {
+            CloseHandle(i_frameLatencyWaitable);
+            i_frameLatencyWaitable = nullptr;
+        }
     }
 
     void InitImGui()
@@ -385,12 +479,43 @@ private:
     void RenderFrame()
     {
         if (!i_imguiCtx || !i_rtv) return;
+        // Don't spend GPU on a hidden/minimized panel (e.g. tabbed
+        // behind another AE panel). RenderFrame runs on AE's main UI
+        // thread; every frame we draw here competes with AE's own GPU
+        // work, and a blocked Present here freezes all of AE. No
+        // point paying that cost when nothing's on screen.
+        if (!IsWindowVisible(i_host) || IsIconic(i_host)) return;
+        // THE freeze fix: only render when the swapchain's frame-
+        // latency waitable says the GPU has consumed the previous
+        // frame. Poll with timeout 0 (NON-blocking) — if it isn't
+        // ready we skip this tick entirely rather than ever blocking
+        // AE's UI thread inside Present/the GPU driver. This is the
+        // single guarantee that our panel can't wedge all of AE.
+        if (i_frameLatencyWaitable &&
+            WaitForSingleObject(i_frameLatencyWaitable, 0) != WAIT_OBJECT_0)
+        {
+            return;
+        }
         if (i_frame_in_progress) return;   // skip reentrant calls
         i_frame_in_progress = true;
         ImGui::SetCurrentContext(i_imguiCtx);
 
+        // Per-INSTANCE first-frame logging (not process-global static)
+        // so every renderer — including ones created on panel reopen —
+        // logs its own first render. Each step is bracketed on the
+        // first frame so a hang pinpoints the stuck call.
+        const bool first = !i_logged_first_frame;
+        if (first) {
+            i_logged_first_frame = true;
+            CM_DIAG_LOG("RenderFrame: first frame begin (renderer=%p)",
+                        (void*)this);
+        }
+
+        if (first) CM_DIAG_LOG("RenderFrame: -> EnsureThumbnailTextures");
         EnsureThumbnailTextures();
+        if (first) CM_DIAG_LOG("RenderFrame: <- EnsureThumbnailTextures");
         UpdateChasePreviewTexture();
+        if (first) CM_DIAG_LOG("RenderFrame: <- UpdateChasePreviewTexture");
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -398,11 +523,13 @@ private:
 
         RECT rc;
         GetClientRect(i_host, &rc);
+        if (first) CM_DIAG_LOG("RenderFrame: -> panel_ui::RenderFrame");
         panel_ui::RenderFrame(i_state,
             static_cast<float>(rc.right - rc.left),
             static_cast<float>(rc.bottom - rc.top),
             i_host,
             "Windows / DX11");
+        if (first) CM_DIAG_LOG("RenderFrame: <- panel_ui::RenderFrame");
 
         ImGui::Render();
 
@@ -410,7 +537,30 @@ private:
         i_context->OMSetRenderTargets(1, &i_rtv, nullptr);
         i_context->ClearRenderTargetView(i_rtv, clearColor);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        i_swapChain->Present(1, 0);
+        // NON-BLOCKING present. This runs on AE's main UI thread
+        // (WM_TIMER/WM_PAINT -> our subclassed WndProc -> RenderFrame).
+        // Two confirmed hang dumps showed the AE main thread parked
+        // inside the NVIDIA D3D UMD (nvwgf2umx) via dxgi!Present from
+        // this exact call: when AE is saturating the GPU (rendering
+        // the EXRDemux comp), Present blocks here and freezes ALL of
+        // AE. Sync interval 0 didn't help (the wait is the busy
+        // present-queue/driver, not vblank). DXGI_PRESENT_DO_NOT_WAIT
+        // makes Present return DXGI_ERROR_WAS_STILL_DRAWING instead
+        // of blocking the host thread — we just drop the frame and
+        // try again on the next timer tick. Never let our panel's
+        // Present stall AE's UI thread.
+        // DXGI_ERROR_WAS_STILL_DRAWING here just means "GPU/present
+        // queue busy (AE is rendering) — frame intentionally dropped";
+        // it is NOT an error and we still fall through to reset state
+        // + drain deferred UI actions so file dialogs / session I/O
+        // aren't starved while the GPU is hot.
+        HRESULT pr = i_swapChain->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+
+        if (pr != DXGI_ERROR_WAS_STILL_DRAWING && !i_logged_first_present) {
+            i_logged_first_present = true;
+            CM_DIAG_LOG("RenderFrame: first Present done (renderer=%p)",
+                        (void*)this);
+        }
 
         i_frame_in_progress = false;
 
@@ -431,7 +581,23 @@ private:
             i_chase_composite_srv->Release();
             i_chase_composite_srv = nullptr;
         }
-        if (i_state) i_state->chase_composite_texture_id = 0;
+        // CRITICAL: PanelState (and its LayerInfo::texture_id) outlives
+        // this renderer — it survives panel close/reopen. The SRVs we
+        // just released belong to THIS renderer's D3D device. If we
+        // leave the ids non-zero, the next renderer (new device) sees
+        // `texture_id != 0`, skips re-upload, and ImGui draws a freed
+        // cross-device handle → AE render-manager crash. Zero them so
+        // a fresh renderer always re-uploads on its own device.
+        if (i_state) {
+            CM_DIAG_LOG("ReleaseThumbs: acquiring state.mu");
+            std::lock_guard<std::mutex> lk(i_state->mu);
+            CM_DIAG_LOG("ReleaseThumbs: state.mu held; zeroing texture ids");
+            for (auto& src : i_state->sources) {
+                for (auto& L : src.layers) L.texture_id = 0;
+            }
+            i_state->chase_composite_texture_id = 0;
+            CM_DIAG_LOG("ReleaseThumbs: done");
+        }
     }
 
     void UpdateChasePreviewTexture()
@@ -541,10 +707,6 @@ private:
             }
             InvalidateRect(i_host, nullptr, FALSE);
         }
-        if (i_state->want_write_sidecar.exchange(false)) {
-            exr_scan::WriteLuminositySidecar(i_state);
-            InvalidateRect(i_host, nullptr, FALSE);
-        }
         if (i_state->want_save_session.exchange(false)) {
             std::string path;
             {
@@ -607,11 +769,14 @@ private:
     ID3D11Device*           i_device = nullptr;
     ID3D11DeviceContext*    i_context = nullptr;
     IDXGISwapChain*         i_swapChain = nullptr;
+    HANDLE                  i_frameLatencyWaitable = nullptr;
     ID3D11RenderTargetView* i_rtv = nullptr;
     ImGuiContext*           i_imguiCtx = nullptr;
     bool                    i_ready = false;
     bool                    i_frame_in_progress = false;
     bool                    i_in_dialog = false;
+    bool                    i_logged_first_frame = false;
+    bool                    i_logged_first_present = false;
     PanelState*             i_state = nullptr;
     std::vector<ID3D11ShaderResourceView*> i_thumb_srvs;
     int                     i_last_scan_gen = -1;
@@ -673,6 +838,8 @@ HRESULT STDMETHODCALLTYPE CMDropTarget::Drop(IDataObject* pDataObj,
 PanelRenderer* CreatePanelRenderer(void* container, PanelState* state)
 {
     HWND hwnd = static_cast<HWND>(container);
+    CM_DIAG_LOG("CreatePanelRenderer: container=%p isWindow=%d state=%p",
+                container, hwnd ? (int)IsWindow(hwnd) : -1, (void*)state);
     if (!hwnd || !IsWindow(hwnd) || !state) return nullptr;
     return new WinPanelRenderer(hwnd, state);
 }

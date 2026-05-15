@@ -441,9 +441,15 @@ std::string BuildSessionJson(const PanelState& state)
         out += "\",\n";
         std::snprintf(buf, sizeof(buf),
             "      \"sort_mode\": %d, \"sort_reverse\": %s, \"random_seed\": %u,\n"
-            "      \"desired_stage_count\": %d,\n",
+            "      \"desired_stage_count\": %d, \"symmetric_pairs\": %s, "
+            "\"manual_stages\": %s,\n"
+            "      \"random_scatter\": %s, \"loop_seconds\": %.3f, "
+            "\"scatter_density\": %d,\n",
             (int)c.sort_mode, c.sort_reverse ? "true" : "false", c.random_seed,
-            c.desired_stage_count);
+            c.desired_stage_count, c.symmetric_pairs ? "true" : "false",
+            c.manual_stages ? "true" : "false",
+            c.random_scatter ? "true" : "false", c.loop_seconds,
+            c.scatter_density);
         out += buf;
         out += "      \"tag_filter\": [";
         for (size_t ti = 0; ti < c.tag_filter.size(); ++ti) {
@@ -660,6 +666,11 @@ bool LoadSession(PanelState* state, const std::string& path)
                 if (const JsonValue* x = e.find("sort_reverse")) c.sort_reverse = x->as_bool();
                 if (const JsonValue* x = e.find("random_seed"))  c.random_seed  = x->as_u32();
                 if (const JsonValue* x = e.find("desired_stage_count")) c.desired_stage_count = x->as_int(0);
+                if (const JsonValue* x = e.find("symmetric_pairs")) c.symmetric_pairs = x->as_bool();
+                if (const JsonValue* x = e.find("manual_stages"))   c.manual_stages   = x->as_bool();
+                if (const JsonValue* x = e.find("random_scatter"))  c.random_scatter  = x->as_bool();
+                if (const JsonValue* x = e.find("loop_seconds"))    c.loop_seconds    = x->as_float(10.0f);
+                if (const JsonValue* x = e.find("scatter_density")) c.scatter_density = x->as_int(5);
                 if (const JsonValue* x = e.find("tag_filter")) {
                     for (const auto& t : x->arr) c.tag_filter.push_back(t.as_u32());
                 }

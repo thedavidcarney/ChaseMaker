@@ -155,6 +155,16 @@ struct ChaseStage {
     std::vector<LayerRef>   members;
 };
 
+// One scattered hit in a Random-scatter chase: a single light fires
+// at `start_frame` within the loop, with the chase's hit envelope.
+// Generated deterministically from (seed, density, loop length) by
+// RegenerateScatter; never hand-authored. Bind members share a hit
+// time (one ScatterHit per member, same start_frame).
+struct ScatterHit {
+    LayerRef                ref;
+    float                   start_frame = 0.f;   // [0, loop_frames)
+};
+
 // Per-chase envelope shape. Maps onto the NWE Light Hit presets but
 // is fully parameterised. Hit duration + step duration together
 // imply overlap (if step < duration, hits overlap).
@@ -183,12 +193,40 @@ struct Chase {
     // Used by the "3 Step Chase" template (=3) and the user-facing
     // "Stages" slider in the chase editor.
     int                     desired_stage_count = 0;
+    // Symmetric center-out staging. When true, RegenerateChaseStages
+    // ignores desired_stage_count and instead orders the eligible
+    // lights by sort_mode, then builds stages from the middle
+    // outward: the center light(s) fire first, then each mirrored
+    // pair welds into one stage (lights 1..5 -> [3],[2,4],[1,5]).
+    // Set by the "Center Out" template.
+    bool                    symmetric_pairs = false;
+    // When true the user has hand-authored `stages` (drag-reorder,
+    // weld, split in the chase editor). RegenerateChaseStages then
+    // leaves `stages` untouched so the arrangement survives the
+    // per-frame refresh and session save/load. Cleared by the
+    // editor's "Reset to auto" button.
+    bool                    manual_stages = false;
     // Cached stage list, regenerated on the fly from (sort_mode,
     // sort_reverse, random_seed, tag_filter, desired_stage_count,
-    // staged inclusion). The chase editor auto-refreshes this each
-    // frame so it never drifts from current state.
+    // staged inclusion) unless manual_stages is set, in which case
+    // it is authored by the user. The chase editor auto-refreshes
+    // this each frame so it never drifts from current state.
     std::vector<ChaseStage> stages;
     ChaseTiming             timing;
+
+    // ---- Random-scatter mode (the "Random" template) ----
+    // A fundamentally different generator from the stage sequence
+    // above: every eligible light gets `scatter_density` copies
+    // spread across a seamless loop of `loop_seconds`, one per
+    // stratified time bucket so a light never stacks on itself and
+    // coverage stays even (not clumpy/sparse). Deterministic from
+    // `random_seed`. When true, sort_mode / desired_stage_count /
+    // symmetric_pairs / manual_stages / stages are all ignored;
+    // `scatter` is the cached output (regenerated each frame).
+    bool                    random_scatter = false;
+    float                   loop_seconds   = 10.0f;
+    int                     scatter_density = 5;
+    std::vector<ScatterHit> scatter;
 };
 
 // The big-three top-level tabs. Chase tabs live in their own vector
@@ -223,13 +261,22 @@ inline bool operator==(const ChaseTiming& a, const ChaseTiming& b) {
 inline bool operator==(const ChaseStage& a, const ChaseStage& b) {
     return a.members == b.members;
 }
+inline bool operator==(const ScatterHit& a, const ScatterHit& b) {
+    return a.ref == b.ref && a.start_frame == b.start_frame;
+}
 inline bool operator==(const Chase& a, const Chase& b) {
     return a.chase_id == b.chase_id && a.name == b.name &&
            a.sort_mode == b.sort_mode && a.sort_reverse == b.sort_reverse &&
            a.random_seed == b.random_seed &&
            a.desired_stage_count == b.desired_stage_count &&
+           a.symmetric_pairs == b.symmetric_pairs &&
+           a.manual_stages == b.manual_stages &&
            a.tag_filter == b.tag_filter &&
-           a.stages == b.stages && a.timing == b.timing;
+           a.stages == b.stages && a.timing == b.timing &&
+           a.random_scatter == b.random_scatter &&
+           a.loop_seconds == b.loop_seconds &&
+           a.scatter_density == b.scatter_density &&
+           a.scatter == b.scatter;
 }
 
 // ===== Undo snapshot ==================================================
@@ -320,7 +367,6 @@ struct PanelState {
     std::string                last_error;
     std::string                last_status;  // human-readable progress msg
     std::atomic<bool>          scanning{false};
-    std::atomic<bool>          sidecar_written{false};
 
     // Deferred-action flags: set by the UI during a frame, consumed
     // by the platform renderer AFTER ImGui::Render() returns and the
@@ -329,7 +375,6 @@ struct PanelState {
     // the middle of an ImGui frame — that triggered reentrant
     // RenderFrame calls and a crash on Windows.
     std::atomic<bool>          want_pick_exr{false};
-    std::atomic<bool>          want_write_sidecar{false};
 
     // ---- Preview animation (cycles through included layers) ----
     // Touched only from the UI thread; no synchronisation needed.
@@ -395,6 +440,10 @@ struct PanelState {
     // create-chase form instead of the chase editor. Set by the
     // "+" button; cleared when the user picks a template.
     bool                          chase_in_wizard = false;
+    // Set to a chase index when the user clicks a chase tab's close
+    // (X) button; drives the top-level delete-confirmation modal.
+    // -1 = no pending close. UI-thread only.
+    int                           chase_pending_close_index = -1;
 
     // ---- Session file ----
     // Where the last load/save lives. Empty = unsaved.
@@ -418,7 +467,10 @@ struct PanelState {
 
     // ---- Wizard form state (reset each time wizard opens) ----
     int                           wizard_template_index = 0;   // index in template list
-    int                           wizard_tag_filter_index = -1; // -1 = all
+    // Selected tag IDs for the new chase's filter. Empty = all
+    // staged layers (no filter). Multi-select with All/None in the
+    // wizard; copied verbatim into Chase::tag_filter on create.
+    std::vector<uint32_t>         wizard_tag_filter;
     float                         wizard_step_duration = 4.0f;
     float                         wizard_hit_duration = 30.0f;
 
@@ -475,7 +527,15 @@ struct PanelState {
     // single texture and publishes the resulting id back here.
     bool                          chase_preview_playing = false;
     float                         chase_preview_frame   = 0.f;
-    float                         chase_preview_fps     = 24.f;
+    // Tracks the active AE comp's frame rate. Written from the AEGP
+    // idle hook (ae_build::RefreshProjectFps) so the preview's
+    // seconds readout + playback speed match the project instead of
+    // a hardcoded value; read on the UI thread — hence atomic.
+    std::atomic<float>            chase_preview_fps{24.f};
+    // Click-to-pin uses the shared `selected_hash` (set by a chase
+    // table row click or a centroid-dot click): when not playing and
+    // that layer belongs to the chase, the preview freezes on its
+    // whole stage. See the build-composite block in DrawChaseEditor.
     std::vector<uint8_t>          chase_composite_rgba;
     int                           chase_composite_w     = 0;
     int                           chase_composite_h     = 0;
@@ -606,6 +666,83 @@ inline const Chase* ActiveChase(const PanelState& state)
         return nullptr;
     }
     return &state.chases[state.active_chase_index];
+}
+
+// Loop length in frames for a Random-scatter chase at `fps`.
+inline int ScatterLoopFrames(const Chase& chase, float fps)
+{
+    // No std::max/std::min in this header: <windows.h> (pulled in
+    // before panel_state.h by some TUs) defines max/min macros.
+    const float fps_eff = (fps < 1.f) ? 1.f : fps;
+    const long f = std::lround(chase.loop_seconds * fps_eff);
+    return static_cast<int>(f < 1 ? 1 : f);
+}
+
+// Regenerate a scatter chase's hit list deterministically from
+// (random_seed, scatter_density, loop_seconds, fps, eligible set).
+// Shared by the UI (per-frame, for the preview) AND the AE builder
+// (so a Random comp is fully populated even when its tab was never
+// opened / after a session load / via Build-all — otherwise the
+// comp would be empty/black). Per light: one jittered hit per
+// stratified time bucket + a per-light phase, so a light never
+// self-stacks and coverage stays even. Binds share each hit time.
+inline void RegenerateScatter(Chase& chase, const PanelState& state,
+                              float fps)
+{
+    chase.scatter.clear();
+    const Source* src = ActiveSource(state);
+    if (!src) return;
+    const int loop_frames = ScatterLoopFrames(chase, fps);
+    const int density = (chase.scatter_density < 1) ? 1
+                                                    : chase.scatter_density;
+
+    struct Lead { LayerRef repr; std::vector<LayerRef> members; };
+    std::vector<Lead> leads;
+    std::vector<uint32_t> bind_seen;
+    for (const auto& L : src->layers) {
+        if (!L.included) continue;
+        LayerRef ref{ src->source_id, L.fnv1a_hash };
+        if (!chase.tag_filter.empty()) {
+            bool in_any = false;
+            for (uint32_t tid : chase.tag_filter) {
+                if (const Tag* t = FindTagById(state, tid)) {
+                    for (const auto& m : t->members)
+                        if (m == ref) { in_any = true; break; }
+                }
+                if (in_any) break;
+            }
+            if (!in_any) continue;
+        }
+        if (const Bind* b = BindOfLayer(state, ref)) {
+            bool seen = false;
+            for (uint32_t id : bind_seen)
+                if (id == b->bind_id) { seen = true; break; }
+            if (!seen) {
+                bind_seen.push_back(b->bind_id);
+                leads.push_back({ ref, b->members });
+            }
+        } else {
+            leads.push_back({ ref, { ref } });
+        }
+    }
+    if (leads.empty()) return;
+
+    const float bucket = static_cast<float>(loop_frames) /
+                         static_cast<float>(density);
+    for (const auto& lead : leads) {
+        uint32_t s = chase.random_seed ^
+            (lead.repr.fnv1a_hash * 2654435761u + 0x9E3779B9u);
+        std::mt19937 rng(s ? s : 1u);
+        std::uniform_real_distribution<float> u01(0.f, 1.f);
+        const float phase = u01(rng) * static_cast<float>(loop_frames);
+        for (int k = 0; k < density; ++k) {
+            float t = bucket * (static_cast<float>(k) + u01(rng)) + phase;
+            t = std::fmod(t, static_cast<float>(loop_frames));
+            if (t < 0.f) t += static_cast<float>(loop_frames);
+            for (const auto& m : lead.members)
+                chase.scatter.push_back(ScatterHit{ m, t });
+        }
+    }
 }
 
 // In-place sort. Layer fields are all pre-computed on scan, so any
@@ -835,6 +972,43 @@ inline void AutotagByName(PanelState* state)
             if (!already) { tag->members.push_back(m); ++members_added; }
         }
     }
+    // Auto-tag UNIQUE-named layers too: any layer not absorbed into a
+    // shared-prefix tag (its prefix group had <2 members, or it had
+    // no usable prefix) gets its OWN single-member tag named exactly
+    // after the layer. Otherwise unique lights (e.g. "Top Light Down")
+    // would be unreachable from the wizard's tag filter — there is no
+    // separate "untagged" bucket by design; every light is tagged.
+    // Idempotent (re-run after each scan): reuses an existing
+    // same-named tag and skips members already present.
+    std::vector<uint32_t> covered;
+    for (auto& kv : by_prefix) {
+        if (kv.second.size() < 2) continue;
+        for (const auto& m : kv.second) covered.push_back(m.fnv1a_hash);
+    }
+    for (const auto& L : src.layers) {
+        bool is_covered = false;
+        for (uint32_t h : covered)
+            if (h == L.fnv1a_hash) { is_covered = true; break; }
+        if (is_covered) continue;
+        LayerRef ref{ src.source_id, L.fnv1a_hash };
+        Tag* tag = nullptr;
+        for (auto& t : state->tags)
+            if (t.name == L.display_name) { tag = &t; break; }
+        if (!tag) {
+            Tag nt;
+            nt.tag_id = state->next_tag_id++;
+            nt.name   = L.display_name;
+            nt.color  = ColorForId(nt.tag_id);
+            state->tags.push_back(std::move(nt));
+            tag = &state->tags.back();
+            ++created;
+        }
+        bool already = false;
+        for (const auto& em : tag->members)
+            if (em == ref) { already = true; break; }
+        if (!already) { tag->members.push_back(ref); ++members_added; }
+    }
+
     if (created > 0 || members_added > 0) {
         char buf[160];
         std::snprintf(buf, sizeof(buf),

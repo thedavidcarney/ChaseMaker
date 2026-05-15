@@ -498,7 +498,6 @@ void DoScan(const std::string& path, PanelState* state,
             state->active_source_index = (int)state->sources.size() - 1;
             state->last_error.clear();
             state->last_status  = "Scan complete.";
-            state->sidecar_written = false;
         }
         // Auto-tag-by-name once the source is published. Idempotent
         // against repeated calls (existing tags get new members added,
@@ -514,35 +513,6 @@ void DoScan(const std::string& path, PanelState* state,
             state->active_source_index = -1;
         }
     }
-}
-
-// Minimal JSON-string escaper. Covers the cases that can appear in
-// EXR layer names (quotes, backslashes, control chars). Output is
-// ASCII-safe; non-ASCII bytes pass through unchanged as raw UTF-8.
-std::string JsonEscape(const std::string& s)
-{
-    std::string out;
-    out.reserve(s.size() + 2);
-    for (unsigned char c : s) {
-        switch (c) {
-        case '"':  out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\b': out += "\\b";  break;
-        case '\f': out += "\\f";  break;
-        case '\n': out += "\\n";  break;
-        case '\r': out += "\\r";  break;
-        case '\t': out += "\\t";  break;
-        default:
-            if (c < 0x20) {
-                char buf[8];
-                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                out += buf;
-            } else {
-                out += static_cast<char>(c);
-            }
-        }
-    }
-    return out;
 }
 
 } // namespace
@@ -655,109 +625,6 @@ bool IncludeSkippedLayer(PanelState* state, uint32_t source_id,
         state->last_error = std::string("Include failed: ") + e.what();
         return false;
     }
-}
-
-bool WriteLuminositySidecar(PanelState* state)
-{
-    if (!state) return false;
-
-    std::string path;
-    int w = 0, h = 0;
-    std::vector<LayerInfo> layers_copy;
-    {
-        std::lock_guard<std::mutex> lk(state->mu);
-        const Source* src = ActiveSource(*state);
-        if (!src || src->path.empty() || src->layers.empty()) {
-            state->last_error = "Nothing to write (no scan results).";
-            return false;
-        }
-        path = src->path;
-        w = src->image_width;
-        h = src->image_height;
-        layers_copy = src->layers;
-    }
-
-    namespace fs = std::filesystem;
-    const fs::path exr_path = fs::u8path(path);
-    const fs::path sidecar_path = fs::u8path(path + ".luminosity.json");
-    const std::string source_filename = exr_path.filename().u8string();
-
-    int64_t mtime_unix = 0;
-    {
-        std::error_code ec;
-        auto ftime = fs::last_write_time(exr_path, ec);
-        if (!ec) {
-            // file_clock -> system_clock conversion is non-portable
-            // before C++20; this round-trips via duration since epoch
-            // measured by file_clock's own epoch, which is sufficient
-            // for staleness-checking by EXRDemux's JSX.
-            auto sys_now  = std::chrono::system_clock::now();
-            auto file_now = decltype(ftime)::clock::now();
-            auto sys_time = std::chrono::time_point_cast<std::chrono::seconds>(
-                std::chrono::system_clock::time_point(
-                    std::chrono::duration_cast<std::chrono::system_clock::duration>(
-                        ftime.time_since_epoch() -
-                        (file_now.time_since_epoch() - sys_now.time_since_epoch()))));
-            mtime_unix = sys_time.time_since_epoch().count();
-        }
-    }
-
-    std::ofstream out(sidecar_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        std::lock_guard<std::mutex> lk(state->mu);
-        state->last_error = "Could not open sidecar for writing: " +
-                            sidecar_path.u8string();
-        return false;
-    }
-
-    out << "{\n";
-    out << "  \"version\": 1,\n";
-    out << "  \"source\": \"" << JsonEscape(source_filename) << "\",\n";
-    out << "  \"source_mtime_utc\": " << mtime_unix << ",\n";
-    out << "  \"image_size\": [" << w << ", " << h << "],\n";
-    out << "  \"layers\": {\n";
-    for (size_t i = 0; i < layers_copy.size(); ++i) {
-        const LayerInfo& L = layers_copy[i];
-        out << "    \"" << JsonEscape(L.display_name) << "\": {"
-            << "\"cx\": "    << L.cx
-            << ", \"cy\": "  << L.cy
-            << ", \"total\": " << L.total
-            << "}";
-        if (i + 1 < layers_copy.size()) out << ",";
-        out << "\n";
-    }
-    out << "  },\n";
-
-    // active_order: the included subset in the user's chosen
-    // playback order (currently the scan-sorted order with excluded
-    // layers filtered out). Additive to the contract documented in
-    // CLAUDE.md — readers that don't know about this field can fall
-    // back to sorting `layers` by cx themselves.
-    out << "  \"active_order\": [\n";
-    bool first = true;
-    for (const auto& L : layers_copy) {
-        if (!L.included) continue;
-        if (!first) out << ",\n";
-        out << "    \"" << JsonEscape(L.display_name) << "\"";
-        first = false;
-    }
-    if (!first) out << "\n";
-    out << "  ]\n";
-    out << "}\n";
-
-    if (!out.good()) {
-        std::lock_guard<std::mutex> lk(state->mu);
-        state->last_error = "Write failed mid-stream.";
-        return false;
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(state->mu);
-        state->last_status = "Sidecar written: " + sidecar_path.u8string();
-        state->last_error.clear();
-    }
-    state->sidecar_written = true;
-    return true;
 }
 
 } // namespace exr_scan

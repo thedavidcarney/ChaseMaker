@@ -142,14 +142,12 @@ struct FrameSnapshot {
     std::string                    last_error;
     std::string                    last_status;
     bool                           scanning = false;
-    bool                           sidecar_written = false;
 };
 
 FrameSnapshot TakeSnapshot(PanelState* state)
 {
     FrameSnapshot s;
     s.scanning        = state->scanning.load();
-    s.sidecar_written = state->sidecar_written.load();
     std::lock_guard<std::mutex> lk(state->mu);
     s.active_tab         = state->active_tab;
     s.active_chase_index = state->active_chase_index;
@@ -238,7 +236,8 @@ void DrawCentroidCanvas(const std::vector<LayerInfo>& layers,
                         int selected_index,
                         SortMode sort_mode,
                         float requested_height,
-                        PanelState* state = nullptr)
+                        PanelState* state = nullptr,
+                        bool allow_drag = true)
 {
     const float pane_w = ImGui::GetContentRegionAvail().x;
     if (pane_w < 80.f) {
@@ -369,9 +368,16 @@ void DrawCentroidCanvas(const std::vector<LayerInfo>& layers,
         {
             int hit = hit_test_dot();
             if (hit >= 0) {
-                state->drag_armed_source_id  = source_id;
-                state->drag_armed_layer_hash = layers[hit].fnv1a_hash;
-                state->drag_armed_press_time = ImGui::GetTime();
+                // Drag-to-reposition the centroid is a Staging-only
+                // affordance (Staging is the master config; Chase mode
+                // is for manual tweaks, not moving lights around). When
+                // drags are disabled we still select on press so the
+                // click-to-pin preview works in the chase editor.
+                if (allow_drag) {
+                    state->drag_armed_source_id  = source_id;
+                    state->drag_armed_layer_hash = layers[hit].fnv1a_hash;
+                    state->drag_armed_press_time = ImGui::GetTime();
+                }
                 // Plain-click-style selection on press: replace the
                 // multi-select set with this single layer so the
                 // visual + context-menu state matches the row-click
@@ -1563,6 +1569,46 @@ bool BuildChaseComposite(const Chase& chase, const PanelState& state,
     return true;
 }
 
+// Composite an explicit set of layer refs at full strength (no
+// envelope). Used by the chase preview's click-to-pin: clicking a
+// layer freezes the preview on just that light (or, if it sits in a
+// multi-light stage, that whole stage). Same accumulation as
+// BuildChaseComposite with k = 1.
+bool BuildRefsComposite(const std::vector<LayerRef>& refs,
+                        const PanelState& state,
+                        std::vector<uint8_t>& out_rgba,
+                        int& out_w, int& out_h)
+{
+    out_w = 0; out_h = 0;
+    for (const auto& ref : refs) {
+        const LayerInfo* L = FindLayerByRef(state, ref);
+        if (L && L->thumb_w > 0 && L->thumb_h > 0) {
+            out_w = L->thumb_w; out_h = L->thumb_h;
+            break;
+        }
+    }
+    if (out_w == 0 || out_h == 0) return false;
+    const size_t n = static_cast<size_t>(out_w) * out_h;
+    out_rgba.assign(n * 4, 0);
+    for (const auto& ref : refs) {
+        const LayerInfo* L = FindLayerByRef(state, ref);
+        if (!L || L->thumb_rgba.empty()) continue;
+        if (L->thumb_w != out_w || L->thumb_h != out_h) continue;
+        const uint8_t* s = L->thumb_rgba.data();
+        uint8_t* d = out_rgba.data();
+        for (size_t i = 0; i < n; ++i) {
+            int r = d[i*4+0] + s[i*4+0];
+            int g = d[i*4+1] + s[i*4+1];
+            int b = d[i*4+2] + s[i*4+2];
+            d[i*4+0] = static_cast<uint8_t>(r > 255 ? 255 : r);
+            d[i*4+1] = static_cast<uint8_t>(g > 255 ? 255 : g);
+            d[i*4+2] = static_cast<uint8_t>(b > 255 ? 255 : b);
+            d[i*4+3] = 255;
+        }
+    }
+    return true;
+}
+
 // ===== Chase JSON exporter ============================================
 
 std::string JsonEscapeForChase(const std::string& s)
@@ -1595,6 +1641,13 @@ std::string JsonEscapeForChase(const std::string& s)
 void RegenerateChaseStages(Chase& chase, const PanelState& state,
                            int stages_count_hint)
 {
+    // Random-scatter chases don't use the stage sequence at all —
+    // they own `scatter` instead (see RegenerateScatter).
+    if (chase.random_scatter) return;
+    // Manual arrangement: the user owns `stages` (drag-reorder, weld,
+    // split in the editor). Don't recompute — leave it as authored so
+    // it survives the per-frame refresh and session round-trips.
+    if (chase.manual_stages) return;
     chase.stages.clear();
     const Source* src = ActiveSource(state);
     if (!src) return;
@@ -1691,6 +1744,31 @@ void RegenerateChaseStages(Chase& chase, const PanelState& state,
         }
     }
 
+    // Symmetric center-out: order is already set by sort_mode (the
+    // "Center Out" template uses CentroidX = left->right). Build
+    // stages from the middle outward — the center light(s) fire
+    // alone, then each mirrored pair welds into one stage. For an
+    // even count the two innermost lights share the first stage.
+    // Lights 1..5 (L->R) => [3], [2,4], [1,5]. Ignores
+    // desired_stage_count by design.
+    if (chase.symmetric_pairs) {
+        const int n = static_cast<int>(leads.size());
+        const int lo = (n - 1) / 2;
+        const int hi = n / 2;
+        for (int k = 0; ; ++k) {
+            const int i = lo - k;
+            const int j = hi + k;
+            if (i < 0 || j >= n) break;
+            ChaseStage st;
+            for (const auto& m : leads[i].members) st.members.push_back(m);
+            if (j != i) {
+                for (const auto& m : leads[j].members) st.members.push_back(m);
+            }
+            chase.stages.push_back(std::move(st));
+        }
+        return;
+    }
+
     // Group leads into stages. desired_stage_count counts LOGICAL
     // lights, not individual layers, so a 3-stage chase with binds
     // still produces 3 stages.
@@ -1710,6 +1788,71 @@ void RegenerateChaseStages(Chase& chase, const PanelState& state,
         }
     }
     if (!cur.members.empty()) chase.stages.push_back(std::move(cur));
+}
+
+// ===== Random-scatter preview ========================================
+// ScatterLoopFrames + RegenerateScatter are shared inlines in
+// panel_state.h (the AE builder regenerates too — see note there).
+
+// Envelope (0..1) of a scattered hit at `playhead`, seamless-wrapped:
+// a hit whose tail crosses the loop end re-enters at the start.
+float ScatterHitEnvelope(float playhead, float start, int loop_frames,
+                         const ChaseTiming& t)
+{
+    float local = std::fmod(playhead - start,
+                            static_cast<float>(loop_frames));
+    if (local < 0.f) local += static_cast<float>(loop_frames);
+    if (local >= t.duration) return 0.f;
+    const float dur  = std::max(0.001f, t.duration);
+    const float t01  = local / dur;
+    const float peak = std::max(0.001f, std::min(0.999f, t.attack / dur));
+    if (t01 < peak) return t01 / peak;
+    return (1.f - t01) / (1.f - peak);
+}
+
+// Composite a scatter chase at `playhead` (loop-relative frames).
+// Same accumulation as BuildChaseComposite; per-hit wrapped envelope.
+bool BuildScatterComposite(const Chase& chase, const PanelState& state,
+                           float playhead, float fps,
+                           std::vector<uint8_t>& out_rgba,
+                           int& out_w, int& out_h)
+{
+    out_w = 0; out_h = 0;
+    const int loop_frames = ScatterLoopFrames(chase, fps);
+    for (const auto& hit : chase.scatter) {
+        const LayerInfo* L = FindLayerByRef(state, hit.ref);
+        if (L && L->thumb_w > 0 && L->thumb_h > 0) {
+            out_w = L->thumb_w; out_h = L->thumb_h; break;
+        }
+    }
+    if (out_w == 0 || out_h == 0) return false;
+    const size_t n = static_cast<size_t>(out_w) * out_h;
+    out_rgba.assign(n * 4, 0);
+    for (const auto& hit : chase.scatter) {
+        const float env = ScatterHitEnvelope(playhead, hit.start_frame,
+                                              loop_frames, chase.timing);
+        if (env <= 0.f) continue;
+        const float opacity = (chase.timing.opacity_peak / 100.f) * env;
+        const float gamma_t = chase.timing.gamma_baseline +
+            (chase.timing.gamma_peak - chase.timing.gamma_baseline) * env;
+        const float k = opacity * gamma_t;
+        if (k <= 0.f) continue;
+        const LayerInfo* L = FindLayerByRef(state, hit.ref);
+        if (!L || L->thumb_rgba.empty()) continue;
+        if (L->thumb_w != out_w || L->thumb_h != out_h) continue;
+        const uint8_t* s = L->thumb_rgba.data();
+        uint8_t* d = out_rgba.data();
+        for (size_t i = 0; i < n; ++i) {
+            int r = d[i*4+0] + static_cast<int>(s[i*4+0] * k);
+            int g = d[i*4+1] + static_cast<int>(s[i*4+1] * k);
+            int b = d[i*4+2] + static_cast<int>(s[i*4+2] * k);
+            d[i*4+0] = static_cast<uint8_t>(r > 255 ? 255 : r);
+            d[i*4+1] = static_cast<uint8_t>(g > 255 ? 255 : g);
+            d[i*4+2] = static_cast<uint8_t>(b > 255 ? 255 : b);
+            d[i*4+3] = 255;
+        }
+    }
+    return true;
 }
 
 // Build a JSON string describing a chase. The companion JSX executor
@@ -1777,19 +1920,37 @@ const char* kChaseTemplateNames[] = {
 
 void ApplyTemplateToChase(Chase& c, int template_idx)
 {
-    // Defaults: one light per stage. The 3 Step template overrides.
+    // Defaults: one light per stage, auto sort (template re-derives
+    // stages from scratch, so any prior manual arrangement is
+    // intentionally dropped). 3 Step / Center Out override below.
     c.desired_stage_count = 0;
+    c.symmetric_pairs = false;
+    c.manual_stages = false;
+    c.random_scatter = false;
     switch (template_idx) {
     case 0: c.sort_mode = SortMode::CentroidX;          c.sort_reverse = false; break;
     case 1: c.sort_mode = SortMode::CentroidY;          c.sort_reverse = false; break;
-    case 2: c.sort_mode = SortMode::DistanceFromCenter; c.sort_reverse = false; break;
+    case 2:
+        // Center Out: order by HOTSPOT x (the bright concentrated
+        // source, not the spill-influenced whole-layer centroid) so
+        // the mirrored pairing is spatially symmetric, then weld
+        // pairs outward from the middle. Even light counts pair the
+        // two centermost together as stage 1 (see RegenerateChase
+        // Stages' symmetric_pairs branch: lo=(n-1)/2, hi=n/2).
+        c.sort_mode = SortMode::HotspotX;
+        c.sort_reverse = false;
+        c.symmetric_pairs = true;
+        break;
     case 3:
         c.sort_mode = SortMode::CentroidX;
         c.sort_reverse = false;
         c.desired_stage_count = 3;
         break;
     case 4: {
-        c.sort_mode = SortMode::Random;
+        // Random = the stratified scatter generator (not a sort).
+        c.random_scatter  = true;
+        c.loop_seconds    = (c.loop_seconds > 0.f) ? c.loop_seconds : 10.0f;
+        c.scatter_density = (c.scatter_density > 0) ? c.scatter_density : 5;
         std::random_device rd;
         c.random_seed = rd();
         break;
@@ -1812,16 +1973,51 @@ void DrawWizardForChaseTab(PanelState* state, FrameSnapshot& snap, int chase_ind
     ImGui::Combo("Template", &state->wizard_template_index,
                  kChaseTemplateNames, IM_ARRAYSIZE(kChaseTemplateNames));
 
-    // Tag filter
-    ImGui::SetNextItemWidth(220.f);
-    std::vector<const char*> tag_labels;
-    tag_labels.push_back("(all layers)");
-    for (const auto& t : snap.tags) tag_labels.push_back(t.name.c_str());
-    int tag_choice = state->wizard_tag_filter_index + 1;  // -1 -> 0
-    if (ImGui::Combo("Tag filter", &tag_choice, tag_labels.data(),
-                     (int)tag_labels.size())) {
-        state->wizard_tag_filter_index = tag_choice - 1;
+    // Tag filter — multi-select. Empty selection = no filter (all
+    // staged layers, including untagged). All / None reset buttons.
+    auto wiz_has_tag = [&](uint32_t id) {
+        for (uint32_t x : state->wizard_tag_filter) if (x == id) return true;
+        return false;
+    };
+    ImGui::Text("Tag filter");
+    ImGui::SameLine();
+    ImGui::TextDisabled(state->wizard_tag_filter.empty()
+        ? "(all layers — no filter)"
+        : "(%d selected)", (int)state->wizard_tag_filter.size());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("All")) {
+        state->wizard_tag_filter.clear();
+        for (const auto& t : snap.tags) {
+            state->wizard_tag_filter.push_back(t.tag_id);
+        }
     }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("None")) state->wizard_tag_filter.clear();
+    ImGui::BeginChild("wizard_tag_list", ImVec2(260.f, 110.f), true);
+    if (snap.tags.empty()) {
+        ImGui::TextDisabled("(no tags — load a source / auto-tag)");
+    }
+    for (const auto& t : snap.tags) {
+        bool sel = wiz_has_tag(t.tag_id);
+        ImGui::PushID((int)t.tag_id);
+        if (ImGui::Checkbox(t.name.c_str(), &sel)) {
+            if (sel) {
+                if (!wiz_has_tag(t.tag_id)) {
+                    state->wizard_tag_filter.push_back(t.tag_id);
+                }
+            } else {
+                for (auto it = state->wizard_tag_filter.begin();
+                     it != state->wizard_tag_filter.end(); ++it) {
+                    if (*it == t.tag_id) {
+                        state->wizard_tag_filter.erase(it);
+                        break;
+                    }
+                }
+            }
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
 
     ImGui::SetNextItemWidth(220.f);
     ImGui::SliderFloat("Hit duration (frames)", &state->wizard_hit_duration,
@@ -1840,12 +2036,18 @@ void DrawWizardForChaseTab(PanelState* state, FrameSnapshot& snap, int chase_ind
             // set, else just "<template>". The em-dash separates the
             // two without colliding with characters that aren't
             // filesystem-safe (the comp builder slugs `/`, `\`, etc.).
-            std::string base = kChaseTemplateNames[state->wizard_template_index];
-            if (state->wizard_tag_filter_index >= 0 &&
-                state->wizard_tag_filter_index < (int)state->tags.size())
-            {
-                base = state->tags[state->wizard_tag_filter_index].name +
-                       " \xE2\x80\x94 " + base;
+            std::string tmpl = kChaseTemplateNames[state->wizard_template_index];
+            std::string base = tmpl;
+            const auto& wtf = state->wizard_tag_filter;
+            if (wtf.size() == 1) {
+                for (const auto& t : state->tags) {
+                    if (t.tag_id == wtf[0]) {
+                        base = t.name + " \xE2\x80\x94 " + tmpl;
+                        break;
+                    }
+                }
+            } else if (wtf.size() > 1) {
+                base = std::to_string(wtf.size()) + " tags \xE2\x80\x94 " + tmpl;
             }
             real.name = base;
             // Append " 2", " 3" if a chase already exists with this
@@ -1856,13 +2058,7 @@ void DrawWizardForChaseTab(PanelState* state, FrameSnapshot& snap, int chase_ind
             }
             if (dup > 0) real.name += " " + std::to_string(dup + 1);
 
-            real.tag_filter.clear();
-            if (state->wizard_tag_filter_index >= 0 &&
-                state->wizard_tag_filter_index < (int)state->tags.size())
-            {
-                real.tag_filter.push_back(
-                    state->tags[state->wizard_tag_filter_index].tag_id);
-            }
+            real.tag_filter = state->wizard_tag_filter;
             ApplyTemplateToChase(real, state->wizard_template_index);
             real.timing = state->default_timing;
             real.timing.duration = state->wizard_hit_duration;
@@ -1928,42 +2124,36 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
             "Create an AE comp for this chase inside a 'ChaseMaker'\n"
-            "folder (next to the active selection in the Project panel,\n"
-            "versioned _v02/_v03 if one already exists). One AE layer\n"
+            "folder at the project root (versioned _v02/_v03 if one\n"
+            "already exists). One AE layer\n"
             "per stage member, with EXRDemux applied + hash params set\n"
             "to target the right EXR layer. Single AE undo step.\n"
             "\nKeyframes (Opacity + Exposure-Gamma envelopes) land in\n"
             "a follow-up pass; for now the layers are static.");
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Delete chase...")) {
-        ImGui::OpenPopup("confirm_delete_chase");
-    }
-    // Confirm popup — modal so it grabs focus until dismissed. Naming
-    // the popup is essential to make ImGui's OpenPopup/BeginPopupModal
-    // pair address the same window.
-    if (ImGui::BeginPopupModal("confirm_delete_chase", nullptr,
-                               ImGuiWindowFlags_AlwaysAutoResize))
-    {
-        ImGui::Text("Delete chase \"%s\"?\nThis cannot be undone.",
-                    cs.name.c_str());
-        ImGui::Spacing();
-        if (ImGui::Button("Delete", ImVec2(120.f, 0.f))) {
-            std::lock_guard<std::mutex> lk(state->mu);
-            if (chase_index >= 0 && chase_index < (int)state->chases.size()) {
-                state->chases.erase(state->chases.begin() + chase_index);
-                state->active_chase_index = -1;
-                state->active_tab = PanelTab::Staging;
-            }
-            ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
-            return;
-        }
+    // Chase deletion lives on the tab's close (X) button now — see
+    // the confirm modal driven by chase_pending_close_index after the
+    // tab bar. (The old redundant "Delete chase..." button was
+    // removed.)
+
+    // ---- Manual-arrangement banner ----
+    // When the user has hand-edited the stage list, the sort + stage
+    // controls no longer drive it; surface that and offer a one-click
+    // way back to auto.
+    if (cs.manual_stages) {
+        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.f),
+            "Manual arrangement \xE2\x80\x94 sort/stage controls disabled.");
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(120.f, 0.f))) {
-            ImGui::CloseCurrentPopup();
+        if (ImGui::Button("Reset to auto")) {
+            std::lock_guard<std::mutex> lk(state->mu);
+            if (chase_index < (int)state->chases.size()) {
+                state->chases[chase_index].manual_stages = false;
+            }
         }
-        ImGui::EndPopup();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Discard the manual stage edits and rebuild\n"
+                              "stages from the sort + stage settings.");
+        }
     }
 
     // ---- Sort + stage grouping ----
@@ -1972,6 +2162,7 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
         "Brightness", "Radial Sweep", "Distance from Center", "Random",
         "Alphabetical", "Included first", "Tag", "Effective X", "Effective Y",
     };
+    ImGui::BeginDisabled(cs.manual_stages);
     int sort_choice = static_cast<int>(cs.sort_mode);
     bool sort_changed = false;
     ImGui::SetNextItemWidth(180.f);
@@ -2028,6 +2219,7 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
                           "with N=51 lights fires 17 lights per stage.\n"
                           "\nMiddle-click to reset to one-per-stage.");
     }
+    ImGui::EndDisabled();
 
     // ---- Timing sliders (compact, two rows) ----
     // Middle-click any slider to reset it to its factory default.
@@ -2074,11 +2266,11 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
 
     // ---- Preview transport ----
     ImGui::Separator();
+    const float fps = std::max(1.f, state->chase_preview_fps.load());
     const float total = ChaseTotalDuration(cs);
     if (state->chase_preview_frame > total) state->chase_preview_frame = 0.f;
     if (state->chase_preview_playing && total > 0.f) {
-        state->chase_preview_frame +=
-            ImGui::GetIO().DeltaTime * state->chase_preview_fps;
+        state->chase_preview_frame += ImGui::GetIO().DeltaTime * fps;
         if (state->chase_preview_frame >= total) state->chase_preview_frame = 0.f;
     }
     const char* play_label = state->chase_preview_playing ? "Pause" : "Play";
@@ -2091,14 +2283,35 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
                        0.f, std::max(1.f, total), "frame %.1f");
     ImGui::SameLine();
     ImGui::TextDisabled("/ %.0f f (%.1f s @ %.0f fps)",
-                        total, total / std::max(1.f, state->chase_preview_fps),
-                        state->chase_preview_fps);
+                        total, total / fps, fps);
 
     // ---- Build composite ----
+    // Click-to-pin: while the preview is NOT playing and the user
+    // has a layer selected (row or centroid click) that belongs to
+    // this chase, freeze the preview on that layer's whole stage
+    // (so a multi-light / bound stage shows all its members). Once
+    // the user presses Play, the animated composite takes over.
     {
         std::vector<uint8_t> rgba;
         int w = 0, h = 0;
-        if (BuildChaseComposite(cs, *state, state->chase_preview_frame, rgba, w, h)) {
+        bool built = false;
+        if (!state->chase_preview_playing && state->selected_hash != 0) {
+            for (const auto& st : cs.stages) {
+                bool here = false;
+                for (const auto& m : st.members) {
+                    if (m.fnv1a_hash == state->selected_hash) { here = true; break; }
+                }
+                if (here) {
+                    built = BuildRefsComposite(st.members, *state, rgba, w, h);
+                    break;
+                }
+            }
+        }
+        if (!built) {
+            built = BuildChaseComposite(cs, *state,
+                                        state->chase_preview_frame, rgba, w, h);
+        }
+        if (built) {
             state->chase_composite_rgba = std::move(rgba);
             state->chase_composite_w = w;
             state->chase_composite_h = h;
@@ -2131,8 +2344,39 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     const float left_w  = std::max(220.f,
                             ImGui::GetContentRegionAvail().x - right_w - 12.f);
 
-    // Stages table (left)
+    // Stages table (left). One row per layer, Staging-style:
+    // shift/ctrl multi-select, drag to reorder, right-click to
+    // Bind / Unbind. A multi-light stage = a chase-local "bind"
+    // (same UX + name as Staging, but it only welds *this* chase;
+    // it is not a session bind). Any edit flips the chase to manual.
     ImGui::BeginChild("chase_stages", ImVec2(left_w, pane_h), false);
+    ImGui::TextDisabled("Click to preview \xC2\xB7 shift/ctrl multi-select "
+                        "\xC2\xB7 drag to reorder \xC2\xB7 right-click to "
+                        "Bind \xC2\xB7 edits switch this chase to manual");
+
+    // Flatten stages -> per-layer rows.
+    struct FlatRow { LayerRef ref; int stage; bool first; int group; };
+    std::vector<FlatRow> flat;
+    for (size_t si = 0; si < cs.stages.size(); ++si) {
+        const auto& mem = cs.stages[si].members;
+        for (size_t mi = 0; mi < mem.size(); ++mi) {
+            flat.push_back({ mem[mi], static_cast<int>(si),
+                             mi == 0, static_cast<int>(mem.size()) });
+        }
+    }
+    auto is_sel = [&](uint32_t h) {
+        for (uint32_t x : state->selected_hashes) if (x == h) return true;
+        return false;
+    };
+
+    // Deferred edits (applied under the lock after the table; the
+    // table iterates the snap copy so mid-loop mutation would
+    // invalidate indices). Refs, not indices, so they survive.
+    bool      do_move = false;
+    LayerRef  move_ref{}, before_ref{};
+    bool      open_ctx = false;
+    uint32_t  ctx_hash = 0;
+
     constexpr ImGuiTableFlags kTblFlags =
         ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersV |
         ImGuiTableFlags_BordersOuterH | ImGuiTableFlags_SizingStretchProp |
@@ -2141,41 +2385,263 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
                           ImVec2(0.f, pane_h - 8.f))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Stage", ImGuiTableColumnFlags_WidthFixed, 48.f);
-        ImGui::TableSetupColumn("Layers", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+        ImGui::TableSetupColumn("Layer", ImGuiTableColumnFlags_WidthStretch, 3.0f);
         ImGui::TableSetupColumn("Env", ImGuiTableColumnFlags_WidthStretch, 1.2f);
         ImGui::TableHeadersRow();
-        for (size_t si = 0; si < cs.stages.size(); ++si) {
-            const auto& stage = cs.stages[si];
-            const float env = stage_envelopes[si];
+        for (int r = 0; r < (int)flat.size(); ++r) {
+            const FlatRow& fr = flat[r];
+            const float env = (fr.stage < (int)stage_envelopes.size())
+                              ? stage_envelopes[fr.stage] : 0.f;
+            const LayerInfo* L = FindLayerByRef(*state, fr.ref);
             ImGui::TableNextRow();
             if (env > 0.f) {
-                ImU32 col = IM_COL32(120, 80, 30,
-                    static_cast<int>(40 + 120 * env));
-                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, col);
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                    IM_COL32(120, 80, 30,
+                             static_cast<int>(40 + 120 * env)));
+            } else if (fr.group > 1) {
+                // Faint stable stripe so a chase-local bind reads as
+                // one contiguous block.
+                ImU32 c = ColorForId(static_cast<uint32_t>(fr.stage) + 1);
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                    (c & 0x00FFFFFFu) | 0x33000000u);
             }
             ImGui::TableNextColumn();
-            ImGui::Text("%zu", si + 1);
-            ImGui::TableNextColumn();
-            std::string names;
-            for (size_t mi = 0; mi < stage.members.size(); ++mi) {
-                const LayerInfo* L = FindLayerByRef(*state, stage.members[mi]);
-                names += L ? L->display_name : "(missing)";
-                if (mi + 1 < stage.members.size()) names += ", ";
+            ImGui::PushID(r);
+            const uint32_t hh = fr.ref.fnv1a_hash;
+            if (ImGui::Selectable("##crow", is_sel(hh),
+                    ImGuiSelectableFlags_SpanAllColumns |
+                    ImGuiSelectableFlags_AllowOverlap))
+            {
+                const ImGuiIO& io = ImGui::GetIO();
+                if (io.KeyCtrl) {
+                    bool removed = false;
+                    for (auto it = state->selected_hashes.begin();
+                         it != state->selected_hashes.end(); ++it) {
+                        if (*it == hh) {
+                            state->selected_hashes.erase(it);
+                            removed = true; break;
+                        }
+                    }
+                    if (!removed) state->selected_hashes.push_back(hh);
+                    state->last_selected_hash = hh;
+                } else if (io.KeyShift && state->last_selected_hash != 0) {
+                    int anchor = -1;
+                    for (int k = 0; k < (int)flat.size(); ++k) {
+                        if (flat[k].ref.fnv1a_hash ==
+                            state->last_selected_hash) { anchor = k; break; }
+                    }
+                    if (anchor < 0) anchor = r;
+                    int a = std::min(anchor, r), b = std::max(anchor, r);
+                    state->selected_hashes.clear();
+                    for (int k = a; k <= b; ++k) {
+                        state->selected_hashes.push_back(
+                            flat[k].ref.fnv1a_hash);
+                    }
+                } else {
+                    state->selected_hashes.clear();
+                    state->selected_hashes.push_back(hh);
+                    state->last_selected_hash = hh;
+                }
+                state->selected_hash = hh;  // drives the preview pin
             }
-            ImGui::TextUnformatted(names.c_str());
+            if (ImGui::IsItemHovered() &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+            {
+                open_ctx = true;
+                ctx_hash = hh;
+            }
+            if (ImGui::BeginDragDropSource(
+                    ImGuiDragDropFlags_SourceAllowNullID)) {
+                ImGui::SetDragDropPayload("CM_CHROW", &r, sizeof(int));
+                ImGui::Text("Move: %s",
+                            L ? L->display_name.c_str() : "(missing)");
+                ImGui::EndDragDropSource();
+            }
+            if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload* p =
+                        ImGui::AcceptDragDropPayload("CM_CHROW")) {
+                    int from = *static_cast<const int*>(p->Data);
+                    if (from >= 0 && from < (int)flat.size() && from != r) {
+                        do_move    = true;
+                        move_ref   = flat[from].ref;
+                        before_ref = fr.ref;
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+            ImGui::SameLine();
+            if (fr.first) ImGui::Text("%d", fr.stage + 1);
+            else          ImGui::TextDisabled("\xC2\xB7");
+            ImGui::PopID();
             ImGui::TableNextColumn();
-            // Mini envelope bar (0..1)
+            if (fr.group > 1) {
+                ImU32 c = ColorForId(static_cast<uint32_t>(fr.stage) + 1)
+                          | 0xFF000000u;
+                ImGui::TextColored(ImColor(c).Value, "%s",
+                    L ? L->display_name.c_str() : "(missing)");
+            } else {
+                ImGui::TextUnformatted(
+                    L ? L->display_name.c_str() : "(missing)");
+            }
+            ImGui::TableNextColumn();
             DrawPositionBar(env);
         }
         ImGui::EndTable();
     }
     ImGui::EndChild();
 
+    // ---- Context menu (Bind / Unbind, Staging-style) ----
+    if (open_ctx) {
+        if (!is_sel(ctx_hash)) {
+            state->selected_hashes.clear();
+            state->selected_hashes.push_back(ctx_hash);
+            state->last_selected_hash = ctx_hash;
+        }
+        state->selected_hash = ctx_hash;
+        ImGui::OpenPopup("chase_row_actions");
+    }
+    bool do_bind = false, do_unbind = false;
+    if (ImGui::BeginPopup("chase_row_actions")) {
+        // Selected refs, in flat order, restricted to this chase.
+        std::vector<LayerRef> selv;
+        for (const auto& fr : flat) {
+            if (is_sel(fr.ref.fnv1a_hash)) selv.push_back(fr.ref);
+        }
+        const int N = static_cast<int>(selv.size());
+        // Is any selected layer in a multi-light (chase-local bind)
+        // stage? Gates "Unbind".
+        bool any_grouped = false;
+        for (const auto& fr : flat) {
+            if (fr.group > 1 && is_sel(fr.ref.fnv1a_hash)) {
+                any_grouped = true; break;
+            }
+        }
+        if (N == 1) {
+            const LayerInfo* fL = FindLayerByRef(*state, selv[0]);
+            ImGui::TextDisabled("%s",
+                fL ? fL->display_name.c_str() : "(missing)");
+        } else {
+            ImGui::TextDisabled("%d layers selected", N);
+        }
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Bind...")) {
+            ImGui::BeginDisabled(N < 2);
+            if (ImGui::MenuItem("Bind selected together (this chase)")) {
+                do_bind = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::BeginDisabled(!any_grouped);
+            if (ImGui::MenuItem("Unbind selected")) {
+                do_unbind = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::EndMenu();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Bind welds the selected lights into one\n"
+                              "chase stage so they fire together \xE2\x80\x94 "
+                              "only in this chase (not a session bind).");
+        }
+        ImGui::EndPopup();
+    }
+
+    // ---- Apply deferred edits (under lock) ----
+    if (do_move || do_bind || do_unbind) {
+        std::lock_guard<std::mutex> lk(state->mu);
+        if (chase_index < (int)state->chases.size()) {
+            Chase& real = state->chases[chase_index];
+            std::vector<ChaseStage> ns = real.stages;
+            auto in_list = [](const std::vector<LayerRef>& v,
+                              const LayerRef& x) {
+                for (const auto& e : v) if (e == x) return true;
+                return false;
+            };
+            auto remove_refs = [&](const std::vector<LayerRef>& kill) {
+                for (auto it = ns.begin(); it != ns.end(); ) {
+                    auto& m = it->members;
+                    for (auto mi = m.begin(); mi != m.end(); ) {
+                        if (in_list(kill, *mi)) mi = m.erase(mi);
+                        else ++mi;
+                    }
+                    if (m.empty()) it = ns.erase(it); else ++it;
+                }
+            };
+            if (do_move) {
+                std::vector<LayerRef> one{ move_ref };
+                remove_refs(one);
+                // Resolve the drop target's stage *after* removal so
+                // the index is exact even if a stage emptied out.
+                int pos = -1;
+                for (int i = 0; i < (int)ns.size(); ++i) {
+                    for (const auto& m : ns[i].members) {
+                        if (m == before_ref) { pos = i; break; }
+                    }
+                    if (pos >= 0) break;
+                }
+                if (pos < 0 || pos > (int)ns.size()) pos = (int)ns.size();
+                ChaseStage st; st.members.push_back(move_ref);
+                ns.insert(ns.begin() + pos, std::move(st));
+            } else if (do_bind) {
+                std::vector<LayerRef> selv;
+                for (const auto& fr : flat) {
+                    if (is_sel(fr.ref.fnv1a_hash)) selv.push_back(fr.ref);
+                }
+                if (selv.size() >= 2) {
+                    int pos = -1;
+                    for (int i = 0; i < (int)ns.size(); ++i) {
+                        for (const auto& m : ns[i].members) {
+                            if (in_list(selv, m)) { pos = i; break; }
+                        }
+                        if (pos >= 0) break;
+                    }
+                    remove_refs(selv);
+                    if (pos < 0 || pos > (int)ns.size()) {
+                        pos = (int)ns.size();
+                    }
+                    ChaseStage st; st.members = selv;
+                    ns.insert(ns.begin() + pos, std::move(st));
+                }
+            } else if (do_unbind) {
+                std::vector<LayerRef> selv;
+                for (const auto& fr : flat) {
+                    if (is_sel(fr.ref.fnv1a_hash)) selv.push_back(fr.ref);
+                }
+                std::vector<ChaseStage> rebuilt;
+                rebuilt.reserve(ns.size());
+                for (auto& stg : ns) {
+                    std::vector<LayerRef> kept, pulled;
+                    for (const auto& m : stg.members) {
+                        if (stg.members.size() > 1 && in_list(selv, m)) {
+                            pulled.push_back(m);
+                        } else {
+                            kept.push_back(m);
+                        }
+                    }
+                    if (!kept.empty()) {
+                        ChaseStage k; k.members = std::move(kept);
+                        rebuilt.push_back(std::move(k));
+                    }
+                    for (const auto& p : pulled) {
+                        ChaseStage one; one.members.push_back(p);
+                        rebuilt.push_back(std::move(one));
+                    }
+                }
+                ns = std::move(rebuilt);
+            }
+            real.stages = std::move(ns);
+            real.manual_stages = true;
+        }
+    }
+
     ImGui::SameLine();
 
     // Composite preview + centroid map (right)
     ImGui::BeginChild("chase_preview_pane", ImVec2(right_w, pane_h), false);
-    ImGui::TextDisabled("Composite preview");
+    const bool pinned = !state->chase_preview_playing &&
+                        state->selected_hash != 0;
+    ImGui::TextDisabled(pinned ? "Composite preview (pinned \xE2\x80\x94 "
+                                 "click elsewhere or Play)"
+                               : "Composite preview");
     if (state->chase_composite_texture_id != 0 &&
         state->chase_composite_w > 0 && state->chase_composite_h > 0)
     {
@@ -2194,31 +2660,315 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     }
 
     ImGui::Separator();
-    ImGui::TextDisabled("Centroid map  (yellow = active this frame)");
-    // Use the snap's active source layers but highlight active-stage
-    // members. We assemble a temporary highlight set keyed by hash.
-    std::vector<uint32_t> active_hashes;
-    if (active_stage_top >= 0) {
-        for (const auto& ref : cs.stages[active_stage_top].members) {
-            active_hashes.push_back(ref.fnv1a_hash);
-        }
-    }
-    // Reuse the staging-tab DrawCentroidCanvas with a synthesized
-    // highlight: substitute layers with the chase's, with `included`
-    // = (in active stage) so it lights up yellow.
+    ImGui::TextDisabled("Centroid map  (yellow = active \xC2\xB7 ring = "
+                        "selected \xC2\xB7 only this chase's lights)");
+    // Only this chase's lights, not the whole staging set. `included`
+    // = member of the active stage this frame (canvas draws those
+    // yellow); the selected/pinned layer gets the ring.
     {
-        std::vector<LayerInfo> highlight_copy = snap.layers;
-        for (auto& L : highlight_copy) {
-            L.included = false;
-            for (uint32_t h : active_hashes) {
-                if (L.fnv1a_hash == h) { L.included = true; break; }
+        std::unordered_set<uint32_t> chase_hashes;
+        for (const auto& stg : cs.stages) {
+            for (const auto& m : stg.members) {
+                chase_hashes.insert(m.fnv1a_hash);
             }
         }
-        DrawCentroidCanvas(highlight_copy, snap.active_source_id,
+        std::unordered_set<uint32_t> active_hashes;
+        if (active_stage_top >= 0 &&
+            active_stage_top < (int)cs.stages.size()) {
+            for (const auto& ref : cs.stages[active_stage_top].members) {
+                active_hashes.insert(ref.fnv1a_hash);
+            }
+        }
+        std::vector<LayerInfo> chase_layers;
+        int sel_idx = -1;
+        for (const auto& Lsrc : snap.layers) {
+            if (!chase_hashes.count(Lsrc.fnv1a_hash)) continue;
+            LayerInfo c = Lsrc;
+            c.included = active_hashes.count(c.fnv1a_hash) != 0;
+            if (c.fnv1a_hash == state->selected_hash) {
+                sel_idx = static_cast<int>(chase_layers.size());
+            }
+            chase_layers.push_back(std::move(c));
+        }
+        DrawCentroidCanvas(chase_layers, snap.active_source_id,
                            snap.position_overrides,
                            snap.image_width, snap.image_height,
-                           -1, -1, cs.sort_mode,
-                           std::max(80.f, ImGui::GetContentRegionAvail().y - 8.f));
+                           -1, sel_idx, cs.sort_mode,
+                           std::max(80.f, ImGui::GetContentRegionAvail().y - 8.f),
+                           state, /*allow_drag=*/false);
+    }
+    ImGui::EndChild();
+}
+
+// ===== Random-scatter editor =========================================
+// Separate from DrawChaseEditor: scatter chases have no stages / sort
+// / manual arrangement, so a dedicated screen is cleaner than
+// threading `if (random_scatter)` through the stage UI.
+void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
+                       int chase_index, float panel_w, float panel_h)
+{
+    if (chase_index < 0 || chase_index >= (int)snap.chases.size()) return;
+    (void)panel_h;
+    const float fps = std::max(1.f, state->chase_preview_fps.load());
+
+    // Per-frame regen so the scatter tracks param / staging changes.
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        if (chase_index < (int)state->chases.size()) {
+            Chase& real = state->chases[chase_index];
+            RegenerateScatter(real, *state, fps);
+            if (chase_index < (int)snap.chases.size()) {
+                snap.chases[chase_index].scatter = real.scatter;
+            }
+        }
+    }
+    Chase& cs = snap.chases[chase_index];
+
+    // ---- Header: name + Build in AE ----
+    char name_buf[128];
+    std::snprintf(name_buf, sizeof(name_buf), "%s", cs.name.c_str());
+    ImGui::SetNextItemWidth(260.f);
+    if (ImGui::InputText("Name", name_buf, sizeof(name_buf))) {
+        std::lock_guard<std::mutex> lk(state->mu);
+        if (chase_index < (int)state->chases.size())
+            state->chases[chase_index].name = name_buf;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Build in AE")) state->want_build_chase_index = chase_index;
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Build a seamless looping comp: every eligible light gets\n"
+            "Density copies scattered across the loop, each with the\n"
+            "hit envelope. Loops cleanly at the loop length.");
+    }
+
+    ImGui::TextColored(ImVec4(0.55f, 0.75f, 1.f, 1.f),
+        "Random scatter \xE2\x80\x94 stratified (every light used; copies "
+        "spread evenly, never self-stacking).");
+
+    // ---- Scatter params ----
+    bool changed = false;
+    float loop_s = cs.loop_seconds;
+    int   dens   = cs.scatter_density;
+    int   seed_i = static_cast<int>(cs.random_seed);
+    ImGui::SetNextItemWidth(180.f);
+    if (ImGui::SliderFloat("Loop length", &loop_s, 1.f, 60.f, "%.1f s"))
+        changed = true;
+    if (MiddleClickReset(loop_s, 10.0f)) changed = true;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(160.f);
+    if (ImGui::SliderInt("Density", &dens, 1, 12, "%d /light")) changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Copies of each light spread across the loop.");
+    ImGui::SetNextItemWidth(160.f);
+    if (ImGui::InputInt("Seed", &seed_i)) changed = true;
+    ImGui::SameLine();
+    if (ImGui::Button("Reseed")) {
+        std::random_device rd;
+        seed_i = static_cast<int>(rd());
+        changed = true;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d lights \xC2\xB7 %zu hits \xC2\xB7 %d frames",
+        (cs.scatter.empty() || dens <= 0)
+            ? 0 : (int)(cs.scatter.size() / std::max(1, dens)),
+        cs.scatter.size(), ScatterLoopFrames(cs, fps));
+
+    // ---- Hit envelope (shared ChaseTiming; no step in scatter) ----
+    ImGui::Separator();
+    ChaseTiming t = cs.timing;
+    bool t_changed = false;
+    const float sw = 150.f;
+    ImGui::SetNextItemWidth(sw);
+    if (ImGui::SliderFloat("Duration", &t.duration, 1.f, 240.f, "%.0f f")) t_changed = true;
+    if (MiddleClickReset(t.duration, 30.0f)) t_changed = true;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(sw);
+    if (ImGui::SliderFloat("Attack", &t.attack, 0.f, t.duration, "%.1f f")) t_changed = true;
+    if (MiddleClickReset(t.attack, 5.0f)) t_changed = true;
+    ImGui::SetNextItemWidth(sw);
+    if (ImGui::SliderFloat("Opacity peak", &t.opacity_peak, 0.f, 100.f, "%.0f%%")) t_changed = true;
+    if (MiddleClickReset(t.opacity_peak, 100.0f)) t_changed = true;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(sw);
+    if (ImGui::SliderFloat("Gamma peak", &t.gamma_peak, 0.01f, 4.f, "%.2f")) t_changed = true;
+    if (MiddleClickReset(t.gamma_peak, 1.0f)) t_changed = true;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(sw);
+    if (ImGui::SliderFloat("Gamma base", &t.gamma_baseline, 0.01f, 4.f, "%.2f")) t_changed = true;
+    if (MiddleClickReset(t.gamma_baseline, 0.25f)) t_changed = true;
+
+    if (changed || t_changed) {
+        std::lock_guard<std::mutex> lk(state->mu);
+        if (chase_index < (int)state->chases.size()) {
+            Chase& real = state->chases[chase_index];
+            real.loop_seconds   = std::max(0.1f, loop_s);
+            real.scatter_density = std::max(1, dens);
+            real.random_seed    = static_cast<uint32_t>(seed_i);
+            real.timing         = t;
+            state->default_timing = t;
+        }
+    }
+
+    // ---- Preview transport (loops over the scatter length) ----
+    ImGui::Separator();
+    const float total = static_cast<float>(ScatterLoopFrames(cs, fps));
+    if (state->chase_preview_frame > total) state->chase_preview_frame = 0.f;
+    if (state->chase_preview_playing && total > 0.f) {
+        state->chase_preview_frame += ImGui::GetIO().DeltaTime * fps;
+        if (state->chase_preview_frame >= total)
+            state->chase_preview_frame = std::fmod(state->chase_preview_frame,
+                                                   total);
+    }
+    if (ImGui::Button(state->chase_preview_playing ? "Pause" : "Play"))
+        state->chase_preview_playing = !state->chase_preview_playing;
+    ImGui::SameLine();
+    if (ImGui::Button("Reset")) state->chase_preview_frame = 0.f;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(280.f);
+    ImGui::SliderFloat("##scrub", &state->chase_preview_frame,
+                       0.f, std::max(1.f, total), "frame %.1f");
+    ImGui::SameLine();
+    ImGui::TextDisabled("/ %.0f f (%.1f s @ %.0f fps, loops)",
+                        total, total / fps, fps);
+
+    // ---- Composite (pin single clicked light, else scatter) ----
+    {
+        std::vector<uint8_t> rgba;
+        int w = 0, h = 0;
+        bool built = false;
+        if (!state->chase_preview_playing && state->selected_hash != 0) {
+            for (const auto& hit : cs.scatter) {
+                if (hit.ref.fnv1a_hash == state->selected_hash) {
+                    built = BuildRefsComposite({ hit.ref }, *state, rgba, w, h);
+                    break;
+                }
+            }
+        }
+        if (!built) {
+            built = BuildScatterComposite(cs, *state,
+                state->chase_preview_frame, fps, rgba, w, h);
+        }
+        if (built) {
+            state->chase_composite_rgba = std::move(rgba);
+            state->chase_composite_w = w;
+            state->chase_composite_h = h;
+            state->chase_composite_dirty = true;
+        } else {
+            state->chase_composite_rgba.clear();
+            state->chase_composite_w = 0;
+            state->chase_composite_h = 0;
+            state->chase_composite_texture_id = 0;
+        }
+    }
+
+    // ---- Split pane: per-light hit list | preview + centroid map ----
+    ImGui::Separator();
+    const float pane_h = std::max(160.f, ImGui::GetContentRegionAvail().y - 8.f);
+    const float right_w = std::min(420.f, std::max(200.f, panel_w * 0.42f));
+    const float left_w  = std::max(220.f,
+                            ImGui::GetContentRegionAvail().x - right_w - 12.f);
+
+    // Aggregate hits per light (for the table) + active set this frame.
+    const int loop_frames = ScatterLoopFrames(cs, fps);
+    std::unordered_map<uint32_t, int> hit_count;
+    std::unordered_set<uint32_t> active_hashes;
+    for (const auto& hit : cs.scatter) {
+        hit_count[hit.ref.fnv1a_hash]++;
+        if (ScatterHitEnvelope(state->chase_preview_frame, hit.start_frame,
+                               loop_frames, cs.timing) > 0.f)
+            active_hashes.insert(hit.ref.fnv1a_hash);
+    }
+
+    ImGui::BeginChild("scatter_list", ImVec2(left_w, pane_h), false);
+    ImGui::TextDisabled("Click a light to pin it in the preview");
+    constexpr ImGuiTableFlags kF =
+        ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersV |
+        ImGuiTableFlags_BordersOuterH | ImGuiTableFlags_ScrollY;
+    if (ImGui::BeginTable("scatter_tbl", 3, kF, ImVec2(0.f, pane_h - 8.f))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Light", ImGuiTableColumnFlags_WidthStretch, 3.f);
+        ImGui::TableSetupColumn("Hits", ImGuiTableColumnFlags_WidthFixed, 44.f);
+        ImGui::TableSetupColumn("On", ImGuiTableColumnFlags_WidthFixed, 32.f);
+        ImGui::TableHeadersRow();
+        // First-occurrence order in the scatter list == source layer
+        // order (RegenerateScatter walks src->layers in order).
+        std::vector<uint32_t> seen;
+        for (const auto& hit : cs.scatter) {
+            uint32_t hh = hit.ref.fnv1a_hash;
+            bool dup = false;
+            for (uint32_t x : seen) if (x == hh) { dup = true; break; }
+            if (dup) continue;
+            seen.push_back(hh);
+            const LayerInfo* L = FindLayerByRef(*state, hit.ref);
+            ImGui::TableNextRow();
+            if (active_hashes.count(hh))
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                       IM_COL32(120, 80, 30, 110));
+            ImGui::TableNextColumn();
+            ImGui::PushID((int)hh);
+            bool sel = (state->selected_hash == hh);
+            if (ImGui::Selectable(L ? L->display_name.c_str() : "(missing)",
+                    sel, ImGuiSelectableFlags_SpanAllColumns)) {
+                state->selected_hash = hh;
+                state->last_selected_hash = hh;
+                state->selected_hashes.clear();
+                state->selected_hashes.push_back(hh);
+            }
+            ImGui::PopID();
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", hit_count[hh]);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(active_hashes.count(hh) ? "*" : "");
+        }
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+
+    ImGui::BeginChild("scatter_preview", ImVec2(right_w, pane_h), false);
+    const bool pinned = !state->chase_preview_playing &&
+                        state->selected_hash != 0;
+    ImGui::TextDisabled(pinned ? "Preview (pinned \xE2\x80\x94 click "
+                                 "elsewhere or Play)" : "Composite preview");
+    if (state->chase_composite_texture_id != 0 &&
+        state->chase_composite_w > 0 && state->chase_composite_h > 0) {
+        const float pw = ImGui::GetContentRegionAvail().x;
+        const float aspect = float(state->chase_composite_h) /
+                             float(state->chase_composite_w);
+        float w = pw, h = w * aspect;
+        const float max_h = pane_h * 0.55f;
+        if (h > max_h) { h = max_h; w = h / aspect; }
+        ImGui::Image((ImTextureID)state->chase_composite_texture_id,
+                     ImVec2(w, h));
+    } else {
+        ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, 60.f));
+        ImGui::TextDisabled("(no composite — wait for thumbs)");
+    }
+    ImGui::Separator();
+    ImGui::TextDisabled("Centroid map  (yellow = on this frame \xC2\xB7 "
+                        "ring = selected)");
+    {
+        std::unordered_set<uint32_t> chase_hashes;
+        for (const auto& hit : cs.scatter)
+            chase_hashes.insert(hit.ref.fnv1a_hash);
+        std::vector<LayerInfo> chase_layers;
+        int sel_idx = -1;
+        for (const auto& Lsrc : snap.layers) {
+            if (!chase_hashes.count(Lsrc.fnv1a_hash)) continue;
+            LayerInfo c = Lsrc;
+            c.included = active_hashes.count(c.fnv1a_hash) != 0;
+            if (c.fnv1a_hash == state->selected_hash)
+                sel_idx = static_cast<int>(chase_layers.size());
+            chase_layers.push_back(std::move(c));
+        }
+        DrawCentroidCanvas(chase_layers, snap.active_source_id,
+                           snap.position_overrides,
+                           snap.image_width, snap.image_height,
+                           -1, sel_idx, SortMode::CentroidX,
+                           std::max(80.f, ImGui::GetContentRegionAvail().y - 8.f),
+                           state, /*allow_drag=*/false);
     }
     ImGui::EndChild();
 }
@@ -2228,6 +2978,9 @@ void DrawChaseTab(PanelState* state, FrameSnapshot& snap, int chase_index,
 {
     if (snap.chase_in_wizard) {
         DrawWizardForChaseTab(state, snap, chase_index);
+    } else if (chase_index >= 0 && chase_index < (int)snap.chases.size() &&
+               snap.chases[chase_index].random_scatter) {
+        DrawScatterEditor(state, snap, chase_index, panel_w, panel_h);
     } else {
         DrawChaseEditor(state, snap, chase_index, panel_w, panel_h);
     }
@@ -2267,18 +3020,6 @@ void DrawSessionToolbar(PanelState* state, const FrameSnapshot& snap)
         if (!status.empty()) {
             ImGui::SameLine();
             ImGui::TextDisabled("%s", status.c_str());
-        }
-    }
-    ImGui::SameLine(0.f, 20.f);
-    if (!snap.exr_path.empty() && !snap.scanning) {
-        if (ImGui::Button("Write luminosity sidecar")) {
-            state->want_write_sidecar = true;
-        }
-        ImGui::SameLine();
-        if (snap.sidecar_written) {
-            ImGui::TextColored(ImVec4(0.5f, 0.85f, 0.5f, 1.f), "saved");
-        } else {
-            ImGui::TextDisabled(".luminosity.json next to the active EXR");
         }
     }
 }
@@ -2347,7 +3088,6 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
     ImGui::Spacing();
 
     // Tab bar: Sources | Staging | chase tabs... | +
-    int closed_chase = -1;
     if (ImGui::BeginTabBar("CMTabBar",
             ImGuiTabBarFlags_AutoSelectNewTabs |
             ImGuiTabBarFlags_FittingPolicyScroll))
@@ -2367,14 +3107,30 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
             std::snprintf(label, sizeof(label), "%s###chase_%u",
                           snap.chases[ci].name.c_str(),
                           snap.chases[ci].chase_id);
+            // Tint each chase tab with its own stable color so the
+            // chase tabs read as a distinct group from Sources /
+            // Staging (which keep the default theme) and from each
+            // other. Same ColorForId palette as binds/tags.
+            ImVec4 base = ImColor(ColorForId(snap.chases[ci].chase_id)).Value;
+            auto tint = [&](float a) { return ImVec4(base.x, base.y,
+                                                     base.z, a); };
+            ImGui::PushStyleColor(ImGuiCol_Tab,                tint(0.40f));
+            ImGui::PushStyleColor(ImGuiCol_TabHovered,         tint(0.80f));
+            ImGui::PushStyleColor(ImGuiCol_TabSelected,        tint(0.70f));
+            ImGui::PushStyleColor(ImGuiCol_TabDimmed,          tint(0.28f));
+            ImGui::PushStyleColor(ImGuiCol_TabDimmedSelected,  tint(0.50f));
             bool open = true;
-            if (ImGui::BeginTabItem(label, &open)) {
+            const bool visible = ImGui::BeginTabItem(label, &open);
+            ImGui::PopStyleColor(5);
+            if (visible) {
                 state->active_tab = PanelTab::Chase;
                 state->active_chase_index = ci;
                 DrawChaseTab(state, snap, ci, w, h);
                 ImGui::EndTabItem();
             }
-            if (!open) closed_chase = ci;
+            // Close (X) doesn't delete outright — it arms the
+            // confirmation modal drawn after the tab bar.
+            if (!open) state->chase_pending_close_index = ci;
         }
         if (ImGui::TabItemButton("+", ImGuiTabItemFlags_Trailing |
                                        ImGuiTabItemFlags_NoTooltip))
@@ -2390,21 +3146,49 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
             state->chase_in_wizard = true;
             // Reset wizard form
             state->wizard_template_index = 0;
-            state->wizard_tag_filter_index = -1;
+            state->wizard_tag_filter.clear();
             state->wizard_step_duration = state->default_timing.step_duration;
             state->wizard_hit_duration = state->default_timing.duration;
         }
         ImGui::EndTabBar();
     }
 
-    if (closed_chase >= 0) {
-        std::lock_guard<std::mutex> lk(state->mu);
-        if (closed_chase < (int)state->chases.size()) {
-            state->chases.erase(state->chases.begin() + closed_chase);
-            if (state->active_chase_index >= (int)state->chases.size()) {
-                state->active_chase_index = -1;
+    // ---- Chase delete confirmation (armed by a tab's close X) ----
+    if (state->chase_pending_close_index >= 0) {
+        ImGui::OpenPopup("confirm_delete_chase");
+    }
+    if (ImGui::BeginPopupModal("confirm_delete_chase", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        const int idx = state->chase_pending_close_index;
+        const char* nm = (idx >= 0 && idx < (int)snap.chases.size())
+            ? snap.chases[idx].name.c_str() : "";
+        ImGui::Text("Delete chase \"%s\"?\nThis cannot be undone.", nm);
+        ImGui::Spacing();
+        if (ImGui::Button("Delete", ImVec2(120.f, 0.f))) {
+            {
+                std::lock_guard<std::mutex> lk(state->mu);
+                if (idx >= 0 && idx < (int)state->chases.size()) {
+                    state->chases.erase(state->chases.begin() + idx);
+                    if (state->active_chase_index >=
+                        (int)state->chases.size())
+                    {
+                        state->active_chase_index = -1;
+                    }
+                    if (state->chases.empty()) {
+                        state->active_tab = PanelTab::Staging;
+                    }
+                }
             }
+            state->chase_pending_close_index = -1;
+            ImGui::CloseCurrentPopup();
         }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120.f, 0.f))) {
+            state->chase_pending_close_index = -1;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
     ImGui::End();

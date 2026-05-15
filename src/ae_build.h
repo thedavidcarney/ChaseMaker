@@ -37,4 +37,10 @@ BuildResult BuildChase(PanelState* state, int chase_index);
 // across chases (TODO — for now binds expand as flat layer lists).
 BuildResult BuildAllChases(PanelState* state);
 
+// Poll the active AE comp's frame rate and publish it to
+// state->chase_preview_fps so the chase preview's timing matches the
+// project. Cheap; safe to call every idle tick. No-op without an
+// AEGP context. Must run from a registered-hook context (idle hook).
+void RefreshProjectFps(PanelState* state);
+
 } // namespace ae_build

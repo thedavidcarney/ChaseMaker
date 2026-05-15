@@ -376,13 +376,29 @@ void MacPanelRenderer::RenderFrame(MTKView* view)
     // ---- Thumbnail texture cache ----
     if (i_state) {
         const int gen = i_state->scan_generation.load();
+        bool released = false;
         if (gen != i_last_scan_gen) {
             [i_thumb_textures removeAllObjects];
             i_chase_composite_tex = nil;
             i_state->chase_composite_texture_id = 0;
             i_last_scan_gen = gen;
+            released = true;
         }
         std::lock_guard<std::mutex> lk(i_state->mu);
+        if (released) {
+            // SAME bug class as the Windows ReleaseAllThumbnailTextures
+            // fix: the MTLTextures we just dropped belong to THIS
+            // renderer, but PanelState (and LayerInfo::texture_id)
+            // outlives it across panel close/reopen. If the ids stay
+            // non-zero the next renderer's `if (L.texture_id != 0)
+            // continue;` skips re-upload and ImGui draws a freed,
+            // cross-renderer Metal texture → crash. Zero every id
+            // (all sources) so a fresh renderer always re-uploads.
+            for (auto& s : i_state->sources) {
+                for (auto& L : s.layers) L.texture_id = 0;
+            }
+            i_state->chase_composite_texture_id = 0;
+        }
         Source* src = ActiveSource(*i_state);
         if (src) for (LayerInfo& L : src->layers) {
             if (L.texture_id != 0) continue;
@@ -492,9 +508,6 @@ void MacPanelRenderer::RenderFrame(MTKView* view)
         if (!path.empty()) {
             exr_scan::StartScan(path, i_state, /*append=*/true, /*source_id=*/0);
         }
-    }
-    if (i_state->want_write_sidecar.exchange(false)) {
-        exr_scan::WriteLuminositySidecar(i_state);
     }
     if (i_state->want_save_session.exchange(false)) {
         std::string path;

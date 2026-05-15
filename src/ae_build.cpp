@@ -97,32 +97,18 @@ std::string MemHandleToString(AEGP_SuiteHandler& sp, AEGP_MemHandle h)
 
 // ===== Project + folder helpers =======================================
 
-// Returns the folder we should drop the new ChaseMaker_vNN folder into.
-// Honors the user's selection in the AE Project panel: pick the
-// active item's containing folder (or the item itself if it IS a
-// folder). Falls back to the project root.
+// Returns the folder we drop the new ChaseMaker_vNN folder into:
+// ALWAYS the project root. We deliberately ignore the Project-panel
+// selection — honoring it meant that building while a prior
+// ChaseMaker comp/folder was selected nested the new folder inside
+// the old one, which David didn't want. Versioning still applies, so
+// repeated builds land as ChaseMaker, ChaseMaker_v02, ... all at the
+// top level.
 A_Err FindTargetFolder(AEGP_SuiteHandler& sp,
                        AEGP_ProjectH proj,
                        AEGP_ItemH* out_folder)
 {
     *out_folder = nullptr;
-    A_Err err = A_Err_NONE;
-    AEGP_ItemH active = nullptr;
-    err = sp.ItemSuite9()->AEGP_GetActiveItem(&active);
-    if (!err && active) {
-        AEGP_ItemType t = AEGP_ItemType_NONE;
-        sp.ItemSuite9()->AEGP_GetItemType(active, &t);
-        if (t == AEGP_ItemType_FOLDER) {
-            *out_folder = active;
-            return A_Err_NONE;
-        }
-        AEGP_ItemH parent = nullptr;
-        if (!sp.ItemSuite9()->AEGP_GetItemParentFolder(active, &parent) && parent) {
-            *out_folder = parent;
-            return A_Err_NONE;
-        }
-    }
-    // Fallback: project root.
     return sp.ProjSuite6()->AEGP_GetProjectRootFolder(proj, out_folder);
 }
 
@@ -439,9 +425,17 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
 {
     A_Err err = A_Err_NONE;
 
-    // Compute total duration in frames.
+    const double fps_d = static_cast<double>(ctx.fps.num) /
+        static_cast<double>(std::max<A_long>(1, ctx.fps.den));
+
+    // Compute total duration in frames. Scatter chases are a fixed
+    // seamless loop; stage chases run until the last stage's release.
     float total_frames = 0.f;
-    if (!chase.stages.empty()) {
+    if (chase.random_scatter) {
+        const double lf = static_cast<double>(
+            std::llround(chase.loop_seconds * fps_d));
+        total_frames = static_cast<float>(lf < 1.0 ? 1.0 : lf);
+    } else if (!chase.stages.empty()) {
         total_frames = (chase.stages.size() - 1) * chase.timing.step_duration
                        + chase.timing.duration;
     }
@@ -519,103 +513,134 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
     const A_Time t0 = FramesToATime(0.0,        ctx.fps);
     const A_Time t1 = FramesToATime(attack_f,   ctx.fps);
     const A_Time t2 = FramesToATime(duration_f, ctx.fps);
+    const A_Time layer_in_pt  = FramesToATime(0.0,        ctx.fps);
+    const A_Time layer_dur    = FramesToATime(duration_f, ctx.fps);
 
-    for (size_t si = 0; si < chase.stages.size(); ++si) {
-        const ChaseStage& stage = chase.stages[si];
-        const double stage_start_frames =
-            static_cast<double>(si) * chase.timing.step_duration;
-        const A_Time stage_offset = FramesToATime(stage_start_frames, ctx.fps);
-        const A_Time stage_in_pt  = FramesToATime(0.0,                ctx.fps);
-        const A_Time stage_layer_dur = FramesToATime(duration_f,      ctx.fps);
+    // Exact (no round-bias) frame->A_Time for layer offsets, which
+    // can be negative for the seamless-loop wrap. FramesToATime's
+    // +0.5 rounding skews negatives by a frame; this is exact.
+    auto offset_at = [&](double frames) -> A_Time {
+        A_Time t{};
+        t.value = static_cast<A_long>(std::llround(frames)) *
+                  static_cast<A_long>(ctx.fps.den);
+        t.scale = static_cast<A_u_long>(ctx.fps.num);
+        return t;
+    };
 
-        for (const LayerRef& ref : stage.members) {
-            std::string display_name;
+    // Place one EXR layer for `display_name` at `offset` on the comp
+    // timeline, trimmed to the envelope window, with the opacity +
+    // exposure-gamma envelope baked. Shared by the stage path and the
+    // random-scatter path.
+    auto place_layer = [&](const std::string& display_name,
+                           const A_Time& offset) {
+        if (display_name.empty()) return;
+        AEGP_LayerH layer = nullptr;
+        if (sp.LayerSuite9()->AEGP_AddLayer(ctx.exr_footage, new_comp,
+                                            &layer) || !layer)
+            return;
+        ++ctx.layers_added;
+
+        sp.LayerSuite9()->AEGP_SetLayerOffset(layer, &offset);
+        sp.LayerSuite9()->AEGP_SetLayerInPointAndDuration(
+            layer, AEGP_LTimeMode_LayerTime, &layer_in_pt, &layer_dur);
+
+        AEGP_LayerTransferMode tm{};
+        tm.mode        = PF_Xfer_LIGHTEN;
+        tm.flags       = static_cast<AEGP_TransferFlags>(0);
+        tm.track_matte = AEGP_TrackMatte_NO_TRACK_MATTE;
+        sp.LayerSuite9()->AEGP_SetLayerTransferMode(layer, &tm);
+
+        {
+            AEGP_StreamRefH op_stream = nullptr;
+            sp.StreamSuite6()->AEGP_GetNewLayerStream(
+                ctx.plugin_id, layer, AEGP_LayerStream_OPACITY, &op_stream);
+            if (op_stream) {
+                BakeThreeKeyframes(sp, op_stream,
+                                   t0, 0.0,
+                                   t1, chase.timing.opacity_peak,
+                                   t2, 0.0);
+                sp.StreamSuite6()->AEGP_DisposeStream(op_stream);
+            }
+        }
+
+        if (ctx.demux_key != AEGP_InstalledEffectKey_NONE) {
+            AEGP_EffectRefH effect = nullptr;
+            if (!sp.EffectSuite5()->AEGP_ApplyEffect(
+                    ctx.plugin_id, layer, ctx.demux_key, &effect) &&
+                effect)
             {
-                std::lock_guard<std::mutex> lk(ctx.state->mu);
-                if (const LayerInfo* L = FindLayerByRef(*ctx.state, ref)) {
-                    display_name = L->display_name;
-                }
+                const uint32_t h32 = FNV1a32(display_name);
+                const double hi = static_cast<double>((h32 >> 16) & 0xFFFF);
+                const double lo = static_cast<double>(h32 & 0xFFFF);
+                SetEffectFloatParam(sp, ctx.plugin_id, effect, 3, hi);
+                SetEffectFloatParam(sp, ctx.plugin_id, effect, 4, lo);
+                sp.EffectSuite5()->AEGP_DisposeEffect(effect);
             }
-            if (display_name.empty()) continue;
+        }
 
-            AEGP_LayerH layer = nullptr;
-            err = sp.LayerSuite9()->AEGP_AddLayer(ctx.exr_footage, new_comp, &layer);
-            if (err || !layer) continue;
-            ++ctx.layers_added;
-
-            // Trim the layer to its envelope window. Each layer is
-            // offset to where its stage starts in the chase comp,
-            // and clipped to the envelope duration so it doesn't
-            // occupy any comp time outside its hit. Avoids paying
-            // render cost for inactive frames.
-            sp.LayerSuite9()->AEGP_SetLayerOffset(layer, &stage_offset);
-            sp.LayerSuite9()->AEGP_SetLayerInPointAndDuration(
-                layer, AEGP_LTimeMode_LayerTime,
-                &stage_in_pt, &stage_layer_dur);
-
-            // Lighten blend mode (additive-ish composite).
-            AEGP_LayerTransferMode tm{};
-            tm.mode        = PF_Xfer_LIGHTEN;
-            tm.flags       = static_cast<AEGP_TransferFlags>(0);
-            tm.track_matte = AEGP_TrackMatte_NO_TRACK_MATTE;
-            sp.LayerSuite9()->AEGP_SetLayerTransferMode(layer, &tm);
-
-            // Opacity envelope: 0 → peak% → 0 over [0, attack, duration]
-            // in layer-local time. The layer's offset places that
-            // envelope at the right point in the comp timeline.
+        if (ctx.exposure_key != AEGP_InstalledEffectKey_NONE) {
+            AEGP_EffectRefH expo = nullptr;
+            if (!sp.EffectSuite5()->AEGP_ApplyEffect(
+                    ctx.plugin_id, layer, ctx.exposure_key, &expo) &&
+                expo)
             {
-                AEGP_StreamRefH op_stream = nullptr;
-                sp.StreamSuite6()->AEGP_GetNewLayerStream(
-                    ctx.plugin_id, layer, AEGP_LayerStream_OPACITY, &op_stream);
-                if (op_stream) {
-                    BakeThreeKeyframes(sp, op_stream,
-                                       t0, 0.0,
-                                       t1, chase.timing.opacity_peak,
-                                       t2, 0.0);
-                    sp.StreamSuite6()->AEGP_DisposeStream(op_stream);
+                AEGP_StreamRefH gamma = nullptr;
+                FindEffectStreamByDisplayName(
+                    sp, ctx.plugin_id, expo,
+                    std::string("Gamma Correction"), &gamma);
+                if (gamma) {
+                    BakeThreeKeyframes(sp, gamma,
+                                       t0, chase.timing.gamma_baseline,
+                                       t1, chase.timing.gamma_peak,
+                                       t2, chase.timing.gamma_baseline);
+                    sp.StreamSuite6()->AEGP_DisposeStream(gamma);
                 }
+                sp.EffectSuite5()->AEGP_DisposeEffect(expo);
             }
+        }
+    };
 
-            // Apply EXRDemux + set Layer Hash Hi/Lo.
-            if (ctx.demux_key != AEGP_InstalledEffectKey_NONE) {
-                AEGP_EffectRefH effect = nullptr;
-                if (!sp.EffectSuite5()->AEGP_ApplyEffect(
-                        ctx.plugin_id, layer, ctx.demux_key, &effect) &&
-                    effect)
-                {
-                    const uint32_t h32 = FNV1a32(display_name);
-                    const double hi = static_cast<double>((h32 >> 16) & 0xFFFF);
-                    const double lo = static_cast<double>(h32 & 0xFFFF);
-                    SetEffectFloatParam(sp, ctx.plugin_id, effect, 3, hi);
-                    SetEffectFloatParam(sp, ctx.plugin_id, effect, 4, lo);
-                    sp.EffectSuite5()->AEGP_DisposeEffect(effect);
-                }
+    auto name_of = [&](const LayerRef& ref) -> std::string {
+        std::lock_guard<std::mutex> lk(ctx.state->mu);
+        if (const LayerInfo* L = FindLayerByRef(*ctx.state, ref))
+            return L->display_name;
+        return {};
+    };
+
+    if (chase.random_scatter) {
+        // Regenerate the scatter HERE rather than trusting
+        // chase.scatter — that list is filled by the UI only while
+        // the scatter tab is drawn and is not persisted, so a
+        // session-loaded chase or a Build-all would otherwise emit a
+        // comp with zero light layers (all black). Deterministic from
+        // the chase's seed/density/loop + comp fps.
+        Chase local = chase;
+        {
+            std::lock_guard<std::mutex> lk(ctx.state->mu);
+            RegenerateScatter(local, *ctx.state,
+                              static_cast<float>(fps_d));
+        }
+        // Every hit is a layer at its scattered offset. A hit whose
+        // envelope tail crosses the loop end gets a second copy at
+        // offset-loop so the tail re-enters at the comp start — the
+        // comp then loops seamlessly at `total_frames` (no black
+        // bookends: it's a continuous loop, not a one-shot sweep).
+        const double loop_f = static_cast<double>(total_frames);
+        for (const ScatterHit& hit : local.scatter) {
+            const std::string nm = name_of(hit.ref);
+            if (nm.empty()) continue;
+            place_layer(nm, offset_at(hit.start_frame));
+            if (hit.start_frame + duration_f > loop_f) {
+                place_layer(nm, offset_at(hit.start_frame - loop_f));
             }
-
-            // Apply Exposure (ADBE Exposure2). Bake the Gamma
-            // Correction param: baseline → peak → baseline over the
-            // same envelope. We look up the stream by display-name
-            // substring "Gamma Correction" — first match wins, which
-            // is the Master Gamma Correction in standard AE versions.
-            if (ctx.exposure_key != AEGP_InstalledEffectKey_NONE) {
-                AEGP_EffectRefH expo = nullptr;
-                if (!sp.EffectSuite5()->AEGP_ApplyEffect(
-                        ctx.plugin_id, layer, ctx.exposure_key, &expo) &&
-                    expo)
-                {
-                    AEGP_StreamRefH gamma = nullptr;
-                    FindEffectStreamByDisplayName(
-                        sp, ctx.plugin_id, expo,
-                        std::string("Gamma Correction"), &gamma);
-                    if (gamma) {
-                        BakeThreeKeyframes(sp, gamma,
-                                           t0, chase.timing.gamma_baseline,
-                                           t1, chase.timing.gamma_peak,
-                                           t2, chase.timing.gamma_baseline);
-                        sp.StreamSuite6()->AEGP_DisposeStream(gamma);
-                    }
-                    sp.EffectSuite5()->AEGP_DisposeEffect(expo);
-                }
+        }
+    } else {
+        for (size_t si = 0; si < chase.stages.size(); ++si) {
+            const double stage_start =
+                static_cast<double>(si) * chase.timing.step_duration;
+            const A_Time stage_offset = offset_at(stage_start);
+            for (const LayerRef& ref : chase.stages[si].members) {
+                place_layer(name_of(ref), stage_offset);
             }
         }
     }
@@ -823,6 +848,17 @@ BuildResult BuildAllChases(PanelState* state)
         state->last_build_status = r.message;
     }
     return r;
+}
+
+void RefreshProjectFps(PanelState* state)
+{
+    if (!state || !state->pica_basicP) return;
+    AEGP_SuiteHandler sp(reinterpret_cast<SPBasicSuite*>(state->pica_basicP));
+    A_Ratio r = GetActiveCompFramerate(sp);
+    if (r.num > 0 && r.den > 0) {
+        state->chase_preview_fps.store(
+            static_cast<float>(r.num) / static_cast<float>(r.den));
+    }
 }
 
 } // namespace ae_build
