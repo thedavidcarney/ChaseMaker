@@ -360,7 +360,9 @@ std::string BuildSessionJson(const PanelState& state)
     for (size_t i = 0; i < state.sources.size(); ++i) {
         const Source& src = state.sources[i];
         std::snprintf(buf, sizeof(buf),
-            "    {\"source_id\": %u, \"path\": \"", src.source_id);
+            "    {\"source_id\": %u, \"scan_frame\": %d, "
+            "\"animation\": %d, \"path\": \"",
+            src.source_id, src.scan_frame, src.animation ? 1 : 0);
         out += buf;
         out += Escape(src.path);
         out += "\"}";
@@ -585,9 +587,10 @@ bool LoadSession(PanelState* state, const std::string& path)
         return false;
     }
 
-    // Capture source paths + ids before we reset state so we can
-    // start scans outside the lock.
-    std::vector<std::pair<uint32_t, std::string>> sources_to_rescan;
+    // Capture source paths + ids (+ saved scan frame) before we reset
+    // state so we can start scans outside the lock.
+    struct RescanReq { uint32_t id; std::string path; int frame; int anim; };
+    std::vector<RescanReq> sources_to_rescan;
 
     {
         std::lock_guard<std::mutex> lk(state->mu);
@@ -613,9 +616,14 @@ bool LoadSession(PanelState* state, const std::string& path)
             for (const auto& e : arr->arr) {
                 uint32_t sid = 0;
                 std::string p;
-                if (const JsonValue* x = e.find("source_id")) sid = x->as_u32();
-                if (const JsonValue* x = e.find("path"))      p   = x->as_string();
-                if (sid != 0 && !p.empty()) sources_to_rescan.emplace_back(sid, p);
+                int frame = 0;
+                int anim = -1;   // -1 = not stored, keep scan auto-default
+                if (const JsonValue* x = e.find("source_id"))  sid   = x->as_u32();
+                if (const JsonValue* x = e.find("path"))       p     = x->as_string();
+                if (const JsonValue* x = e.find("scan_frame")) frame = x->as_int(0);
+                if (const JsonValue* x = e.find("animation"))  anim  = x->as_int(-1);
+                if (sid != 0 && !p.empty())
+                    sources_to_rescan.push_back({sid, p, frame, anim});
             }
         }
 
@@ -699,11 +707,19 @@ bool LoadSession(PanelState* state, const std::string& path)
     // the saved ID so saved LayerRefs keep resolving once scans
     // complete.
     for (const auto& kv : sources_to_rescan) {
-        exr_scan::StartScan(kv.second, state, /*append=*/true, /*source_id=*/kv.first);
+        exr_scan::StartScan(kv.path, state, /*append=*/true,
+                            /*source_id=*/kv.id, /*frame_index=*/kv.frame);
         // Block until current scan finishes — StartScan refuses re-entry
         // while scanning is true. We poll briefly to serialize.
         while (state->scanning.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        // Re-apply the saved animation override (the scan resets it to
+        // the frame_count auto-default; the user's choice must win).
+        if (kv.anim >= 0) {
+            std::lock_guard<std::mutex> lk(state->mu);
+            if (Source* s = FindSourceById(*state, kv.id))
+                s->animation = (kv.anim != 0);
         }
     }
     return true;

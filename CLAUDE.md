@@ -217,6 +217,46 @@ Build stamp: `cmake/gen_build_stamp.cmake` regenerates
 panel title via `AEGP_SetTitle` so each test cycle is visually
 distinct.
 
+## Release checklist
+
+Releasing is handled **in tandem with EXRDemux** — same conventions
+(see EXRDemux's CLAUDE.md "Release checklist"). Chase Maker is an
+AEGP panel, not a PF effect, so there are no `PF_VERSION` macros or
+`.r` `AE_Effect_Version` to bump — the version lives in the **git
+tag** and the GitHub Release. (Known gap: the panel title currently
+shows a build *timestamp*, not the release version — surfacing the
+tag in the title is a future nicety, not done yet. CMake
+`project(... VERSION)` is not maintained per-release, mirroring
+EXRDemux.)
+
+Convention: the **1.0 release candidate is tagged `v0.9.0`** (plain
+semver, no `-rc` suffix — exactly how EXRDemux does its 1.0 RC),
+described in the README as "the 1.0 release candidate aimed at AE
+2026". Bump to `v1.0.0` only when the team signs off.
+
+When cutting a release:
+
+1. **README.md** — keep the RC callout + "Things I didn't test very
+   much" current; the version line names the tag (e.g. `v0.9.0`).
+2. **Build artifacts** — rebuild Win Release `.aex` + Mac Release
+   `.plugin` (Mac `codesign --force --deep --sign -`), zip each with
+   `THIRD_PARTY_LICENSES.txt` into
+   `release/ChaseMaker-vX.Y.Z-{win-x64,mac-arm64}.zip`. The Mac zip
+   must be made **on the Mac** (`zip -r -y` / `ditto`) to preserve
+   the bundle + `_CodeSignature`.
+3. **`release/` is gitignored** (build outputs) — the zips must be
+   force-added: `git add -f release/ChaseMaker-vX.Y.Z-*.zip`. (Same
+   as EXRDemux.)
+4. **Git tag** `vX.Y.Z` on the release commit.
+5. **GitHub Release** — mark **pre-release** for an RC; attach both
+   zips; release notes = summary of commits since the last tag.
+   EXRDemux uses the web UI (no `gh`); ChaseMaker's remote works with
+   `gh` if preferred. David runs all git/tag/push/release steps.
+
+David drives every git/tag/push/release action himself (see "Working
+with David"); the assistant prepares files, zips, the commit message
+and release notes, but does not run git or gh.
+
 ## Source map
 
 - `src/chase_maker.cpp` — AEGP plugin entry point. EntryPointFunc,
@@ -355,8 +395,10 @@ built — this section was very stale before):
 - **"Dumb comps" AEGP builder is wired and working** (per-chase
   "Build in AE" + session "Build all chases"): comps/footage/layers,
   EXRDemux applied + FNV hashes set, opacity/gamma keyframes, black
-  solid + Lighten, ChaseMaker folder ALWAYS at project root +
-  versioned, scatter build path with seamless-loop wrap layers.
+  solid + Lighten, a SINGLE reused "ChaseMaker" folder at project
+  root (comps inside are name-versioned `_vNN` on collision so
+  nothing is overwritten — the folder is no longer re-versioned per
+  build), scatter build path with seamless-loop wrap layers.
 - Preview FPS tracks the active comp (throttled idle poll). Session
   save/load (JSON), undo/redo. Tab-X delete confirmation (the only
   delete affordance). Build-stamp + auto-install POST_BUILD. Windows

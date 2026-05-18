@@ -32,9 +32,19 @@ namespace exr_scan {
 // `source_id=0` (default): the new Source gets `state.next_source_id`
 // assigned and that counter advances. When loading a saved session,
 // pass the saved source_id explicitly so LayerRefs in saved binds /
-// tags / chases keep resolving.
+// tags / chases keep resolving. If a source with that id already
+// exists it is replaced in place (used by the frame re-scan), so the
+// row keeps its position and active selection.
+//
+// `path` may be a concrete .exr, a directory of frames, or a
+// sequence-token path (e.g. name_[0001-0060].exr / name_####.exr /
+// name_%04d.exr). It is resolved to a single frame to scan;
+// `frame_index` (0-based, clamped) selects which frame. The scanner
+// only needs one representative frame — light positions don't move
+// across the chase, the chase is the animation layered on top.
 void StartScan(const std::string& path, PanelState* state,
-               bool append = true, uint32_t source_id = 0);
+               bool append = true, uint32_t source_id = 0,
+               int frame_index = 0);
 
 // Force-include a layer that the auto-skip heuristic dropped (e.g.
 // a light named "Crypto_Bounce" that got false-matched as a

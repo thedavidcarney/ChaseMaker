@@ -26,6 +26,10 @@ struct BuildResult {
     std::string message;        // status text — gets stashed on state.last_build_status
     int         comps_created = 0;
     int         layers_added = 0;
+    // True if the comps built but "tdcarney EXRDemux" wasn't installed
+    // — the layers have no hash-driven selection and render wrong
+    // until EXRDemux is installed (drives a prominent UI warning).
+    bool        exrdemux_missing = false;
 };
 
 // Build a single chase. `chase_index` is into state->chases.

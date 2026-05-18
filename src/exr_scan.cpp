@@ -2,6 +2,7 @@
 
 #include "hash.h"
 #include "panel_state.h"
+#include "diag_log.h"
 
 #include <algorithm>
 #include <cctype>
@@ -217,8 +218,10 @@ void GenerateThumbnail(const std::vector<float>& r,
                        int w, int h,
                        int target_max_w,
                        std::vector<uint8_t>& out_rgba,
-                       int& out_w, int& out_h)
+                       int& out_w, int& out_h,
+                       float& out_peak)
 {
+    out_peak = 0.f;
     if (target_max_w < 1) target_max_w = 1;
     out_w = std::min(target_max_w, w);
     if (out_w < 1) out_w = 1;
@@ -237,6 +240,7 @@ void GenerateThumbnail(const std::vector<float>& r,
         if (bv > max_v) max_v = bv;
     }
     const float inv_max = max_v > 0.f ? 1.0f / max_v : 0.f;
+    out_peak = max_v;
 
     out_rgba.assign(static_cast<size_t>(out_w) * out_h * 4, 0);
 
@@ -372,9 +376,175 @@ ScanMetrics ComputeMetrics(const std::vector<float>& r,
     return m;
 }
 
-void DoScan(const std::string& path, PanelState* state,
-            bool append, uint32_t fixed_source_id)
+namespace fs = std::filesystem;
+
+bool HasExrExt(const fs::path& p)
 {
+    std::string e = p.extension().string();
+    std::transform(e.begin(), e.end(), e.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return e == ".exr";
+}
+
+// Files in `dir` whose name is exactly prefix + <digits> + suffix.
+// prefix/suffix are matched LITERALLY (pass/sequence names are
+// arbitrary strings — no regex, per project rules). Sorted by the
+// integer value of the digit run so frame 1 is index 0.
+std::vector<std::string> CollectNumberedSiblings(
+    const fs::path& dir, const std::string& prefix, const std::string& suffix)
+{
+    std::vector<std::pair<long long, std::string>> hits;
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, ec), end; it != end && !ec;
+         it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        const std::string name = it->path().filename().string();
+        if (name.size() <= prefix.size() + suffix.size()) continue;
+        if (name.compare(0, prefix.size(), prefix) != 0) continue;
+        if (!suffix.empty() &&
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+            continue;
+        const std::string mid = name.substr(
+            prefix.size(), name.size() - prefix.size() - suffix.size());
+        if (mid.empty()) continue;
+        bool digits = true;
+        for (unsigned char c : mid)
+            if (!std::isdigit(c)) { digits = false; break; }
+        if (!digits) continue;
+        long long n = 0;
+        try { n = std::stoll(mid); } catch (...) { continue; }
+        hits.emplace_back(n, it->path().string());
+    }
+    std::sort(hits.begin(), hits.end(),
+        [](const auto& a, const auto& b) {
+            if (a.first != b.first) return a.first < b.first;
+            return a.second < b.second;
+        });
+    std::vector<std::string> out;
+    out.reserve(hits.size());
+    for (auto& h : hits) out.push_back(std::move(h.second));
+    return out;
+}
+
+// Turn whatever path AE / Explorer hands us (a concrete frame file, a
+// directory of frames, or a sequence-token path like name_[0001-0060]
+// .exr / name_####.exr / name_%04d.exr) into a single concrete EXR
+// file to actually open. `frame_index` (0-based) picks which frame of
+// the discovered sequence to use; it is clamped into range. Returns
+// false + a human-readable reason on failure.
+bool ResolveExrFrame(const std::string& input, int frame_index,
+                     std::string& out_file, int& out_count,
+                     int& out_used_index, std::string& out_err)
+{
+    std::error_code ec;
+    fs::path in(input);
+    std::vector<std::string> frames;
+
+    if (fs::is_directory(in, ec)) {
+        for (fs::directory_iterator it(in, ec), end; it != end && !ec;
+             it.increment(ec)) {
+            if (it->is_regular_file(ec) && HasExrExt(it->path()))
+                frames.push_back(it->path().string());
+        }
+        std::sort(frames.begin(), frames.end());
+    } else if (fs::is_regular_file(in, ec)) {
+        // Derive the sequence from this frame: the LAST run of digits
+        // in the filename is the frame counter.
+        const std::string fn = in.filename().string();
+        size_t end = std::string::npos, beg = std::string::npos;
+        for (size_t i = fn.size(); i-- > 0; ) {
+            if (std::isdigit(static_cast<unsigned char>(fn[i]))) {
+                if (end == std::string::npos) end = i + 1;
+                beg = i;
+            } else if (end != std::string::npos) {
+                break;
+            }
+        }
+        if (end == std::string::npos) {
+            frames.push_back(in.string());          // standalone, no number
+        } else {
+            frames = CollectNumberedSiblings(in.parent_path(),
+                fn.substr(0, beg), fn.substr(end));
+            if (frames.empty()) frames.push_back(in.string());
+        }
+    } else {
+        // Doesn't exist as-is: treat the filename as a sequence token.
+        fs::path parent = in.parent_path();
+        if (!fs::is_directory(parent, ec)) {
+            out_err = "Path not found: " + input;
+            return false;
+        }
+        const std::string fn = in.filename().string();
+        size_t tpos = std::string::npos;
+        for (size_t i = 0; i < fn.size(); ++i) {
+            char c = fn[i];
+            if (c == '#' || c == '*' || c == '%' || c == '[') { tpos = i; break; }
+        }
+        if (tpos == std::string::npos) {
+            out_err = "File not found: " + input;
+            return false;
+        }
+        std::string prefix = fn.substr(0, tpos);
+        size_t after = tpos;
+        if (fn[tpos] == '[') {
+            size_t close = fn.find(']', tpos);
+            if (close == std::string::npos) {
+                out_err = "Unrecognized sequence pattern: " + fn;
+                return false;
+            }
+            after = close + 1;
+        } else if (fn[tpos] == '#') {
+            while (after < fn.size() && fn[after] == '#') ++after;
+        } else if (fn[tpos] == '*') {
+            after = tpos + 1;
+        } else { // '%' printf-style
+            after = tpos + 1;
+            while (after < fn.size() &&
+                   std::isdigit(static_cast<unsigned char>(fn[after]))) ++after;
+            if (after < fn.size() &&
+                (fn[after] == 'd' || fn[after] == 'D' || fn[after] == 'i'))
+                ++after;
+        }
+        frames = CollectNumberedSiblings(parent, prefix, fn.substr(after));
+    }
+
+    if (frames.empty()) {
+        out_err = "No EXR frames found for: " + input;
+        return false;
+    }
+    int idx = frame_index < 0 ? 0 : frame_index;
+    if (idx >= static_cast<int>(frames.size()))
+        idx = static_cast<int>(frames.size()) - 1;
+    out_file       = frames[static_cast<size_t>(idx)];
+    out_count      = static_cast<int>(frames.size());
+    out_used_index = idx;
+    return true;
+}
+
+void DoScan(const std::string& input, PanelState* state,
+            bool append, uint32_t fixed_source_id, int frame_index)
+{
+    std::string path;
+    int frame_count = 1, used_frame = 0;
+    {
+        std::string rerr;
+        if (!ResolveExrFrame(input, frame_index, path, frame_count,
+                              used_frame, rerr)) {
+            CM_DIAG_LOG("DoScan: resolve failed input='%s' err='%s'",
+                        input.c_str(), rerr.c_str());
+            std::lock_guard<std::mutex> lk(state->mu);
+            state->last_error  = "EXR scan failed: " + rerr;
+            state->last_status = "Scan failed.";
+            if (!append) {
+                state->sources.clear();
+                state->active_source_index = -1;
+            }
+            return;
+        }
+    }
+    CM_DIAG_LOG("DoScan: input='%s' -> frame %d/%d '%s'",
+                input.c_str(), used_frame + 1, frame_count, path.c_str());
+
     try {
         Imf::MultiPartInputFile file(path.c_str());
 
@@ -454,7 +624,7 @@ void DoScan(const std::string& path, PanelState* state,
                 target_w = state->thumb_max_width;
             }
             GenerateThumbnail(r_buf, g_buf, b_buf, w, h, target_w,
-                              info.thumb_rgba, tw, th);
+                              info.thumb_rgba, tw, th, info.thumb_peak);
             info.thumb_w = tw;
             info.thumb_h = th;
 
@@ -486,7 +656,11 @@ void DoScan(const std::string& path, PanelState* state,
             } else {
                 src.source_id = state->next_source_id++;
             }
-            src.path         = path;
+            src.path         = input;        // original drag/pick path
+            src.scan_path    = path;         // concrete frame opened
+            src.scan_frame   = used_frame;
+            src.frame_count  = frame_count;
+            src.animation    = (frame_count > 1);  // auto; user-overridable
             src.image_width  = img_w;
             src.image_height = img_h;
             src.layers       = std::move(layers);
@@ -494,10 +668,33 @@ void DoScan(const std::string& path, PanelState* state,
             if (!append) {
                 state->sources.clear();
             }
-            state->sources.push_back(std::move(src));
-            state->active_source_index = (int)state->sources.size() - 1;
+            // Replace an existing source with the same id in place (a
+            // frame re-scan) so we don't stack duplicates and the row
+            // keeps its position / active selection. Otherwise append.
+            int replaced = -1;
+            if (fixed_source_id != 0) {
+                for (size_t i = 0; i < state->sources.size(); ++i) {
+                    if (state->sources[i].source_id == fixed_source_id) {
+                        // Preserve the user's animation override across
+                        // a frame re-scan (don't reset to auto-default).
+                        src.animation = state->sources[i].animation;
+                        state->sources[i] = std::move(src);
+                        replaced = static_cast<int>(i);
+                        break;
+                    }
+                }
+            }
+            if (replaced < 0) {
+                state->sources.push_back(std::move(src));
+                state->active_source_index = (int)state->sources.size() - 1;
+            } else {
+                state->active_source_index = replaced;
+            }
             state->last_error.clear();
-            state->last_status  = "Scan complete.";
+            state->last_status  = frame_count > 1
+                ? ("Scan complete (frame " + std::to_string(used_frame + 1) +
+                   "/" + std::to_string(frame_count) + ").")
+                : std::string("Scan complete.");
         }
         // Auto-tag-by-name once the source is published. Idempotent
         // against repeated calls (existing tags get new members added,
@@ -518,7 +715,7 @@ void DoScan(const std::string& path, PanelState* state,
 } // namespace
 
 void StartScan(const std::string& path, PanelState* state,
-               bool append, uint32_t source_id)
+               bool append, uint32_t source_id, int frame_index)
 {
     if (!state) return;
     if (state->scanning.exchange(true)) {
@@ -533,8 +730,8 @@ void StartScan(const std::string& path, PanelState* state,
         state->last_status = "Opening EXR...";
         state->last_error.clear();
     }
-    std::thread([state, path, append, source_id]() {
-        DoScan(path, state, append, source_id);
+    std::thread([state, path, append, source_id, frame_index]() {
+        DoScan(path, state, append, source_id, frame_index);
         state->scanning = false;
     }).detach();
 }
@@ -553,7 +750,7 @@ bool IncludeSkippedLayer(PanelState* state, uint32_t source_id,
             state->last_error = "Source not found.";
             return false;
         }
-        exr_path = src->path;
+        exr_path = src->scan_path.empty() ? src->path : src->scan_path;
         target_thumb_width = state->thumb_max_width;
     }
     if (exr_path.empty()) return false;
@@ -600,7 +797,7 @@ bool IncludeSkippedLayer(PanelState* state, uint32_t source_id,
         info.total        = m.total;
         int tw = 0, th = 0;
         GenerateThumbnail(r_buf, g_buf, b_buf, w, h, target_thumb_width,
-                          info.thumb_rgba, tw, th);
+                          info.thumb_rgba, tw, th, info.thumb_peak);
         info.thumb_w = tw;
         info.thumb_h = th;
 

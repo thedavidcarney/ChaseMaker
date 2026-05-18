@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -111,6 +112,10 @@ std::string Basename(const std::string& path)
 struct SourceSummary {
     uint32_t    source_id   = 0;
     std::string path;
+    std::string scan_path;
+    int         scan_frame  = 0;
+    int         frame_count = 1;
+    bool        animation   = false;
     int         image_width = 0;
     int         image_height = 0;
     size_t      layer_count = 0;
@@ -169,6 +174,10 @@ FrameSnapshot TakeSnapshot(PanelState* state)
         SourceSummary ss;
         ss.source_id     = src.source_id;
         ss.path          = src.path;
+        ss.scan_path     = src.scan_path;
+        ss.scan_frame    = src.scan_frame;
+        ss.frame_count   = src.frame_count;
+        ss.animation     = src.animation;
         ss.image_width   = src.image_width;
         ss.image_height  = src.image_height;
         ss.layer_count   = src.layers.size();
@@ -880,13 +889,15 @@ void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
         return;
     }
 
-    if (ImGui::BeginTable("sources_table", 5,
+    if (ImGui::BeginTable("sources_table", 7,
             ImGuiTableFlags_BordersOuterH | ImGuiTableFlags_BordersV |
             ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("Active",  ImGuiTableColumnFlags_WidthFixed, 56.f);
         ImGui::TableSetupColumn("File",    ImGuiTableColumnFlags_WidthStretch, 4.f);
         ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed, 110.f);
         ImGui::TableSetupColumn("Layers",  ImGuiTableColumnFlags_WidthFixed, 70.f);
+        ImGui::TableSetupColumn("Scan frame", ImGuiTableColumnFlags_WidthFixed, 130.f);
+        ImGui::TableSetupColumn("Loop",    ImGuiTableColumnFlags_WidthFixed, 64.f);
         ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 80.f);
         ImGui::TableHeadersRow();
 
@@ -920,6 +931,54 @@ void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
             ImGui::Text("%zu", ss.layer_count);
             if (ss.skipped_count > 0 && ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Plus %zu skipped", ss.skipped_count);
+            }
+
+            // Scan-frame picker: re-scan a different frame of the
+            // sequence in place. Only one frame is needed for centroid
+            // / sort / thumbnails — the chase is the animation layered
+            // on top, not the underlying scene motion.
+            ImGui::TableNextColumn();
+            if (ss.frame_count > 1) {
+                const bool busy = snap.scanning;
+                ImGui::BeginDisabled(busy || ss.scan_frame <= 0);
+                if (ImGui::SmallButton("<")) {
+                    exr_scan::StartScan(ss.path, state, /*append=*/true,
+                                        ss.source_id, ss.scan_frame - 1);
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::Text("%d/%d", ss.scan_frame + 1, ss.frame_count);
+                if (ImGui::IsItemHovered() && !ss.scan_path.empty())
+                    ImGui::SetTooltip("Scanned: %s", ss.scan_path.c_str());
+                ImGui::SameLine();
+                ImGui::BeginDisabled(busy ||
+                                     ss.scan_frame >= ss.frame_count - 1);
+                if (ImGui::SmallButton(">")) {
+                    exr_scan::StartScan(ss.path, state, /*append=*/true,
+                                        ss.source_id, ss.scan_frame + 1);
+                }
+                ImGui::EndDisabled();
+            } else {
+                ImGui::TextDisabled("single");
+            }
+
+            // Animation toggle: when on, chases from this source are
+            // seamless loops over its duration (footage time-locked,
+            // envelope sweeps). Auto-on for sequences; override here.
+            ImGui::TableNextColumn();
+            {
+                bool anim = ss.animation;
+                if (ImGui::Checkbox("##anim", &anim)) {
+                    std::lock_guard<std::mutex> lk(state->mu);
+                    if (Source* s = FindSourceById(*state, ss.source_id))
+                        s->animation = anim;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        anim ? "Animation: seamless loop over %d frames "
+                               "(footage time-locked)"
+                             : "Treated as a still (shift-in-time chase)",
+                        ss.frame_count);
             }
 
             ImGui::TableNextColumn();
@@ -1489,6 +1548,10 @@ bool MiddleClickReset(T& value, T default_value)
 
 // ===== Chase preview compositing ======================================
 
+// Defined later; the wrapped (seamless-loop) triangle envelope.
+float ScatterHitEnvelope(float playhead, float start, int loop_frames,
+                         const ChaseTiming& t);
+
 // Envelope value (0..1) for a stage at the given playhead frame.
 // Linear triangle: rises from 0 at stage_start to 1 at attack, falls
 // back to 0 at duration. Returns 0 when the stage is inactive.
@@ -1511,6 +1574,87 @@ float ChaseTotalDuration(const Chase& chase)
     return (chase.stages.size() - 1) * chase.timing.step_duration + chase.timing.duration;
 }
 
+// Per-stage envelope honoring loop-mode. In loop-mode (animation
+// source) stages are evenly spaced across the seamless loop and the
+// envelope wraps — no from-black ramp at t=0. `loop_frames <= 0`
+// falls back to the legacy shift-in-time triangle (still images).
+float ChaseStageEnvelopeAt(const Chase& chase, size_t si, float playhead,
+                           int loop_frames)
+{
+    const size_t n = chase.stages.size();
+    if (loop_frames > 0 && n > 0) {
+        const float phase = static_cast<float>(si) *
+            (static_cast<float>(loop_frames) / static_cast<float>(n));
+        return ScatterHitEnvelope(playhead, phase, loop_frames, chase.timing);
+    }
+    return StageEnvelope(static_cast<int>(si), playhead, chase.timing);
+}
+
+// Loop-mode-aware total preview length in frames.
+float ChaseTotalFrames(const Chase& chase, const PanelState& state, float fps)
+{
+    if (chase.random_scatter || ChaseLoopMode(state))
+        return static_cast<float>(ChaseLoopFrames(chase, state, fps));
+    return ChaseTotalDuration(chase);
+}
+
+// One weighted layer going into a composite. `k` is the envelope
+// multiplier (opacity * gamma_at_t), applied linearly.
+struct CompositeContribution { const LayerInfo* L; float k; };
+
+// Lighten-composite weighted contributions, matching the AE build
+// (black solid + Lighten — per-channel max, NOT additive). Thumbnails
+// are normalized to each layer's OWN peak so weak lights stay visible
+// in the layer table; that lies about relative brightness, so here we
+// undo it via thumb_peak and renormalize against `shared_peak` (the
+// brightest participating layer). Result: overlapping lights no
+// longer stack to white, and a dim fill reads dimmer than the key —
+// as it will in the AE comp. Still an approximation (the real
+// Exposure effect is a per-channel pow, not a linear scale), but
+// close and ~free.
+bool LightenComposite(const std::vector<CompositeContribution>& contribs,
+                      int out_w, int out_h, float shared_peak,
+                      std::vector<uint8_t>& out_rgba)
+{
+    if (out_w <= 0 || out_h <= 0) return false;
+    const size_t n = static_cast<size_t>(out_w) * out_h;
+    std::vector<float> acc(n * 3, 0.f);            // linear, Lighten max
+    const float sp = shared_peak > 1e-6f ? shared_peak : 1.f;
+
+    for (const auto& c : contribs) {
+        const LayerInfo* L = c.L;
+        if (!L || L->thumb_rgba.empty()) continue;
+        if (L->thumb_w != out_w || L->thumb_h != out_h) continue;
+        if (c.k <= 0.f) continue;
+        // thumb byte = sqrt(linear / thumb_peak) * 255, so
+        // linear / shared_peak = (byte/255)^2 * thumb_peak/shared_peak.
+        const float lp = L->thumb_peak > 0.f ? L->thumb_peak : 1.f;
+        const float scale = (lp / sp) * c.k;
+        const uint8_t* s = L->thumb_rgba.data();
+        for (size_t i = 0; i < n; ++i) {
+            for (int ch = 0; ch < 3; ++ch) {
+                const float u = s[i * 4 + ch] * (1.f / 255.f);
+                const float lin = u * u * scale;
+                float& a = acc[i * 3 + ch];
+                if (lin > a) a = lin;              // Lighten
+            }
+        }
+    }
+
+    out_rgba.assign(n * 4, 0);
+    for (size_t i = 0; i < n; ++i) {
+        for (int ch = 0; ch < 3; ++ch) {
+            float v = acc[i * 3 + ch];
+            if (v < 0.f) v = 0.f; else if (v > 1.f) v = 1.f;
+            int q = static_cast<int>(std::sqrt(v) * 255.f + 0.5f);
+            out_rgba[i * 4 + ch] =
+                static_cast<uint8_t>(q < 0 ? 0 : (q > 255 ? 255 : q));
+        }
+        out_rgba[i * 4 + 3] = 255;
+    }
+    return true;
+}
+
 // Build the composite RGBA8 buffer for the chase at the current
 // playhead. Sized to match the first usable thumbnail; ignores
 // thumbs whose dimensions don't match (mixed-source case; not yet
@@ -1521,28 +1665,26 @@ bool BuildChaseComposite(const Chase& chase, const PanelState& state,
                          int& out_w, int& out_h)
 {
     out_w = 0; out_h = 0;
+    // Shared peak over ALL referenced layers (not just active ones)
+    // so brightness doesn't flicker as stages turn on/off.
+    float shared_peak = 0.f;
     for (const auto& stage : chase.stages) {
         for (const auto& ref : stage.members) {
             const LayerInfo* L = FindLayerByRef(state, ref);
-            if (L && L->thumb_w > 0 && L->thumb_h > 0) {
+            if (!L) continue;
+            if (out_w == 0 && L->thumb_w > 0 && L->thumb_h > 0) {
                 out_w = L->thumb_w; out_h = L->thumb_h;
-                break;
             }
+            if (L->thumb_peak > shared_peak) shared_peak = L->thumb_peak;
         }
-        if (out_w > 0) break;
     }
     if (out_w == 0 || out_h == 0) return false;
 
-    const size_t n = static_cast<size_t>(out_w) * out_h;
-    out_rgba.assign(n * 4, 0);
-
-    // Accumulate per stage. Approximation: linear multiplier =
-    // opacity * gamma_at_t. The actual Exposure effect applies
-    // pow(input, 1/gamma) per channel; this linear scaling is close
-    // enough for an at-a-glance preview and 50-100x faster than a
-    // per-pixel pow.
+    const int loop_frames = ChaseLoopMode(state)
+        ? ChaseLoopFrames(chase, state, 0.f) : 0;
+    std::vector<CompositeContribution> contribs;
     for (size_t si = 0; si < chase.stages.size(); ++si) {
-        float env = StageEnvelope(static_cast<int>(si), playhead, chase.timing);
+        float env = ChaseStageEnvelopeAt(chase, si, playhead, loop_frames);
         if (env <= 0.f) continue;
         const float opacity = (chase.timing.opacity_peak / 100.f) * env;
         const float gamma_t = chase.timing.gamma_baseline +
@@ -1550,23 +1692,10 @@ bool BuildChaseComposite(const Chase& chase, const PanelState& state,
         const float k = opacity * gamma_t;
         if (k <= 0.f) continue;
         for (const auto& ref : chase.stages[si].members) {
-            const LayerInfo* L = FindLayerByRef(state, ref);
-            if (!L || L->thumb_rgba.empty()) continue;
-            if (L->thumb_w != out_w || L->thumb_h != out_h) continue;
-            const uint8_t* s = L->thumb_rgba.data();
-            uint8_t* d = out_rgba.data();
-            for (size_t i = 0; i < n; ++i) {
-                int r = d[i*4+0] + static_cast<int>(s[i*4+0] * k);
-                int g = d[i*4+1] + static_cast<int>(s[i*4+1] * k);
-                int b = d[i*4+2] + static_cast<int>(s[i*4+2] * k);
-                d[i*4+0] = static_cast<uint8_t>(r > 255 ? 255 : r);
-                d[i*4+1] = static_cast<uint8_t>(g > 255 ? 255 : g);
-                d[i*4+2] = static_cast<uint8_t>(b > 255 ? 255 : b);
-                d[i*4+3] = 255;
-            }
+            contribs.push_back({ FindLayerByRef(state, ref), k });
         }
     }
-    return true;
+    return LightenComposite(contribs, out_w, out_h, shared_peak, out_rgba);
 }
 
 // Composite an explicit set of layer refs at full strength (no
@@ -1580,33 +1709,19 @@ bool BuildRefsComposite(const std::vector<LayerRef>& refs,
                         int& out_w, int& out_h)
 {
     out_w = 0; out_h = 0;
+    float shared_peak = 0.f;
+    std::vector<CompositeContribution> contribs;
     for (const auto& ref : refs) {
         const LayerInfo* L = FindLayerByRef(state, ref);
-        if (L && L->thumb_w > 0 && L->thumb_h > 0) {
+        if (!L) continue;
+        if (out_w == 0 && L->thumb_w > 0 && L->thumb_h > 0) {
             out_w = L->thumb_w; out_h = L->thumb_h;
-            break;
         }
+        if (L->thumb_peak > shared_peak) shared_peak = L->thumb_peak;
+        contribs.push_back({ L, 1.f });
     }
     if (out_w == 0 || out_h == 0) return false;
-    const size_t n = static_cast<size_t>(out_w) * out_h;
-    out_rgba.assign(n * 4, 0);
-    for (const auto& ref : refs) {
-        const LayerInfo* L = FindLayerByRef(state, ref);
-        if (!L || L->thumb_rgba.empty()) continue;
-        if (L->thumb_w != out_w || L->thumb_h != out_h) continue;
-        const uint8_t* s = L->thumb_rgba.data();
-        uint8_t* d = out_rgba.data();
-        for (size_t i = 0; i < n; ++i) {
-            int r = d[i*4+0] + s[i*4+0];
-            int g = d[i*4+1] + s[i*4+1];
-            int b = d[i*4+2] + s[i*4+2];
-            d[i*4+0] = static_cast<uint8_t>(r > 255 ? 255 : r);
-            d[i*4+1] = static_cast<uint8_t>(g > 255 ? 255 : g);
-            d[i*4+2] = static_cast<uint8_t>(b > 255 ? 255 : b);
-            d[i*4+3] = 255;
-        }
-    }
-    return true;
+    return LightenComposite(contribs, out_w, out_h, shared_peak, out_rgba);
 }
 
 // ===== Chase JSON exporter ============================================
@@ -1818,16 +1933,19 @@ bool BuildScatterComposite(const Chase& chase, const PanelState& state,
                            int& out_w, int& out_h)
 {
     out_w = 0; out_h = 0;
-    const int loop_frames = ScatterLoopFrames(chase, fps);
+    const int loop_frames = ChaseLoopFrames(chase, state, fps);
+    float shared_peak = 0.f;
     for (const auto& hit : chase.scatter) {
         const LayerInfo* L = FindLayerByRef(state, hit.ref);
-        if (L && L->thumb_w > 0 && L->thumb_h > 0) {
-            out_w = L->thumb_w; out_h = L->thumb_h; break;
+        if (!L) continue;
+        if (out_w == 0 && L->thumb_w > 0 && L->thumb_h > 0) {
+            out_w = L->thumb_w; out_h = L->thumb_h;
         }
+        if (L->thumb_peak > shared_peak) shared_peak = L->thumb_peak;
     }
     if (out_w == 0 || out_h == 0) return false;
-    const size_t n = static_cast<size_t>(out_w) * out_h;
-    out_rgba.assign(n * 4, 0);
+
+    std::vector<CompositeContribution> contribs;
     for (const auto& hit : chase.scatter) {
         const float env = ScatterHitEnvelope(playhead, hit.start_frame,
                                               loop_frames, chase.timing);
@@ -1837,22 +1955,9 @@ bool BuildScatterComposite(const Chase& chase, const PanelState& state,
             (chase.timing.gamma_peak - chase.timing.gamma_baseline) * env;
         const float k = opacity * gamma_t;
         if (k <= 0.f) continue;
-        const LayerInfo* L = FindLayerByRef(state, hit.ref);
-        if (!L || L->thumb_rgba.empty()) continue;
-        if (L->thumb_w != out_w || L->thumb_h != out_h) continue;
-        const uint8_t* s = L->thumb_rgba.data();
-        uint8_t* d = out_rgba.data();
-        for (size_t i = 0; i < n; ++i) {
-            int r = d[i*4+0] + static_cast<int>(s[i*4+0] * k);
-            int g = d[i*4+1] + static_cast<int>(s[i*4+1] * k);
-            int b = d[i*4+2] + static_cast<int>(s[i*4+2] * k);
-            d[i*4+0] = static_cast<uint8_t>(r > 255 ? 255 : r);
-            d[i*4+1] = static_cast<uint8_t>(g > 255 ? 255 : g);
-            d[i*4+2] = static_cast<uint8_t>(b > 255 ? 255 : b);
-            d[i*4+3] = 255;
-        }
+        contribs.push_back({ FindLayerByRef(state, hit.ref), k });
     }
-    return true;
+    return LightenComposite(contribs, out_w, out_h, shared_peak, out_rgba);
 }
 
 // Build a JSON string describing a chase. The companion JSX executor
@@ -1928,7 +2033,9 @@ void ApplyTemplateToChase(Chase& c, int template_idx)
     c.manual_stages = false;
     c.random_scatter = false;
     switch (template_idx) {
-    case 0: c.sort_mode = SortMode::CentroidX;          c.sort_reverse = false; break;
+    // Left→Right: Hotspot X (bright concentrated source, spill
+    // ignored) is the default ordering basis for chases.
+    case 0: c.sort_mode = SortMode::HotspotX;           c.sort_reverse = false; break;
     case 1: c.sort_mode = SortMode::CentroidY;          c.sort_reverse = false; break;
     case 2:
         // Center Out: order by HOTSPOT x (the bright concentrated
@@ -1942,7 +2049,7 @@ void ApplyTemplateToChase(Chase& c, int template_idx)
         c.symmetric_pairs = true;
         break;
     case 3:
-        c.sort_mode = SortMode::CentroidX;
+        c.sort_mode = SortMode::HotspotX;
         c.sort_reverse = false;
         c.desired_stage_count = 3;
         break;
@@ -2238,19 +2345,45 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     if (MiddleClickReset(t.attack, 5.0f)) t_changed = true;
     ImGui::SameLine();
     ImGui::SetNextItemWidth(slider_w);
-    if (ImGui::SliderFloat("Step", &t.step_duration, 0.5f, 60.f, "%.1f f")) t_changed = true;
-    if (MiddleClickReset(t.step_duration, 4.0f)) t_changed = true;
-    ImGui::SetNextItemWidth(slider_w);
-    if (ImGui::SliderFloat("Opacity peak", &t.opacity_peak, 0.f, 100.f, "%.0f%%")) t_changed = true;
-    if (MiddleClickReset(t.opacity_peak, 100.0f)) t_changed = true;
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(slider_w);
-    if (ImGui::SliderFloat("Gamma peak", &t.gamma_peak, 0.01f, 4.f, "%.2f")) t_changed = true;
-    if (MiddleClickReset(t.gamma_peak, 1.0f)) t_changed = true;
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(slider_w);
-    if (ImGui::SliderFloat("Gamma base", &t.gamma_baseline, 0.01f, 4.f, "%.2f")) t_changed = true;
-    if (MiddleClickReset(t.gamma_baseline, 0.25f)) t_changed = true;
+    const bool loop_mode = ChaseLoopMode(*state);
+    if (loop_mode) {
+        // Animation source: the loop length is the source duration and
+        // step is derived (loop / stage count) so the chase stays
+        // phase-locked to the scene. Step isn't user-editable here.
+        const int   lf = ChaseLoopFrames(cs, *state, 0.f);
+        const size_t n  = cs.stages.empty() ? 1 : cs.stages.size();
+        const float derived_step = static_cast<float>(lf) /
+                                   static_cast<float>(n);
+        t.step_duration = derived_step;
+        ImGui::BeginDisabled(true);
+        float shown = derived_step;
+        ImGui::SliderFloat("Step", &shown, 0.f, static_cast<float>(lf),
+                           "%.2f f (auto)");
+        ImGui::EndDisabled();
+        ImGui::TextDisabled(
+            "Seamless loop: %d-frame source \xC2\xB7 %zu stages \xC2\xB7 "
+            "step %.2f f (loop divides the source exactly)",
+            lf, n, derived_step);
+    } else {
+        if (ImGui::SliderFloat("Step", &t.step_duration, 0.5f, 60.f, "%.1f f")) t_changed = true;
+        if (MiddleClickReset(t.step_duration, 4.0f)) t_changed = true;
+    }
+    // Opacity/gamma envelope tuned rarely — collapsed by default to
+    // keep the common timing controls uncluttered.
+    if (ImGui::TreeNode("Opacity / Gamma envelope")) {
+        ImGui::SetNextItemWidth(slider_w);
+        if (ImGui::SliderFloat("Opacity peak", &t.opacity_peak, 0.f, 100.f, "%.0f%%")) t_changed = true;
+        if (MiddleClickReset(t.opacity_peak, 100.0f)) t_changed = true;
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(slider_w);
+        if (ImGui::SliderFloat("Gamma peak", &t.gamma_peak, 0.01f, 4.f, "%.2f")) t_changed = true;
+        if (MiddleClickReset(t.gamma_peak, 1.0f)) t_changed = true;
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(slider_w);
+        if (ImGui::SliderFloat("Gamma base", &t.gamma_baseline, 0.01f, 4.f, "%.2f")) t_changed = true;
+        if (MiddleClickReset(t.gamma_baseline, 0.25f)) t_changed = true;
+        ImGui::TreePop();
+    }
 
     if (sort_changed || t_changed || grouping_changed) {
         std::lock_guard<std::mutex> lk(state->mu);
@@ -2267,7 +2400,7 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     // ---- Preview transport ----
     ImGui::Separator();
     const float fps = std::max(1.f, state->chase_preview_fps.load());
-    const float total = ChaseTotalDuration(cs);
+    const float total = ChaseTotalFrames(cs, *state, fps);
     if (state->chase_preview_frame > total) state->chase_preview_frame = 0.f;
     if (state->chase_preview_playing && total > 0.f) {
         state->chase_preview_frame += ImGui::GetIO().DeltaTime * fps;
@@ -2328,9 +2461,11 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     std::vector<float> stage_envelopes(cs.stages.size(), 0.f);
     int   active_stage_top = -1;
     float active_top_env = 0.f;
+    const int hl_loop_frames = ChaseLoopMode(*state)
+        ? ChaseLoopFrames(cs, *state, fps) : 0;
     for (size_t si = 0; si < cs.stages.size(); ++si) {
-        stage_envelopes[si] = StageEnvelope(static_cast<int>(si),
-                                            state->chase_preview_frame, cs.timing);
+        stage_envelopes[si] = ChaseStageEnvelopeAt(
+            cs, si, state->chase_preview_frame, hl_loop_frames);
         if (stage_envelopes[si] > active_top_env) {
             active_top_env = stage_envelopes[si];
             active_stage_top = static_cast<int>(si);
@@ -2772,7 +2907,7 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
     ImGui::TextDisabled("%d lights \xC2\xB7 %zu hits \xC2\xB7 %d frames",
         (cs.scatter.empty() || dens <= 0)
             ? 0 : (int)(cs.scatter.size() / std::max(1, dens)),
-        cs.scatter.size(), ScatterLoopFrames(cs, fps));
+        cs.scatter.size(), ChaseLoopFrames(cs, *state, fps));
 
     // ---- Hit envelope (shared ChaseTiming; no step in scatter) ----
     ImGui::Separator();
@@ -2786,17 +2921,22 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
     ImGui::SetNextItemWidth(sw);
     if (ImGui::SliderFloat("Attack", &t.attack, 0.f, t.duration, "%.1f f")) t_changed = true;
     if (MiddleClickReset(t.attack, 5.0f)) t_changed = true;
-    ImGui::SetNextItemWidth(sw);
-    if (ImGui::SliderFloat("Opacity peak", &t.opacity_peak, 0.f, 100.f, "%.0f%%")) t_changed = true;
-    if (MiddleClickReset(t.opacity_peak, 100.0f)) t_changed = true;
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(sw);
-    if (ImGui::SliderFloat("Gamma peak", &t.gamma_peak, 0.01f, 4.f, "%.2f")) t_changed = true;
-    if (MiddleClickReset(t.gamma_peak, 1.0f)) t_changed = true;
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(sw);
-    if (ImGui::SliderFloat("Gamma base", &t.gamma_baseline, 0.01f, 4.f, "%.2f")) t_changed = true;
-    if (MiddleClickReset(t.gamma_baseline, 0.25f)) t_changed = true;
+    // Opacity/gamma envelope tuned rarely — collapsed by default to
+    // keep the common timing controls uncluttered.
+    if (ImGui::TreeNode("Opacity / Gamma envelope")) {
+        ImGui::SetNextItemWidth(sw);
+        if (ImGui::SliderFloat("Opacity peak", &t.opacity_peak, 0.f, 100.f, "%.0f%%")) t_changed = true;
+        if (MiddleClickReset(t.opacity_peak, 100.0f)) t_changed = true;
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(sw);
+        if (ImGui::SliderFloat("Gamma peak", &t.gamma_peak, 0.01f, 4.f, "%.2f")) t_changed = true;
+        if (MiddleClickReset(t.gamma_peak, 1.0f)) t_changed = true;
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(sw);
+        if (ImGui::SliderFloat("Gamma base", &t.gamma_baseline, 0.01f, 4.f, "%.2f")) t_changed = true;
+        if (MiddleClickReset(t.gamma_baseline, 0.25f)) t_changed = true;
+        ImGui::TreePop();
+    }
 
     if (changed || t_changed) {
         std::lock_guard<std::mutex> lk(state->mu);
@@ -2812,7 +2952,7 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
 
     // ---- Preview transport (loops over the scatter length) ----
     ImGui::Separator();
-    const float total = static_cast<float>(ScatterLoopFrames(cs, fps));
+    const float total = static_cast<float>(ChaseLoopFrames(cs, *state, fps));
     if (state->chase_preview_frame > total) state->chase_preview_frame = 0.f;
     if (state->chase_preview_playing && total > 0.f) {
         state->chase_preview_frame += ImGui::GetIO().DeltaTime * fps;
@@ -2870,7 +3010,7 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
                             ImGui::GetContentRegionAvail().x - right_w - 12.f);
 
     // Aggregate hits per light (for the table) + active set this frame.
-    const int loop_frames = ScatterLoopFrames(cs, fps);
+    const int loop_frames = ChaseLoopFrames(cs, *state, fps);
     std::unordered_map<uint32_t, int> hit_count;
     std::unordered_set<uint32_t> active_hashes;
     for (const auto& hit : cs.scatter) {
@@ -3013,11 +3153,25 @@ void DrawSessionToolbar(PanelState* state, const FrameSnapshot& snap)
     ImGui::EndDisabled();
     {
         std::string status;
+        bool exrdemux_missing = false;
         {
             std::lock_guard<std::mutex> lk(state->mu);
             status = state->last_build_status;
+            exrdemux_missing = state->last_build_exrdemux_missing;
         }
-        if (!status.empty()) {
+        if (exrdemux_missing) {
+            // Comps DID build — but without EXRDemux they render
+            // wrong. Loud, actionable, points at the Save button
+            // that's right above this line.
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.62f, 0.18f, 1.f));
+            ImGui::TextWrapped(
+                "EXRDemux not installed: the comps were created, but the "
+                "light layers have NO hash-driven selection and will "
+                "render wrong. Click \"Save session\" above, install "
+                "\"tdcarney EXRDemux\", restart AE, then \"Load session\" "
+                "and Build again. (%s)", status.c_str());
+            ImGui::PopStyleColor();
+        } else if (!status.empty()) {
             ImGui::SameLine();
             ImGui::TextDisabled("%s", status.c_str());
         }

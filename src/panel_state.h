@@ -60,6 +60,15 @@ struct LayerInfo {
     int         thumb_w = 0;
     int         thumb_h = 0;
     uint64_t    texture_id = 0;
+
+    // Linear peak the thumbnail was normalized against (the layer's
+    // own brightest channel value). thumb_rgba encodes
+    // sqrt(linear / thumb_peak), so the preview compositor can recover
+    // a relative-truthful linear value and renormalize against a
+    // shared scene peak (per-layer normalization keeps weak lights
+    // visible in the layer table, but lies about relative brightness
+    // — the composite preview undoes it). 0 = unknown (treat as 1).
+    float       thumb_peak = 0.f;
 };
 
 struct SkippedLayer {
@@ -73,7 +82,19 @@ struct SkippedLayer {
 // references by (source_id, layer_hash) remain valid.
 struct Source {
     uint32_t                    source_id = 0;     // assigned per session
-    std::string                 path;              // full filesystem path
+    std::string                 path;              // original drag/pick path
+                                                   // (file, dir, or seq token)
+    std::string                 scan_path;         // concrete .exr frame opened
+    int                         scan_frame = 0;    // 0-based frame scanned
+    int                         frame_count = 1;   // frames in the sequence
+    // Treat this source as an animation: chases built from it loop
+    // seamlessly over the source's own duration (frame_count frames),
+    // footage time-locked (every layer plays the same frames at the
+    // same comp time), envelope sweeps. Auto-set true at scan when
+    // frame_count > 1; user-overridable in the Sources tab for the
+    // odd case where a multi-frame source should still be treated as
+    // shift-in-time stills.
+    bool                        animation = false;
     int                         image_width = 0;
     int                         image_height = 0;
     std::vector<LayerInfo>      layers;
@@ -182,7 +203,11 @@ struct ChaseTiming {
 struct Chase {
     uint32_t                chase_id = 0;
     std::string             name;
-    SortMode                sort_mode = SortMode::CentroidX;
+    // Hotspot X is the chase default: it orders by the bright
+    // concentrated source (ignoring spill/bounce), which reads as the
+    // truer left→right light order than the spill-influenced
+    // whole-layer centroid.
+    SortMode                sort_mode = SortMode::HotspotX;
     bool                    sort_reverse = false;
     uint32_t                random_seed = 0;
     // Filter by tag IDs. Empty = all staged layers are eligible.
@@ -464,6 +489,11 @@ struct PanelState {
     std::atomic<bool>             want_build_all_chases{false};
     // Status feedback from the last build for the UI to display.
     std::string                   last_build_status;
+    // Last build ran but EXRDemux wasn't installed — drives a
+    // prominent, actionable UI warning (save session / install /
+    // restart AE / reload + rebuild). Guarded by `mu` like the
+    // status string above.
+    bool                          last_build_exrdemux_missing = false;
 
     // ---- Wizard form state (reset each time wizard opens) ----
     int                           wizard_template_index = 0;   // index in template list
@@ -678,6 +708,28 @@ inline int ScatterLoopFrames(const Chase& chase, float fps)
     return static_cast<int>(f < 1 ? 1 : f);
 }
 
+// True when the active source is an animation/sequence — chases run
+// as seamless loops over the source's own duration instead of the
+// shift-in-time "from black" model used for stills.
+inline bool ChaseLoopMode(const PanelState& state)
+{
+    const Source* src = ActiveSource(state);
+    return src && src->animation && src->frame_count > 1;
+}
+
+// Seamless-loop length in frames for this chase. Animation source:
+// EXACTLY the source duration (frame_count) — the show requirement,
+// so the chase loop and the scene animation stay phase-locked.
+// Otherwise the scatter's own loop_seconds*fps (still-image scatter).
+inline int ChaseLoopFrames(const Chase& chase, const PanelState& state,
+                           float fps)
+{
+    const Source* src = ActiveSource(state);
+    if (src && src->animation && src->frame_count > 1)
+        return src->frame_count;
+    return ScatterLoopFrames(chase, fps);
+}
+
 // Regenerate a scatter chase's hit list deterministically from
 // (random_seed, scatter_density, loop_seconds, fps, eligible set).
 // Shared by the UI (per-frame, for the preview) AND the AE builder
@@ -692,7 +744,7 @@ inline void RegenerateScatter(Chase& chase, const PanelState& state,
     chase.scatter.clear();
     const Source* src = ActiveSource(state);
     if (!src) return;
-    const int loop_frames = ScatterLoopFrames(chase, fps);
+    const int loop_frames = ChaseLoopFrames(chase, state, fps);
     const int density = (chase.scatter_density < 1) ? 1
                                                     : chase.scatter_density;
 

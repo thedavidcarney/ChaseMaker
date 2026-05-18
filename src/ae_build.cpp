@@ -9,10 +9,14 @@
 #include "AEGP_SuiteHandler.h"
 #include "SPBasic.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ae_build {
@@ -150,40 +154,36 @@ A_Err FindChildByName(AEGP_SuiteHandler& sp,
     return A_Err_NONE;
 }
 
-// Pick a new, unused versioned name for the ChaseMaker folder. If
-// `base` doesn't exist yet, returns `base`. Otherwise returns
-// `base_v02`, `base_v03`, etc. up to a safety limit.
-std::string PickVersionedFolderName(AEGP_SuiteHandler& sp,
-                                    AEGP_ProjectH proj,
-                                    AEGP_ItemH parent,
-                                    AEGP_PluginID plugin_id,
-                                    const std::string& base)
-{
-    AEGP_ItemH existing = nullptr;
-    FindChildByName(sp, proj, parent, base, AEGP_ItemType_NONE, plugin_id, &existing);
-    if (!existing) return base;
-    for (int v = 2; v < 100; ++v) {
-        char suffix[8];
-        std::snprintf(suffix, sizeof(suffix), "_v%02d", v);
-        std::string candidate = base + suffix;
-        FindChildByName(sp, proj, parent, candidate, AEGP_ItemType_NONE,
-                        plugin_id, &existing);
-        if (!existing) return candidate;
-    }
-    return base + "_vXX";  // very unlikely; user will see and adjust
-}
-
 // ===== Footage import =================================================
 
+// Case-insensitive, separator-normalized path compare (Windows paths
+// from AE vs our std::filesystem paths can differ in slash/case).
+std::string NormPath(const std::string& s)
+{
+    std::string o = s;
+    for (char& c : o) {
+        if (c == '/') c = '\\';
+        else c = static_cast<char>(std::tolower(
+            static_cast<unsigned char>(c)));
+    }
+    return o;
+}
+
 // Find a footage item already in the project whose source path
-// matches `path`. Returns nullptr in *out_item if not found.
+// matches `path` OR `alt_path` (the latter lets us reuse a sequence
+// the user imported themselves — AE reports its path as frame 0,
+// which is our scan_path). Returns nullptr in *out_item if not found.
 A_Err FindFootageByPath(AEGP_SuiteHandler& sp,
                         AEGP_ProjectH proj,
                         AEGP_PluginID plugin_id,
                         const std::string& path,
+                        const std::string& alt_path,
                         AEGP_ItemH* out_item)
 {
     *out_item = nullptr;
+    const std::string want  = NormPath(path);
+    const std::string want2 = alt_path.empty() ? std::string()
+                                               : NormPath(alt_path);
     AEGP_ItemH it = nullptr;
     sp.ItemSuite9()->AEGP_GetFirstProjItem(proj, &it);
     while (it) {
@@ -196,8 +196,8 @@ A_Err FindFootageByPath(AEGP_SuiteHandler& sp,
                 if (!sp.FootageSuite5()->AEGP_GetFootagePath(
                         fh, 0, AEGP_FOOTAGE_MAIN_FILE_INDEX, &hpath))
                 {
-                    std::string p = MemHandleToString(sp, hpath);
-                    if (p == path) {
+                    std::string p = NormPath(MemHandleToString(sp, hpath));
+                    if (p == want || (!want2.empty() && p == want2)) {
                         *out_item = it;
                         return A_Err_NONE;
                     }
@@ -217,19 +217,33 @@ A_Err EnsureFootage(AEGP_SuiteHandler& sp,
                     AEGP_ProjectH proj,
                     AEGP_PluginID plugin_id,
                     const std::string& path,
+                    const std::string& scan_path,
+                    bool as_sequence,
                     AEGP_ItemH chasemaker_folder,
                     AEGP_ItemH* out_footage)
 {
-    A_Err err = FindFootageByPath(sp, proj, plugin_id, path, out_footage);
+    A_Err err = FindFootageByPath(sp, proj, plugin_id, path,
+                                  scan_path, out_footage);
     if (err) return err;
     if (*out_footage) return A_Err_NONE;
-    // Not found — import.
+    // Not found — import. For an animation source import the whole
+    // image sequence (a concrete frame path + all_in_folder) so the
+    // built comp animates; otherwise import the path as-is (still).
     AEGP_FootageH footH = nullptr;
-    std::vector<A_UTF16Char> u16 = ToUtf16(path);
+    const std::string import_path =
+        (as_sequence && !scan_path.empty()) ? scan_path : path;
+    std::vector<A_UTF16Char> u16 = ToUtf16(import_path);
+    AEGP_FileSequenceImportOptions seq{};
+    if (as_sequence) {
+        seq.all_in_folderB     = TRUE;
+        seq.force_alphabeticalB = TRUE;
+        seq.start_frameL       = AEGP_ANY_FRAME;
+        seq.end_frameL         = AEGP_ANY_FRAME;
+    }
     err = sp.FootageSuite5()->AEGP_NewFootage(
         plugin_id, u16.data(),
         nullptr,  // no layer key — import as merged
-        nullptr,  // no sequence options
+        as_sequence ? &seq : nullptr,
         AEGP_InterpretationStyle_NO_DIALOG_GUESS,
         nullptr,  // reserved
         &footH);
@@ -347,6 +361,30 @@ A_Err BakeThreeKeyframes(AEGP_SuiteHandler& sp,
     return A_Err_NONE;
 }
 
+// Bake an arbitrary keyframe list (linear interp) on a 1-D stream.
+// Used for the seamless-loop wrapped envelope, which needs more than
+// three breakpoints once it crosses the loop boundary.
+A_Err BakeKeyframes(AEGP_SuiteHandler& sp,
+                    AEGP_StreamRefH stream,
+                    const std::vector<std::pair<A_Time, double>>& kf)
+{
+    if (!stream || kf.empty()) return A_Err_GENERIC;
+    AEGP_AddKeyframesInfoH ak = nullptr;
+    A_Err err = sp.KeyframeSuite5()->AEGP_StartAddKeyframes(stream, &ak);
+    if (err || !ak) return err ? err : A_Err_GENERIC;
+    for (const auto& p : kf) {
+        A_long idx = 0;
+        sp.KeyframeSuite5()->AEGP_AddKeyframes(ak, AEGP_LTimeMode_LayerTime,
+                                               &p.first, &idx);
+        AEGP_StreamValue2 val{};
+        val.streamH = stream;
+        val.val.one_d = p.second;
+        sp.KeyframeSuite5()->AEGP_SetAddKeyframe(ak, idx, &val);
+    }
+    sp.KeyframeSuite5()->AEGP_EndAddKeyframes(TRUE, ak);
+    return A_Err_NONE;
+}
+
 // Convert "frames at fps" to A_Time. duration_in_seconds = frames/fps.
 // A_Time models that as value/scale with value = frames*fps.den and
 // scale = fps.num — exact rational, no float-to-rational conversion.
@@ -365,6 +403,17 @@ A_Time FramesToATime(double frames, A_Ratio fps)
 
 // ===== Comp creation ==================================================
 
+// A floating fps -> exact A_Ratio, preserving the common NTSC
+// fractional rates and otherwise rounding to an integer/1.
+A_Ratio RatioFromFps(A_FpLong fps)
+{
+    if (fps <= 0.01) return A_Ratio{24, 1};
+    if (std::fabs(fps - 23.976) < 0.01) return A_Ratio{24000, 1001};
+    if (std::fabs(fps - 29.97)  < 0.01) return A_Ratio{30000, 1001};
+    if (std::fabs(fps - 59.94)  < 0.01) return A_Ratio{60000, 1001};
+    return A_Ratio{static_cast<A_long>(fps + 0.5), 1};
+}
+
 // Pull the AE project's "natural" framerate. There's no direct
 // project-level fps; pull from the active comp if any, else fall
 // back to 24/1.
@@ -381,14 +430,7 @@ A_Ratio GetActiveCompFramerate(AEGP_SuiteHandler& sp)
             if (!sp.CompSuite11()->AEGP_GetCompFromItem(active, &ch) && ch) {
                 A_FpLong fps = 0;
                 sp.CompSuite11()->AEGP_GetCompFramerate(ch, &fps);
-                if (fps > 0.01) {
-                    // Round to a sane integer numerator with den=1
-                    // unless fps is clearly 23.976/29.97/59.94.
-                    if (std::fabs(fps - 23.976) < 0.01) return A_Ratio{24000, 1001};
-                    if (std::fabs(fps - 29.97)  < 0.01) return A_Ratio{30000, 1001};
-                    if (std::fabs(fps - 59.94)  < 0.01) return A_Ratio{60000, 1001};
-                    return A_Ratio{static_cast<A_long>(fps + 0.5), 1};
-                }
+                if (fps > 0.01) return RatioFromFps(fps);
             }
         }
     }
@@ -415,6 +457,12 @@ struct BuildContext {
     A_Ratio                   fps{24, 1};
     A_long                    src_w = 0;
     A_long                    src_h = 0;
+    // Loop-mode (animation/sequence source): chases are seamless
+    // loops of exactly `loop_frames` (the source's own duration);
+    // every light's footage is time-locked (offset 0, spans the whole
+    // comp) and only the opacity/exposure envelope sweeps + wraps.
+    // 0 = still-image shift-in-time mode (legacy).
+    int                       loop_frames = 0;
     int                       comps_created = 0;
     int                       layers_added = 0;
 };
@@ -428,10 +476,16 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
     const double fps_d = static_cast<double>(ctx.fps.num) /
         static_cast<double>(std::max<A_long>(1, ctx.fps.den));
 
-    // Compute total duration in frames. Scatter chases are a fixed
-    // seamless loop; stage chases run until the last stage's release.
+    // Compute total duration in frames.
+    //  - Loop-mode (animation source): EXACTLY the source duration, so
+    //    the comp loops seamlessly and stays phase-locked to the scene.
+    //  - Scatter (still source): its own seamless loop_seconds.
+    //  - Stage chase (still source): runs until the last release.
+    const bool loop_mode = (ctx.loop_frames > 0);
     float total_frames = 0.f;
-    if (chase.random_scatter) {
+    if (loop_mode) {
+        total_frames = static_cast<float>(ctx.loop_frames);
+    } else if (chase.random_scatter) {
         const double lf = static_cast<double>(
             std::llround(chase.loop_seconds * fps_d));
         total_frames = static_cast<float>(lf < 1.0 ? 1.0 : lf);
@@ -600,6 +654,122 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
         }
     };
 
+    // Loop-mode placement: ONE time-locked footage layer per light
+    // spanning the whole comp (offset 0 — the sequence plays its own
+    // frames at the same comp time for every light, keeping the scene
+    // animation in sync). The chase is expressed purely as wrapped
+    // opacity/gamma keyframes whose envelope is periodic with the
+    // loop, so the comp loops seamlessly with no from-black bookends.
+    const double loopL   = static_cast<double>(total_frames);
+    const double env_a   = attack_f;
+    const double env_d   = duration_f;
+    auto env_at = [loopL, env_a, env_d](double phase, double t) -> double {
+        double local = std::fmod(t - phase, loopL);
+        if (local < 0.0) local += loopL;
+        if (local >= env_d) return 0.0;
+        const double dd = env_d < 0.001 ? 0.001 : env_d;
+        double pk = env_a / dd;
+        if (pk < 0.001) pk = 0.001; else if (pk > 0.999) pk = 0.999;
+        const double t01 = local / dd;
+        return (t01 < pk) ? (t01 / pk) : ((1.0 - t01) / (1.0 - pk));
+    };
+
+    auto place_loop_layer = [&](const std::string& display_name,
+                                double phase) {
+        if (display_name.empty()) return;
+        AEGP_LayerH layer = nullptr;
+        if (sp.LayerSuite9()->AEGP_AddLayer(ctx.exr_footage, new_comp,
+                                            &layer) || !layer)
+            return;
+        ++ctx.layers_added;
+
+        // Time-locked: offset 0, span the whole comp. No SetLayerOffset
+        // — the footage frame N lands on comp frame N for every light.
+        const A_Time zero = FramesToATime(0.0, ctx.fps);
+        sp.LayerSuite9()->AEGP_SetLayerOffset(layer, &zero);
+        sp.LayerSuite9()->AEGP_SetLayerInPointAndDuration(
+            layer, AEGP_LTimeMode_LayerTime, &zero, &duration);
+
+        AEGP_LayerTransferMode tm{};
+        tm.mode        = PF_Xfer_LIGHTEN;
+        tm.flags       = static_cast<AEGP_TransferFlags>(0);
+        tm.track_matte = AEGP_TrackMatte_NO_TRACK_MATTE;
+        sp.LayerSuite9()->AEGP_SetLayerTransferMode(layer, &tm);
+
+        // Sample the wrapped envelope at every piecewise-linear corner
+        // (window start/peak/end, plus their ±loop copies that fall in
+        // range) and the loop endpoints. Linear interp between these
+        // reproduces the triangle exactly; env(0)==env(loop) keeps the
+        // loop seamless.
+        std::vector<double> ts;
+        ts.push_back(0.0);
+        ts.push_back(loopL);
+        for (int k = -1; k <= 1; ++k) {
+            for (double c : { 0.0, env_a, env_d }) {
+                double tc = phase + c + static_cast<double>(k) * loopL;
+                if (tc > 1e-4 && tc < loopL - 1e-4) ts.push_back(tc);
+            }
+        }
+        std::sort(ts.begin(), ts.end());
+        ts.erase(std::unique(ts.begin(), ts.end(),
+            [](double a, double b){ return std::fabs(a - b) < 1e-4; }),
+            ts.end());
+
+        std::vector<std::pair<A_Time, double>> op_kf, gm_kf;
+        op_kf.reserve(ts.size());
+        gm_kf.reserve(ts.size());
+        for (double tf : ts) {
+            const double e = env_at(phase, tf);
+            const A_Time at = FramesToATime(tf, ctx.fps);
+            op_kf.emplace_back(at, chase.timing.opacity_peak * e);
+            gm_kf.emplace_back(at, chase.timing.gamma_baseline +
+                (chase.timing.gamma_peak - chase.timing.gamma_baseline) * e);
+        }
+
+        {
+            AEGP_StreamRefH op_stream = nullptr;
+            sp.StreamSuite6()->AEGP_GetNewLayerStream(
+                ctx.plugin_id, layer, AEGP_LayerStream_OPACITY, &op_stream);
+            if (op_stream) {
+                BakeKeyframes(sp, op_stream, op_kf);
+                sp.StreamSuite6()->AEGP_DisposeStream(op_stream);
+            }
+        }
+
+        if (ctx.demux_key != AEGP_InstalledEffectKey_NONE) {
+            AEGP_EffectRefH effect = nullptr;
+            if (!sp.EffectSuite5()->AEGP_ApplyEffect(
+                    ctx.plugin_id, layer, ctx.demux_key, &effect) &&
+                effect)
+            {
+                const uint32_t h32 = FNV1a32(display_name);
+                const double hi = static_cast<double>((h32 >> 16) & 0xFFFF);
+                const double lo = static_cast<double>(h32 & 0xFFFF);
+                SetEffectFloatParam(sp, ctx.plugin_id, effect, 3, hi);
+                SetEffectFloatParam(sp, ctx.plugin_id, effect, 4, lo);
+                sp.EffectSuite5()->AEGP_DisposeEffect(effect);
+            }
+        }
+
+        if (ctx.exposure_key != AEGP_InstalledEffectKey_NONE) {
+            AEGP_EffectRefH expo = nullptr;
+            if (!sp.EffectSuite5()->AEGP_ApplyEffect(
+                    ctx.plugin_id, layer, ctx.exposure_key, &expo) &&
+                expo)
+            {
+                AEGP_StreamRefH gamma = nullptr;
+                FindEffectStreamByDisplayName(
+                    sp, ctx.plugin_id, expo,
+                    std::string("Gamma Correction"), &gamma);
+                if (gamma) {
+                    BakeKeyframes(sp, gamma, gm_kf);
+                    sp.StreamSuite6()->AEGP_DisposeStream(gamma);
+                }
+                sp.EffectSuite5()->AEGP_DisposeEffect(expo);
+            }
+        }
+    };
+
     auto name_of = [&](const LayerRef& ref) -> std::string {
         std::lock_guard<std::mutex> lk(ctx.state->mu);
         if (const LayerInfo* L = FindLayerByRef(*ctx.state, ref))
@@ -607,7 +777,36 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
         return {};
     };
 
-    if (chase.random_scatter) {
+    if (loop_mode) {
+        // Animation source: seamless loop of exactly the source
+        // duration. Footage time-locked; the chase IS the wrapped
+        // envelope. Scatter picks phases via the stratified
+        // generator; templated chases space stages evenly over the
+        // loop (step = loop / stageCount, fractional frames fine —
+        // the loop divides the source exactly, which is what matters).
+        if (chase.random_scatter) {
+            Chase local = chase;
+            {
+                std::lock_guard<std::mutex> lk(ctx.state->mu);
+                RegenerateScatter(local, *ctx.state,
+                                  static_cast<float>(fps_d));
+            }
+            for (const ScatterHit& hit : local.scatter) {
+                const std::string nm = name_of(hit.ref);
+                if (!nm.empty())
+                    place_loop_layer(nm, hit.start_frame);
+            }
+        } else {
+            const size_t n = chase.stages.size();
+            for (size_t si = 0; si < n; ++si) {
+                const double phase = (n == 0) ? 0.0
+                    : static_cast<double>(si) * (loopL /
+                          static_cast<double>(n));
+                for (const LayerRef& ref : chase.stages[si].members)
+                    place_loop_layer(name_of(ref), phase);
+            }
+        }
+    } else if (chase.random_scatter) {
         // Regenerate the scatter HERE rather than trusting
         // chase.scatter — that list is filled by the UI only while
         // the scatter tab is drawn and is not persisted, so a
@@ -646,6 +845,40 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
     }
 
     return A_Err_NONE;
+}
+
+// In loop-mode the comp must equal the SOURCE's own duration (the
+// show requirement: "use the duration of the source"). The active
+// comp's fps is unrelated to the footage's, so deriving the comp
+// length from frame_count * activeCompFps gave the wrong duration
+// (e.g. 60 source frames laid out at a 24fps fallback = 2:12, not
+// 2:00). Instead pin the comp fps to the footage's own rate and
+// recompute the loop length from the footage item's true duration,
+// so every chase type (Left→Right, Random, ...) lands at exactly the
+// source loop. Mutates ctx.fps / ctx.loop_frames; no-op (keeps prior
+// behavior) if the footage rate/duration can't be read.
+void PinLoopTimingToFootage(AEGP_SuiteHandler& sp, BuildContext& ctx)
+{
+    if (ctx.loop_frames <= 0 || !ctx.exr_footage) return;
+
+    AEGP_FootageInterp itp{};
+    if (!sp.FootageSuite5()->AEGP_GetFootageInterpretation(
+            ctx.exr_footage, FALSE, &itp)) {
+        A_FpLong f = (itp.conform_fpsF > 0.01) ? itp.conform_fpsF
+                                               : itp.native_fpsF;
+        if (f > 0.01) ctx.fps = RatioFromFps(f);
+    }
+
+    A_Time fdur{};
+    if (!sp.ItemSuite9()->AEGP_GetItemDuration(ctx.exr_footage, &fdur) &&
+        fdur.scale > 0 && fdur.value > 0) {
+        const double secs  = static_cast<double>(fdur.value) /
+                             static_cast<double>(fdur.scale);
+        const double fps_d = static_cast<double>(ctx.fps.num) /
+                             static_cast<double>(std::max<A_long>(1, ctx.fps.den));
+        const long lf = std::lround(secs * fps_d);
+        if (lf >= 1) ctx.loop_frames = static_cast<int>(lf);
+    }
 }
 
 BuildResult DoBuild(PanelState* state, int chase_index, bool build_all)
@@ -695,7 +928,8 @@ BuildResult DoBuild(PanelState* state, int chase_index, bool build_all)
     }
 
     // Source dimensions + path (from the active source).
-    std::string src_path;
+    std::string src_path, src_scan_path;
+    bool src_is_anim = false;
     {
         std::lock_guard<std::mutex> lk(state->mu);
         const Source* src = ActiveSource(*state);
@@ -704,8 +938,15 @@ BuildResult DoBuild(PanelState* state, int chase_index, bool build_all)
             return result;
         }
         src_path = src->path;
+        src_scan_path = src->scan_path;
         ctx.src_w = src->image_width;
         ctx.src_h = src->image_height;
+        // Loop-mode when the source is an animation/sequence; the
+        // loop is EXACTLY the source duration so the chase stays
+        // phase-locked to the scene animation.
+        if (src->animation && src->frame_count > 1)
+            ctx.loop_frames = src->frame_count;
+        src_is_anim = (ctx.loop_frames > 0);
     }
     if (ctx.src_w < 1 || ctx.src_h < 1) {
         result.message = "Active source has zero dimensions; "
@@ -725,22 +966,36 @@ BuildResult DoBuild(PanelState* state, int chase_index, bool build_all)
         result.message = "Could not resolve target folder.";
         return result;
     }
-    ctx.chasemaker_folder_name = PickVersionedFolderName(
-        sp, ctx.proj, ctx.target_folder, ctx.plugin_id, "ChaseMaker");
+    ctx.chasemaker_folder_name = "ChaseMaker";
     {
-        std::vector<A_UTF16Char> u16 = ToUtf16(ctx.chasemaker_folder_name);
-        A_Err e = sp.ItemSuite9()->AEGP_CreateNewFolder(
-            u16.data(), ctx.target_folder, &ctx.chasemaker_folder);
-        if (e || !ctx.chasemaker_folder) {
-            sp.UtilitySuite6()->AEGP_EndUndoGroup();
-            result.message = "Could not create ChaseMaker folder (err " +
-                              std::to_string(e) + ").";
-            return result;
+        // Reuse a single project-root "ChaseMaker" folder across
+        // builds instead of spawning ChaseMaker_vNN on every export.
+        // Comps inside are still name-versioned (_vNN on collision),
+        // so nothing is overwritten — this just stops the folder
+        // explosion the user hit while iterating.
+        AEGP_ItemH existing = nullptr;
+        FindChildByName(sp, ctx.proj, ctx.target_folder,
+                        ctx.chasemaker_folder_name, AEGP_ItemType_FOLDER,
+                        ctx.plugin_id, &existing);
+        if (existing) {
+            ctx.chasemaker_folder = existing;
+        } else {
+            std::vector<A_UTF16Char> u16 =
+                ToUtf16(ctx.chasemaker_folder_name);
+            A_Err e = sp.ItemSuite9()->AEGP_CreateNewFolder(
+                u16.data(), ctx.target_folder, &ctx.chasemaker_folder);
+            if (e || !ctx.chasemaker_folder) {
+                sp.UtilitySuite6()->AEGP_EndUndoGroup();
+                result.message = "Could not create ChaseMaker folder (err " +
+                                  std::to_string(e) + ").";
+                return result;
+            }
         }
     }
 
     // Footage.
     if (EnsureFootage(sp, ctx.proj, ctx.plugin_id, src_path,
+                      src_scan_path, src_is_anim,
                       ctx.chasemaker_folder, &ctx.exr_footage) ||
         !ctx.exr_footage)
     {
@@ -749,30 +1004,52 @@ BuildResult DoBuild(PanelState* state, int chase_index, bool build_all)
         return result;
     }
 
+    // Loop-mode: now that the footage exists, pin comp fps + loop
+    // length to the footage's own duration so the comp == the source
+    // loop exactly (fixes the 2:12-instead-of-2:00 duration bug).
+    PinLoopTimingToFootage(sp, ctx);
+
     // Shared black-solid backdrop. AE's NewSolidFootage takes an
     // A_char* name (ASCII), not UTF-16. Sized to the source so it
-    // covers the entire comp frame. Item added under the
-    // ChaseMaker folder; reused across every chase comp this build.
+    // covers the entire comp frame. Reuse the existing solid in the
+    // (now-shared) ChaseMaker folder if it's the right size, so
+    // repeated builds don't pile up identical backdrops; only make a
+    // new one if missing or the source dimensions changed.
     {
-        AEGP_ColorVal black{};
-        black.alphaF = 1.0;
-        black.redF = black.greenF = black.blueF = 0.0;
-        AEGP_FootageH solid_fh = nullptr;
-        if (!sp.FootageSuite5()->AEGP_NewSolidFootage(
-                "ChaseMaker BG (black)",
-                ctx.src_w, ctx.src_h, &black, &solid_fh) && solid_fh)
-        {
-            sp.FootageSuite5()->AEGP_AddFootageToProject(
-                solid_fh, ctx.chasemaker_folder, &ctx.black_solid);
+        AEGP_ItemH existing_bg = nullptr;
+        FindChildByName(sp, ctx.proj, ctx.chasemaker_folder,
+                        "ChaseMaker BG (black)", AEGP_ItemType_FOOTAGE,
+                        ctx.plugin_id, &existing_bg);
+        if (existing_bg) {
+            A_long bw = 0, bh = 0;
+            sp.ItemSuite9()->AEGP_GetItemDimensions(existing_bg, &bw, &bh);
+            if (bw == ctx.src_w && bh == ctx.src_h)
+                ctx.black_solid = existing_bg;
+        }
+        if (!ctx.black_solid) {
+            AEGP_ColorVal black{};
+            black.alphaF = 1.0;
+            black.redF = black.greenF = black.blueF = 0.0;
+            AEGP_FootageH solid_fh = nullptr;
+            if (!sp.FootageSuite5()->AEGP_NewSolidFootage(
+                    "ChaseMaker BG (black)",
+                    ctx.src_w, ctx.src_h, &black, &solid_fh) && solid_fh)
+            {
+                sp.FootageSuite5()->AEGP_AddFootageToProject(
+                    solid_fh, ctx.chasemaker_folder, &ctx.black_solid);
+            }
         }
     }
 
     // EXRDemux effect — required for layer-name-driven render.
     FindInstalledEffectKey(sp, "tdcarney EXRDemux", &ctx.demux_key);
     if (ctx.demux_key == AEGP_InstalledEffectKey_NONE) {
-        result.message = "Note: EXRDemux not installed; layers added "
-                         "without the effect. Install tdcarney EXRDemux "
-                         "to get hash-driven layer selection.";
+        result.exrdemux_missing = true;
+        result.message = "EXRDemux ('tdcarney EXRDemux') is not installed "
+                         "— light layers were added WITHOUT hash-driven "
+                         "selection and will render wrong. Save your "
+                         "session, install EXRDemux, restart AE, then "
+                         "Load session and Build again.";
     }
     // Built-in Exposure effect — used to bake the Gamma Correction
     // envelope. Match name is stable across AE versions.
@@ -836,6 +1113,7 @@ BuildResult BuildChase(PanelState* state, int chase_index)
     if (state) {
         std::lock_guard<std::mutex> lk(state->mu);
         state->last_build_status = r.message;
+        state->last_build_exrdemux_missing = r.exrdemux_missing;
     }
     return r;
 }
@@ -846,6 +1124,7 @@ BuildResult BuildAllChases(PanelState* state)
     if (state) {
         std::lock_guard<std::mutex> lk(state->mu);
         state->last_build_status = r.message;
+        state->last_build_exrdemux_missing = r.exrdemux_missing;
     }
     return r;
 }
