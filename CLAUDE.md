@@ -80,9 +80,8 @@ Dear ImGui is wired in via vcpkg with platform backends:
   a 2D ImGui UI with zero need for GPU accel, so WARP is correct and
   removes us from the GPU driver entirely. Swap chain is flip-model
   with a frame-latency *waitable* (polled non-blocking — never block
-  AE's UI thread in Present). See the
-  [panel renderer lifecycle + GPU invariants](C:\Users\User\.claude\projects\C--Users-User-Documents-GitHub-ChaseMaker\memory\panel_close_reopen_lifecycle.md)
-  memory before touching the renderer.
+  AE's UI thread in Present). Review the panel renderer
+  lifecycle + GPU invariants notes before touching the renderer.
 - **macOS**: adds an MTKView (`ChaseMakerMTKView` subclass) as a
   subview of AE's container NSView. Metal + `ImGui_ImplMetal` +
   `ImGui_ImplOSX`. Display link drives redraws. (No WARP analog —
@@ -102,9 +101,8 @@ writes load-path/teardown milestones to
   against the shared `PanelState`; both platform renderers just call
   `panel_ui::RenderFrame()` from their per-frame hook.
 
-Keyboard input was hard-won. See the
-[ImGui keyboard input inside an AE panel](C:\Users\User\.claude\projects\C--Users-User-Documents-GitHub-ChaseMaker\memory\imgui_keyboard_focus.md)
-memory for the working recipe (Windows deferred SetFocus + consume-
+Keyboard input was hard-won. See the ImGui keyboard-input notes
+for the working recipe (Windows deferred SetFocus + consume-
 on-WantCapture; Mac lazy-init + KeyEventResponder firstResponder
 routing; *no* NSEvent consume-monitor on Mac — it breaks the
 `interpretKeyEvents:` → `insertText:` character-input path).
@@ -298,12 +296,9 @@ and release notes, but does not run git or gh.
 
 ## Reference test scene
 
-Same scene as EXRDemux. See EXRDemux's `project_example_scene` memory
-for full details. Path on the dev PC:
-
-```
-D:\Dropbox\David Carney\Blender Troubleshoot\Bad Romance (Curtains)\04_Renders\01_Components\Passes\Wall_Curtains_v1_0001.exr
-```
+Same scene as EXRDemux. The local reference EXR lives on the dev
+machine only — its path is intentionally not checked into this
+public repo.
 
 Multipart EXR (58 parts, Blender 5.x), ~232 raw channels, 51 lightgroups
 + World/Image/Alpha + 4 cryptomattes. 5760×1440. Cryptomattes are out

@@ -22,8 +22,8 @@ they fail, something foundational broke.
 Quit AE, relaunch, open `Window → Chase Maker`. The panel title shows
 a build stamp — confirm it matches your most recent build.
 
-Reference scene path:
-`D:\Dropbox\David Carney\Blender Troubleshoot\Bad Romance (Curtains)\04_Renders\01_Components\Passes\Wall_Curtains_v1_0001.exr`
+Reference scene: the local multipart Blender test EXR on the dev
+machine (path intentionally not checked into this public repo).
 
 ---
 
