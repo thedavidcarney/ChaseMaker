@@ -453,6 +453,29 @@ std::vector<std::string> CollectNumberedSiblings(
     return out;
 }
 
+// Split a bare filename into (prefix, suffix) around the LAST run of
+// digits (the frame counter). False = no digit run (standalone
+// still). The variable part is ALWAYS the pure-digit run, so
+// `TestFile_###` and `TestFile_Test_###` resolve as distinct
+// sequences (the latter's mid would be "Test_###", not all digits).
+bool SplitSeqName(const std::string& fn, std::string& prefix,
+                  std::string& suffix)
+{
+    size_t end = std::string::npos, beg = std::string::npos;
+    for (size_t i = fn.size(); i-- > 0; ) {
+        if (std::isdigit(static_cast<unsigned char>(fn[i]))) {
+            if (end == std::string::npos) end = i + 1;
+            beg = i;
+        } else if (end != std::string::npos) {
+            break;
+        }
+    }
+    if (end == std::string::npos) return false;
+    prefix = fn.substr(0, beg);
+    suffix = fn.substr(end);
+    return true;
+}
+
 // Turn whatever path AE / Explorer hands us (a concrete frame file, a
 // directory of frames, or a sequence-token path like name_[0001-0060]
 // .exr / name_####.exr / name_%04d.exr) into a single concrete EXR
@@ -468,30 +491,35 @@ bool ResolveExrFrame(const std::string& input, int frame_index,
     std::vector<std::string> frames;
 
     if (fs::is_directory(in, ec)) {
-        for (fs::directory_iterator it(in, ec), end; it != end && !ec;
+        // A folder can hold MULTIPLE distinct sequences (e.g.
+        // TestFile_### alongside TestFile_Test_###). Don't merge
+        // them: take the alphabetically-first .exr as the reference
+        // and collect ONLY its numbered siblings — a differently
+        // named sequence's frames are excluded.
+        std::vector<std::string> all;
+        for (fs::directory_iterator it(in, ec), e2; it != e2 && !ec;
              it.increment(ec)) {
             if (it->is_regular_file(ec) && HasExrExt(it->path()))
-                frames.push_back(it->path().string());
+                all.push_back(it->path().filename().string());
         }
-        std::sort(frames.begin(), frames.end());
+        if (!all.empty()) {
+            std::sort(all.begin(), all.end());
+            std::string pfx, sfx;
+            if (SplitSeqName(all.front(), pfx, sfx))
+                frames = CollectNumberedSiblings(in, pfx, sfx);
+            if (frames.empty())
+                frames.push_back((in / all.front()).string());
+        }
     } else if (fs::is_regular_file(in, ec)) {
         // Derive the sequence from this frame: the LAST run of digits
-        // in the filename is the frame counter.
+        // is the frame counter; the fixed prefix/suffix pin it to
+        // exactly this sequence.
         const std::string fn = in.filename().string();
-        size_t end = std::string::npos, beg = std::string::npos;
-        for (size_t i = fn.size(); i-- > 0; ) {
-            if (std::isdigit(static_cast<unsigned char>(fn[i]))) {
-                if (end == std::string::npos) end = i + 1;
-                beg = i;
-            } else if (end != std::string::npos) {
-                break;
-            }
-        }
-        if (end == std::string::npos) {
+        std::string pfx, sfx;
+        if (!SplitSeqName(fn, pfx, sfx)) {
             frames.push_back(in.string());          // standalone, no number
         } else {
-            frames = CollectNumberedSiblings(in.parent_path(),
-                fn.substr(0, beg), fn.substr(end));
+            frames = CollectNumberedSiblings(in.parent_path(), pfx, sfx);
             if (frames.empty()) frames.push_back(in.string());
         }
     } else {

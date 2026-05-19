@@ -419,7 +419,7 @@ A_Ratio RatioFromFps(A_FpLong fps)
 // back to 24/1.
 A_Ratio GetActiveCompFramerate(AEGP_SuiteHandler& sp)
 {
-    A_Ratio r{24, 1};
+    A_Ratio r{30, 1};   // no active comp -> default to 30 (the 99% case)
     AEGP_ItemH active = nullptr;
     sp.ItemSuite9()->AEGP_GetActiveItem(&active);
     if (active) {
@@ -594,6 +594,14 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
             return;
         ++ctx.layers_added;
 
+        // Name the timeline layer after the LIGHT (the footage
+        // source still carries the filename) so per-light layers
+        // are identifiable in the comp.
+        {
+            std::vector<A_UTF16Char> u16nm = ToUtf16(display_name);
+            sp.LayerSuite9()->AEGP_SetLayerName(layer, u16nm.data());
+        }
+
         sp.LayerSuite9()->AEGP_SetLayerOffset(layer, &offset);
         sp.LayerSuite9()->AEGP_SetLayerInPointAndDuration(
             layer, AEGP_LTimeMode_LayerTime, &layer_in_pt, &layer_dur);
@@ -682,6 +690,13 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
                                             &layer) || !layer)
             return;
         ++ctx.layers_added;
+
+        // Name the timeline layer after the LIGHT (footage source
+        // keeps the filename) so per-light layers are identifiable.
+        {
+            std::vector<A_UTF16Char> u16nm = ToUtf16(display_name);
+            sp.LayerSuite9()->AEGP_SetLayerName(layer, u16nm.data());
+        }
 
         // Time-locked: offset 0, span the whole comp. No SetLayerOffset
         // — the footage frame N lands on comp frame N for every light.
@@ -847,40 +862,6 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
     return A_Err_NONE;
 }
 
-// In loop-mode the comp must equal the SOURCE's own duration (the
-// show requirement: "use the duration of the source"). The active
-// comp's fps is unrelated to the footage's, so deriving the comp
-// length from frame_count * activeCompFps gave the wrong duration
-// (e.g. 60 source frames laid out at a 24fps fallback = 2:12, not
-// 2:00). Instead pin the comp fps to the footage's own rate and
-// recompute the loop length from the footage item's true duration,
-// so every chase type (Left→Right, Random, ...) lands at exactly the
-// source loop. Mutates ctx.fps / ctx.loop_frames; no-op (keeps prior
-// behavior) if the footage rate/duration can't be read.
-void PinLoopTimingToFootage(AEGP_SuiteHandler& sp, BuildContext& ctx)
-{
-    if (ctx.loop_frames <= 0 || !ctx.exr_footage) return;
-
-    AEGP_FootageInterp itp{};
-    if (!sp.FootageSuite5()->AEGP_GetFootageInterpretation(
-            ctx.exr_footage, FALSE, &itp)) {
-        A_FpLong f = (itp.conform_fpsF > 0.01) ? itp.conform_fpsF
-                                               : itp.native_fpsF;
-        if (f > 0.01) ctx.fps = RatioFromFps(f);
-    }
-
-    A_Time fdur{};
-    if (!sp.ItemSuite9()->AEGP_GetItemDuration(ctx.exr_footage, &fdur) &&
-        fdur.scale > 0 && fdur.value > 0) {
-        const double secs  = static_cast<double>(fdur.value) /
-                             static_cast<double>(fdur.scale);
-        const double fps_d = static_cast<double>(ctx.fps.num) /
-                             static_cast<double>(std::max<A_long>(1, ctx.fps.den));
-        const long lf = std::lround(secs * fps_d);
-        if (lf >= 1) ctx.loop_frames = static_cast<int>(lf);
-    }
-}
-
 BuildResult DoBuild(PanelState* state, int chase_index, bool build_all)
 {
     BuildResult result;
@@ -954,7 +935,11 @@ BuildResult DoBuild(PanelState* state, int chase_index, bool build_all)
         return result;
     }
 
-    ctx.fps = GetActiveCompFramerate(sp);
+    // The single project FPS is authoritative for every chase
+    // (preview + build). It's auto-seeded from the active comp but
+    // the user can pin it in the Sources tab — that's what fixes the
+    // "built at 24 while the project is 30" bug.
+    ctx.fps = RatioFromFps(static_cast<A_FpLong>(state->project_fps.load()));
 
     // Wrap everything in a single undo group so the user can Ctrl+Z
     // the whole build out of AE in one stroke.
@@ -1004,10 +989,10 @@ BuildResult DoBuild(PanelState* state, int chase_index, bool build_all)
         return result;
     }
 
-    // Loop-mode: now that the footage exists, pin comp fps + loop
-    // length to the footage's own duration so the comp == the source
-    // loop exactly (fixes the 2:12-instead-of-2:00 duration bug).
-    PinLoopTimingToFootage(sp, ctx);
+    // Loop-mode comp length is the source's own frame count
+    // (ctx.loop_frames, set from src->frame_count) laid out at the
+    // user-authoritative project FPS — so a 60-frame source at 30 fps
+    // is exactly 2:00, no footage-fps guessing.
 
     // Shared black-solid backdrop. AE's NewSolidFootage takes an
     // A_char* name (ASCII), not UTF-16. Sized to the source so it
@@ -1132,10 +1117,13 @@ BuildResult BuildAllChases(PanelState* state)
 void RefreshProjectFps(PanelState* state)
 {
     if (!state || !state->pica_basicP) return;
+    // Once the user has set the FPS in the Sources tab, their value
+    // is authoritative — stop auto-tracking the active comp.
+    if (state->project_fps_user.load()) return;
     AEGP_SuiteHandler sp(reinterpret_cast<SPBasicSuite*>(state->pica_basicP));
     A_Ratio r = GetActiveCompFramerate(sp);
     if (r.num > 0 && r.den > 0) {
-        state->chase_preview_fps.store(
+        state->project_fps.store(
             static_cast<float>(r.num) / static_cast<float>(r.den));
     }
 }

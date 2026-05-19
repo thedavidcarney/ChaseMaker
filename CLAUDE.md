@@ -394,10 +394,25 @@ built — this section was very stale before):
   root (comps inside are name-versioned `_vNN` on collision so
   nothing is overwritten — the folder is no longer re-versioned per
   build), scatter build path with seamless-loop wrap layers.
-- Preview FPS tracks the active comp (throttled idle poll). Session
-  save/load (JSON), undo/redo. Tab-X delete confirmation (the only
-  delete affordance). Build-stamp + auto-install POST_BUILD. Windows
-  build emits a matching PDB; load-path diagnostic log (diag_log.h).
+- Session save/load (JSON), undo/redo. Tab-X delete confirmation
+  (the only delete affordance). Build-stamp + auto-install
+  POST_BUILD. Windows build emits a matching PDB; load-path
+  diagnostic log (diag_log.h).
+- **Playtest UX (2026-05-18/19), all shipped — see
+  `project_playtest_followups.md` for the locked invariants:**
+  ONE project FPS (default 30, edited/pinned in the Sources tab,
+  drives preview + every build); animation/sequence **loop-mode**
+  (auto for sequence sources, footage time-locked, seamless loop =
+  source duration × integer loop_multiple, wrapped envelope
+  keyframes); Lighten preview compositing with shared normalization;
+  **Chunks** stage grouping (number of groups, even split — NOT the
+  rejected per-light "clumps"); `FrameSlider` widget (left label,
+  drag, Ctrl/double-click to type, -/+); preview-size buttons
+  S/M/L/XL/XXL = thumbnail resolution, pane grows / stages list
+  squished; per-source Rescan; EXRDemux-missing in-panel warning;
+  built comp layers renamed to the light name; strict
+  digits-only sequence resolver. Keyboard nav code exists but is
+  inert (AE host doesn't forward arrows — deferred).
 
 **Not yet**:
 - Bind → precomp emission. Binds currently expand as flat stacked
@@ -409,7 +424,18 @@ built — this section was very stale before):
   deferred — v1 scatter is temporal-only stratification.
 - Notarization (Mac ad-hoc signed). Version scheme + release + CI.
 
-## Working notes (current — 2026-05-15)
+## Working notes (current — 2026-05-19)
+
+- **Stage grouping is "Chunks" and that's FINAL.** It churned
+  stages→clumps→Chunks across playtests. Chunks = number of groups,
+  even split. Do NOT revert to "clumps" (lights-per-group) or the
+  old ceil-of-ceil stage count. See `project_playtest_followups.md`.
+- **Preview size = thumbnail resolution** (S/M/L/XL/XXL buttons);
+  the split pane grows the preview and squishes the stages list.
+- **Keyboard nav is still dead** (inert code, AE host doesn't
+  forward arrow/Ctrl keydowns). Don't rabbit-hole without the
+  platform-layer key-forwarding work; it's a deferred focused task.
+- Default project FPS is 30 (David's 99% case).
 
 - **The multi-day AE crash/freeze saga is RESOLVED** and
   user-confirmed stable on Win + Mac. Root cause + the (3) fixes +

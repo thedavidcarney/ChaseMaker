@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -233,6 +234,56 @@ void PublishLayerReorder(PanelState* state,
         reordered.push_back(std::move(src->layers[it->second]));
     }
     src->layers = std::move(reordered);
+}
+
+// Re-scan the active source in place (same source_id) — used by the
+// preview-size buttons to regenerate thumbnails at the new
+// resolution. StartScan bumps scan_generation, so the renderer
+// releases the old thumbnail textures (no GPU/memory accumulation).
+void RequestActiveSourceRescan(PanelState* state)
+{
+    if (!state || state->scanning.load()) return;
+    std::string path;
+    uint32_t sid = 0;
+    int frame = 0;
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        const Source* s = ActiveSource(*state);
+        if (!s || s->path.empty()) return;
+        path  = s->path;
+        sid   = s->source_id;
+        frame = s->scan_frame;
+    }
+    exr_scan::StartScan(path, state, /*append=*/true, sid, frame);
+}
+
+// Buttons row above the preview: pick the preview RESOLUTION (which
+// is also its on-screen size — bigger res = bigger preview, the
+// user's mental model). Changing it regenerates thumbnails for the
+// active source. Default stays the small size.
+void DrawPreviewSizeButtons(PanelState* state, bool scanning)
+{
+    static const int  kSizes[] = { 256, 384, 512, 768, 1024 };
+    static const char* kLabels[] = { "S", "M", "L", "XL", "XXL" };
+    ImGui::TextDisabled("Preview size:");
+    ImGui::SameLine();
+    for (int i = 0; i < 5; ++i) {
+        const bool cur = (state->thumb_max_width == kSizes[i]);
+        if (cur)
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.28f, 0.52f, 0.30f, 1.f));
+        ImGui::BeginDisabled(scanning);
+        if (ImGui::SmallButton(kLabels[i])) {
+            state->thumb_max_width = kSizes[i];
+            RequestActiveSourceRescan(state);  // regen at new res
+        }
+        ImGui::EndDisabled();
+        if (cur) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%d px (regenerates thumbnails)", kSizes[i]);
+        ImGui::SameLine();
+    }
+    ImGui::NewLine();
 }
 
 // ===== Centroid canvas =================================================
@@ -708,10 +759,10 @@ TableInteractionResult DrawLayersTable(std::vector<LayerInfo>& layers,
                                    IM_COL32(120, 80, 30, 80));
         } else if (i == selected_index) {
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
-                                   IM_COL32(40, 100, 150, 120));
+                                   IM_COL32(95, 165, 240, 200));
         } else if (in_set) {
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
-                                   IM_COL32(40, 80, 120, 90));
+                                   IM_COL32(60, 125, 200, 165));
         } else if (b) {
             ImU32 c = b->color;
             ImU32 faded = (c & 0x00FFFFFFu) | 0x40000000u;
@@ -880,7 +931,51 @@ void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
         ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.45f, 1.f),
                            "%s", snap.last_error.c_str());
     }
-    (void)state;
+
+    // Project settings — the ONE frame rate used by EVERY chase
+    // (preview + AE build). Auto-seeded from the active AE comp until
+    // pinned here, then the pinned value wins (fixes "stuck at 24
+    // while the project is 30"). Not per-chase, not per-source.
+    {
+        ImGui::Separator();
+        float fps = state->project_fps.load();
+        const bool pinned = state->project_fps_user.load();
+        ImGui::TextUnformatted("Project FPS");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90.f);
+        if (ImGui::InputFloat("##projfps", &fps, 1.0f, 5.0f, "%.3f")) {
+            if (fps < 1.f)   fps = 1.f;
+            if (fps > 240.f) fps = 240.f;
+            state->project_fps.store(fps);
+            state->project_fps_user.store(true);
+        }
+        ImGui::SameLine();
+        if (pinned) {
+            if (ImGui::SmallButton("Auto")) {
+                // Resume auto-tracking the AE comp's fps.
+                state->project_fps_user.store(false);
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("pinned \xC2\xB7 applies to all chases & builds");
+        } else {
+            ImGui::TextDisabled("auto from AE comp \xC2\xB7 edit to pin");
+        }
+
+        // Preview thumbnail size — bigger = sharper preview but
+        // slower compositing. Applies on the next scan (re-add /
+        // re-scan a source to regenerate at the new size).
+        int tw = state->thumb_max_width;
+        ImGui::TextUnformatted("Preview thumb px");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90.f);
+        if (ImGui::InputInt("##thumbpx", &tw)) {
+            if (tw < 64)   tw = 64;
+            if (tw > 1024) tw = 1024;
+            state->thumb_max_width = tw;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("applies on next scan");
+    }
 
     ImGui::Spacing();
     if (snap.source_summaries.empty()) {
@@ -892,13 +987,15 @@ void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
     if (ImGui::BeginTable("sources_table", 7,
             ImGuiTableFlags_BordersOuterH | ImGuiTableFlags_BordersV |
             ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("Active",  ImGuiTableColumnFlags_WidthFixed, 56.f);
+        ImGui::TableSetupColumn("Active",  ImGuiTableColumnFlags_WidthFixed, 54.f);
         ImGui::TableSetupColumn("File",    ImGuiTableColumnFlags_WidthStretch, 4.f);
-        ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed, 110.f);
-        ImGui::TableSetupColumn("Layers",  ImGuiTableColumnFlags_WidthFixed, 70.f);
-        ImGui::TableSetupColumn("Scan frame", ImGuiTableColumnFlags_WidthFixed, 130.f);
-        ImGui::TableSetupColumn("Loop",    ImGuiTableColumnFlags_WidthFixed, 64.f);
-        ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 80.f);
+        ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed, 92.f);
+        ImGui::TableSetupColumn("Layers",  ImGuiTableColumnFlags_WidthFixed, 60.f);
+        ImGui::TableSetupColumn("Scan frame", ImGuiTableColumnFlags_WidthFixed, 116.f);
+        ImGui::TableSetupColumn("Loop",    ImGuiTableColumnFlags_WidthFixed, 52.f);
+        // Wide enough for "Rescan" + "Remove" so the last button
+        // doesn't spill past the panel's right edge.
+        ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 150.f);
         ImGui::TableHeadersRow();
 
         for (size_t i = 0; i < snap.source_summaries.size(); ++i) {
@@ -982,6 +1079,20 @@ void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
             }
 
             ImGui::TableNextColumn();
+            ImGui::BeginDisabled(snap.scanning);
+            if (ImGui::SmallButton("Rescan")) {
+                // In-place re-scan (same source_id) — picks up a new
+                // Preview thumb size and bumps scan_generation so the
+                // renderer releases the old thumbnail textures (no
+                // GPU/memory accumulation on repeated rescans).
+                exr_scan::StartScan(ss.path, state, /*append=*/true,
+                                    ss.source_id, ss.scan_frame);
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Re-scan this source (applies a new "
+                                  "Preview thumb size; frees old textures).");
+            ImGui::SameLine();
             if (ImGui::SmallButton("Remove")) {
                 std::lock_guard<std::mutex> lk(state->mu);
                 if (i < state->sources.size()) {
@@ -1225,6 +1336,47 @@ void DrawStagingTab(PanelState* state, FrameSnapshot& snap, float w, float h)
         order.reserve(snap.layers.size());
         for (const auto& L : snap.layers) order.push_back(L.display_name);
         PublishLayerReorder(state, order);
+    }
+
+    // ---- Keyboard nav ----
+    // Arrows move the focused selection; Ctrl+Up/Down reorder the
+    // focused layer. Gated to when this list is focused/hovered and
+    // no text widget is capturing keys (the AE-embedded ImGui
+    // keyboard path is delicate — see the keyboard-input notes).
+    if ((ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) ||
+         ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows)) &&
+        !ImGui::GetIO().WantTextInput && !snap.layers.empty())
+    {
+        const int n = static_cast<int>(snap.layers.size());
+        const int cur = selected_index;            // -1 = nothing
+        const bool ctrl = ImGui::GetIO().KeyCtrl;
+        const bool up   = ImGui::IsKeyPressed(ImGuiKey_UpArrow);
+        const bool down = ImGui::IsKeyPressed(ImGuiKey_DownArrow);
+        if (ctrl && (up || down) && cur >= 0) {
+            const int tgt = cur + (down ? 1 : -1);
+            if (tgt >= 0 && tgt < n) {
+                std::swap(snap.layers[cur], snap.layers[tgt]);
+                std::vector<std::string> order;
+                order.reserve(n);
+                for (const auto& L : snap.layers)
+                    order.push_back(L.display_name);
+                PublishLayerReorder(state, order);
+                state->selected_hash = snap.layers[tgt].fnv1a_hash;
+            }
+        } else if (!ctrl && (up || down)) {
+            int tgt;
+            if (cur < 0) tgt = down ? 0 : n - 1;
+            else {
+                tgt = cur + (down ? 1 : -1);
+                if (tgt < 0) tgt = 0;
+                else if (tgt >= n) tgt = n - 1;
+            }
+            const uint32_t hh = snap.layers[tgt].fnv1a_hash;
+            state->selected_hash      = hh;
+            state->last_selected_hash = hh;
+            state->selected_hashes.clear();
+            state->selected_hashes.push_back(hh);
+        }
     }
     ImGui::EndChild();
 
@@ -1529,18 +1681,103 @@ void DrawStagingTab(PanelState* state, FrameSnapshot& snap, float w, float h)
     }
 }
 
-// Middle-click-on-last-item reset. Use immediately after a slider /
-// drag / input:
+// Reset-to-default on the just-drawn item. Triggers on middle-click,
+// right-click, OR double-click — tablet users (no middle button) and
+// AE "right-click param → reset" muscle memory both work. Sliders
+// have no default right-click/double-click behavior so there's no
+// conflict (this is used on sliders, not table rows). Use right
+// after a slider / drag / input:
 //   ImGui::SliderFloat(...); if (MiddleClickReset(value, default)) changed = true;
-// Matches the AE "right-click param → reset" muscle memory but
-// middle-click since right-click is already our row context menu.
 template <typename T>
 bool MiddleClickReset(T& value, T default_value)
 {
     if (ImGui::IsItemHovered() &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Middle))
+        (ImGui::IsMouseClicked(ImGuiMouseButton_Middle) ||
+         ImGui::IsMouseClicked(ImGuiMouseButton_Right)  ||
+         ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)))
     {
         value = default_value;
+        return true;
+    }
+    return false;
+}
+
+// Left-labeled integer "frames" slider with -/+ steppers.
+//  - drag the slider to scrub
+//  - type a value: Ctrl+click (ImGui built-in) OR double-click —
+//    either swaps in a focused, select-all input field; Enter or
+//    click-away commits
+//  - -/+ nudge by one
+//  - right-click or middle-click resets to `def`
+// Label is drawn on the LEFT (ImGui's default is right). `value`
+// stays float (loop-mode derives a fractional step). No ImGui::
+// InputInt steppers — its arrow auto-repeat / step_fast caused the
+// wild multi-step jumps; the typed field uses step 0 (no arrows).
+inline bool FrameSlider(const char* label, float& value,
+                        int lo, int hi, int def)
+{
+    if (hi < lo) hi = lo;
+    int v = static_cast<int>(std::lround(value));
+    if (v < lo) v = lo; else if (v > hi) v = hi;
+    bool changed = false;
+    ImGui::PushID(label);
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("-") && v > lo) { --v; changed = true; }
+    ImGui::SameLine();
+
+    ImGuiStorage* st = ImGui::GetStateStorage();
+    const ImGuiID kEdit  = ImGui::GetID("##edit");
+    const ImGuiID kFocus = ImGui::GetID("##focus");
+    const bool editing = st->GetBool(kEdit, false);
+
+    ImGui::SetNextItemWidth(140.f);
+    if (editing) {
+        if (st->GetBool(kFocus, false)) {
+            ImGui::SetKeyboardFocusHere();
+            st->SetBool(kFocus, false);
+        }
+        int iv = v;
+        const bool entered = ImGui::InputInt(
+            "##typ", &iv, 0, 0,
+            ImGuiInputTextFlags_EnterReturnsTrue |
+            ImGuiInputTextFlags_AutoSelectAll);
+        // Enter, Tab, Esc or click-away ends edit mode; commit the
+        // typed value.
+        if (entered || ImGui::IsItemDeactivated()) {
+            v = iv; changed = true;
+            st->SetBool(kEdit, false);
+        }
+    } else {
+        if (ImGui::SliderInt("##sld", &v, lo, hi)) changed = true;
+        if (ImGui::IsItemHovered()) {
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                st->SetBool(kEdit, true);    // double-click -> type
+                st->SetBool(kFocus, true);
+            } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) ||
+                       ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
+                v = def; changed = true;     // reset to default
+            }
+        }
+    }
+
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+") && v < hi) { ++v; changed = true; }
+    ImGui::PopID();
+    if (changed) {
+        if (v < lo) v = lo; else if (v > hi) v = hi;
+        value = static_cast<float>(v);
+    }
+    return changed;
+}
+
+// Same widget for an int& (loop multiple / clumps / etc.).
+inline bool IntSlider(const char* label, int& value,
+                      int lo, int hi, int def)
+{
+    float f = static_cast<float>(value);
+    if (FrameSlider(label, f, lo, hi, def)) {
+        value = static_cast<int>(f);
         return true;
     }
     return false;
@@ -1884,25 +2121,34 @@ void RegenerateChaseStages(Chase& chase, const PanelState& state,
         return;
     }
 
-    // Group leads into stages. desired_stage_count counts LOGICAL
-    // lights, not individual layers, so a 3-stage chase with binds
-    // still produces 3 stages.
-    int per_stage = 1;
-    if (stages_count_hint > 0 && (int)leads.size() > stages_count_hint) {
-        per_stage = ((int)leads.size() + stages_count_hint - 1) / stages_count_hint;
-    }
-    ChaseStage cur;
-    int placed = 0;
-    for (const auto& L : leads) {
-        for (const auto& m : L.members) cur.members.push_back(m);
-        ++placed;
-        if (placed >= per_stage) {
-            chase.stages.push_back(std::move(cur));
-            cur = ChaseStage{};
-            placed = 0;
+    // CHUNKS model: split the leads into exactly `D` contiguous
+    // groups, sizes as equal as possible (differ by at most one
+    // light; the first `rem` groups get the extra). No remainder /
+    // straggler, fully linear: D=3 over 31 lights -> [11][10][10].
+    // stages_count_hint is the chunk COUNT; <=0 or >=n means one
+    // light per stage (the default; auto-tracks N as lights change).
+    const int n = static_cast<int>(leads.size());
+    if (n <= 0) return;
+    int D = stages_count_hint;
+    if (D <= 0 || D >= n) {
+        for (const auto& L : leads) {
+            ChaseStage s;
+            for (const auto& m : L.members) s.members.push_back(m);
+            chase.stages.push_back(std::move(s));
         }
+        return;
     }
-    if (!cur.members.empty()) chase.stages.push_back(std::move(cur));
+    const int base = n / D;
+    const int rem  = n % D;          // first `rem` chunks get base+1
+    int idx = 0;
+    for (int g = 0; g < D; ++g) {
+        const int sz = base + (g < rem ? 1 : 0);
+        ChaseStage cur;
+        for (int k = 0; k < sz && idx < n; ++k, ++idx)
+            for (const auto& m : leads[idx].members)
+                cur.members.push_back(m);
+        if (!cur.members.empty()) chase.stages.push_back(std::move(cur));
+    }
 }
 
 // ===== Random-scatter preview ========================================
@@ -2025,10 +2271,11 @@ const char* kChaseTemplateNames[] = {
 
 void ApplyTemplateToChase(Chase& c, int template_idx)
 {
-    // Defaults: one light per stage, auto sort (template re-derives
-    // stages from scratch, so any prior manual arrangement is
-    // intentionally dropped). 3 Step / Center Out override below.
-    c.desired_stage_count = 0;
+    // Defaults: 0 chunks = one light per stage (auto), auto sort
+    // (template re-derives stages from scratch, so any prior manual
+    // arrangement is intentionally dropped). 3 Step (= 3 chunks) /
+    // Center Out override below.
+    c.desired_stage_count = 0;   // 0 = one light per stage (auto)
     c.symmetric_pairs = false;
     c.manual_stages = false;
     c.random_scatter = false;
@@ -2100,10 +2347,31 @@ void DrawWizardForChaseTab(PanelState* state, FrameSnapshot& snap, int chase_ind
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("None")) state->wizard_tag_filter.clear();
-    ImGui::BeginChild("wizard_tag_list", ImVec2(260.f, 110.f), true);
+    // Single column by default, sized to its CONTENT so the timing
+    // sliders + Create button sit right below the list (not floated
+    // far down). Only split into columns if one tall column would
+    // overflow the cap.
+    const int   cm_ntags = static_cast<int>(snap.tags.size());
+    const float cm_rowH  = ImGui::GetFrameHeightWithSpacing();
+    const float cm_capH  = std::max(120.f,
+                               ImGui::GetContentRegionAvail().y - 120.f);
+    const float cm_oneColH = std::max(1, cm_ntags) * cm_rowH + 8.f;
+    int cm_tag_cols = 1;
+    if (cm_oneColH > cm_capH)
+        cm_tag_cols = std::min(4,
+            static_cast<int>(std::ceil(cm_oneColH / cm_capH)));
+    const int   cm_perCol = (cm_ntags + cm_tag_cols - 1) /
+                            (cm_tag_cols < 1 ? 1 : cm_tag_cols);
+    const float cm_taglist_w = ImGui::GetContentRegionAvail().x;
+    const float cm_taglist_h = std::min(cm_capH,
+        std::max(cm_rowH + 8.f, cm_perCol * cm_rowH + 8.f));
+    ImGui::BeginChild("wizard_tag_list",
+                      ImVec2(cm_taglist_w, cm_taglist_h), true);
     if (snap.tags.empty()) {
         ImGui::TextDisabled("(no tags — load a source / auto-tag)");
     }
+    if (!snap.tags.empty() && cm_tag_cols > 1)
+        ImGui::Columns(cm_tag_cols, nullptr, false);
     for (const auto& t : snap.tags) {
         bool sel = wiz_has_tag(t.tag_id);
         ImGui::PushID((int)t.tag_id);
@@ -2123,15 +2391,15 @@ void DrawWizardForChaseTab(PanelState* state, FrameSnapshot& snap, int chase_ind
             }
         }
         ImGui::PopID();
+        if (cm_tag_cols > 1) ImGui::NextColumn();
     }
+    if (!snap.tags.empty() && cm_tag_cols > 1) ImGui::Columns(1);
     ImGui::EndChild();
 
     ImGui::SetNextItemWidth(220.f);
-    ImGui::SliderFloat("Hit duration (frames)", &state->wizard_hit_duration,
-                       1.f, 240.f, "%.0f");
+    FrameSlider("Hit duration", state->wizard_hit_duration, 1, 240, 30);
     ImGui::SetNextItemWidth(220.f);
-    ImGui::SliderFloat("Step duration (frames)", &state->wizard_step_duration,
-                       0.5f, 60.f, "%.1f");
+    FrameSlider("Step duration", state->wizard_step_duration, 1, 120, 4);
 
     ImGui::Spacing();
     if (ImGui::Button("Create chase", ImVec2(160.f, 0.f))) {
@@ -2297,35 +2565,22 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
             }
         }
     }
-    int desired = cs.desired_stage_count;
+    // "Chunks" = number of groups. Lights split as evenly as
+    // possible across the chunks (sizes differ by at most one — 31
+    // lights, Chunks=3 -> [11][10][10]). At max (= light count) it's
+    // one light per stage — the default — stored as 0 so it
+    // auto-tracks the light count as the staged set changes.
     bool grouping_changed = false;
-    ImGui::SetNextItemWidth(180.f);
-    int max_stages = std::max(1, total_eligible);
-    int display_desired = (desired <= 0) ? max_stages : desired;
-    if (ImGui::SliderInt("Stages", &display_desired, 1, max_stages,
-                         "%d", ImGuiSliderFlags_AlwaysClamp))
-    {
-        // Setting back to "one per stage" when slider hits N (the
-        // implicit default) keeps the value as 0 internally so future
-        // layer additions extend automatically.
-        desired = (display_desired >= max_stages) ? 0 : display_desired;
+    const int max_chunks = std::max(1, total_eligible);
+    int chunks_disp = (cs.desired_stage_count <= 0 ||
+                       cs.desired_stage_count >= max_chunks)
+                          ? max_chunks : cs.desired_stage_count;
+    if (IntSlider("Chunks", chunks_disp, 1, max_chunks, max_chunks))
         grouping_changed = true;
-    }
-    // Middle-click resets to "one light per stage" (desired=0).
-    if (ImGui::IsItemHovered() &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Middle))
-    {
-        desired = 0;
-        display_desired = max_stages;
-        grouping_changed = true;
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("How many stages this chase has.\n"
-                          "Max = N lights (one per stage).\n"
-                          "Lower groups lights into chunks; e.g. 3 stages\n"
-                          "with N=51 lights fires 17 lights per stage.\n"
-                          "\nMiddle-click to reset to one-per-stage.");
-    }
+    const int desired = (chunks_disp >= max_chunks) ? 0 : chunks_disp;
+    ImGui::SameLine();
+    ImGui::TextDisabled(desired == 0 ? "one light / stage"
+                                     : "groups, even split");
     ImGui::EndDisabled();
 
     // ---- Timing sliders (compact, two rows) ----
@@ -2337,36 +2592,36 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     bool t_changed = false;
     const float slider_w = 150.f;
     ImGui::SetNextItemWidth(slider_w);
-    if (ImGui::SliderFloat("Duration", &t.duration, 1.f, 240.f, "%.0f f")) t_changed = true;
-    if (MiddleClickReset(t.duration, 30.0f)) t_changed = true;
+    if (FrameSlider("Hit Duration", t.duration, 1, 240, 30)) t_changed = true;
     ImGui::SameLine();
     ImGui::SetNextItemWidth(slider_w);
-    if (ImGui::SliderFloat("Attack", &t.attack, 0.f, t.duration, "%.1f f")) t_changed = true;
-    if (MiddleClickReset(t.attack, 5.0f)) t_changed = true;
+    if (FrameSlider("Hit Attack", t.attack, 0, static_cast<int>(t.duration), 5)) t_changed = true;
     ImGui::SameLine();
     ImGui::SetNextItemWidth(slider_w);
     const bool loop_mode = ChaseLoopMode(*state);
     if (loop_mode) {
-        // Animation source: the loop length is the source duration and
-        // step is derived (loop / stage count) so the chase stays
-        // phase-locked to the scene. Step isn't user-editable here.
-        const int   lf = ChaseLoopFrames(cs, *state, 0.f);
+        // Animation source: loop length is locked to WHOLE source
+        // durations (integer ×N only — never a free length, so it
+        // always wraps seamlessly and stays phase-locked). Step is
+        // derived (loop / stage count), not user-editable.
+        int loop_mult = cs.loop_multiple < 1 ? 1 : cs.loop_multiple;
+        if (IntSlider("Source loops", loop_mult, 1, 60, 1)) t_changed = true;
+        if (loop_mult < 1) loop_mult = 1;
+        cs.loop_multiple = loop_mult;
+        const int   lf  = ChaseLoopFrames(cs, *state, 0.f);
+        const int   per = loop_mult > 0 ? lf / loop_mult : lf;
         const size_t n  = cs.stages.empty() ? 1 : cs.stages.size();
         const float derived_step = static_cast<float>(lf) /
                                    static_cast<float>(n);
         t.step_duration = derived_step;
-        ImGui::BeginDisabled(true);
-        float shown = derived_step;
-        ImGui::SliderFloat("Step", &shown, 0.f, static_cast<float>(lf),
-                           "%.2f f (auto)");
-        ImGui::EndDisabled();
+        // Step is auto (loop / stages) in loop-mode — shown read-only
+        // here, no overflowing disabled slider.
         ImGui::TextDisabled(
-            "Seamless loop: %d-frame source \xC2\xB7 %zu stages \xC2\xB7 "
-            "step %.2f f (loop divides the source exactly)",
-            lf, n, derived_step);
+            "Seamless loop: %d-frame source \xC3\x97%d = %d f \xC2\xB7 "
+            "%zu stages \xC2\xB7 auto step %.2f f",
+            per, loop_mult, lf, n, derived_step);
     } else {
-        if (ImGui::SliderFloat("Step", &t.step_duration, 0.5f, 60.f, "%.1f f")) t_changed = true;
-        if (MiddleClickReset(t.step_duration, 4.0f)) t_changed = true;
+        if (FrameSlider("Step", t.step_duration, 1, 120, 4)) t_changed = true;
     }
     // Opacity/gamma envelope tuned rarely — collapsed by default to
     // keep the common timing controls uncluttered.
@@ -2393,13 +2648,14 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
             real.sort_reverse = rev;
             real.timing = t;
             real.desired_stage_count = desired;
+            real.loop_multiple = cs.loop_multiple < 1 ? 1 : cs.loop_multiple;
             state->default_timing = t;
         }
     }
 
     // ---- Preview transport ----
     ImGui::Separator();
-    const float fps = std::max(1.f, state->chase_preview_fps.load());
+    const float fps = std::max(1.f, state->project_fps.load());
     const float total = ChaseTotalFrames(cs, *state, fps);
     if (state->chase_preview_frame > total) state->chase_preview_frame = 0.f;
     if (state->chase_preview_playing && total > 0.f) {
@@ -2412,8 +2668,12 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     if (ImGui::Button("Reset")) state->chase_preview_frame = 0.f;
     ImGui::SameLine();
     ImGui::SetNextItemWidth(280.f);
-    ImGui::SliderFloat("##scrub", &state->chase_preview_frame,
+    bool scrub_used = ImGui::SliderFloat("##scrub", &state->chase_preview_frame,
                        0.f, std::max(1.f, total), "frame %.1f");
+    // Grabbing the timeline releases click-to-pin so the preview
+    // follows the playhead in realtime instead of staying frozen on
+    // the pinned light (the "scrubbing doesn't update" report).
+    if (scrub_used || ImGui::IsItemActive()) state->selected_hash = 0;
     ImGui::SameLine();
     ImGui::TextDisabled("/ %.0f f (%.1f s @ %.0f fps)",
                         total, total / fps, fps);
@@ -2425,6 +2685,7 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     // (so a multi-light / bound stage shows all its members). Once
     // the user presses Play, the animated composite takes over.
     {
+        const auto _pb0 = std::chrono::steady_clock::now();
         std::vector<uint8_t> rgba;
         int w = 0, h = 0;
         bool built = false;
@@ -2455,6 +2716,16 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
             state->chase_composite_h = 0;
             state->chase_composite_texture_id = 0;
         }
+        const double _pbms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - _pb0).count();
+        const double budget_ms = 1000.0 / (fps < 1.f ? 1.f : fps);
+        if (built && _pbms > budget_ms * 1.25) {
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.30f, 1.f),
+                "Preview slow: %.1f ms/frame > %.1f ms @ %.0f fps "
+                "\xC2\xB7 lower \"Preview thumb px\" in Sources",
+                _pbms, budget_ms, fps);
+        }
     }
 
     // ---- Identify active stages for highlighting ----
@@ -2475,9 +2746,15 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     // ---- Split pane: stages table | composite preview + centroid map ----
     ImGui::Separator();
     const float pane_h = std::max(160.f, ImGui::GetContentRegionAvail().y - 8.f);
-    const float right_w = std::min(420.f, std::max(200.f, panel_w * 0.42f));
-    const float left_w  = std::max(220.f,
-                            ImGui::GetContentRegionAvail().x - right_w - 12.f);
+    // The preview pane grows to fit the chosen preview resolution so
+    // the whole composite is visible; the stages list is squished to
+    // a still-usable minimum (it had tons of unused width).
+    const float avail_x  = ImGui::GetContentRegionAvail().x;
+    const float min_left = 240.f;
+    float right_w = static_cast<float>(state->thumb_max_width) + 24.f;
+    right_w = std::min(right_w, std::max(300.f, avail_x - min_left - 12.f));
+    right_w = std::max(right_w, 300.f);
+    const float left_w = std::max(min_left, avail_x - right_w - 12.f);
 
     // Stages table (left). One row per layer, Staging-style:
     // shift/ctrl multi-select, drag to reorder, right-click to
@@ -2774,19 +3051,20 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     ImGui::BeginChild("chase_preview_pane", ImVec2(right_w, pane_h), false);
     const bool pinned = !state->chase_preview_playing &&
                         state->selected_hash != 0;
+    DrawPreviewSizeButtons(state, snap.scanning);
     ImGui::TextDisabled(pinned ? "Composite preview (pinned \xE2\x80\x94 "
                                  "click elsewhere or Play)"
                                : "Composite preview");
     if (state->chase_composite_texture_id != 0 &&
         state->chase_composite_w > 0 && state->chase_composite_h > 0)
     {
-        const float pw = ImGui::GetContentRegionAvail().x;
         const float aspect = float(state->chase_composite_h) /
                              float(state->chase_composite_w);
-        float w = pw;
+        // On-screen size = the chosen resolution (bigger res =
+        // bigger preview). The pane scrolls if it exceeds it.
+        float w = static_cast<float>(state->thumb_max_width);
+        if (w < 64.f) w = 64.f; else if (w > 2048.f) w = 2048.f;
         float h = w * aspect;
-        const float max_h = pane_h * 0.55f;
-        if (h > max_h) { h = max_h; w = h / aspect; }
         ImGui::Image((ImTextureID)state->chase_composite_texture_id,
                      ImVec2(w, h));
     } else {
@@ -2844,7 +3122,7 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
 {
     if (chase_index < 0 || chase_index >= (int)snap.chases.size()) return;
     (void)panel_h;
-    const float fps = std::max(1.f, state->chase_preview_fps.load());
+    const float fps = std::max(1.f, state->project_fps.load());
 
     // Per-frame regen so the scatter tracks param / staging changes.
     {
@@ -2884,19 +3162,39 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
     // ---- Scatter params ----
     bool changed = false;
     float loop_s = cs.loop_seconds;
+    int   loop_mult = cs.loop_multiple < 1 ? 1 : cs.loop_multiple;
     int   dens   = cs.scatter_density;
     int   seed_i = static_cast<int>(cs.random_seed);
-    ImGui::SetNextItemWidth(180.f);
-    if (ImGui::SliderFloat("Loop length", &loop_s, 1.f, 60.f, "%.1f s"))
-        changed = true;
-    if (MiddleClickReset(loop_s, 10.0f)) changed = true;
+    const bool loopmode = ChaseLoopMode(*state);
+    if (loopmode) {
+        // Animation source: the loop is locked to WHOLE source
+        // durations — never a free-form length. Only an integer
+        // ×N multiple is offered, so it always wraps seamlessly and
+        // stays phase-locked to the scene.
+        if (IntSlider("Source loops", loop_mult, 1, 60, 1)) changed = true;
+        if (loop_mult < 1) loop_mult = 1;
+        cs.loop_multiple = loop_mult;
+        ImGui::SameLine();
+        ImGui::TextDisabled("= %d frames (\xC3\x97%d source)",
+                            ChaseLoopFrames(cs, *state, fps), loop_mult);
+    } else {
+        ImGui::TextUnformatted("Loop length");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(150.f);
+        if (ImGui::SliderFloat("##looplen", &loop_s, 1.f, 60.f, "%.1f s"))
+            changed = true;
+        if (MiddleClickReset(loop_s, 10.0f)) changed = true;
+    }
+    ImGui::TextUnformatted("Density");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(160.f);
-    if (ImGui::SliderInt("Density", &dens, 1, 12, "%d /light")) changed = true;
+    ImGui::SetNextItemWidth(150.f);
+    if (ImGui::SliderInt("##dens", &dens, 1, 12, "%d /light")) changed = true;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Copies of each light spread across the loop.");
-    ImGui::SetNextItemWidth(160.f);
-    if (ImGui::InputInt("Seed", &seed_i)) changed = true;
+    ImGui::TextUnformatted("Seed");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(150.f);
+    if (ImGui::InputInt("##seed", &seed_i)) changed = true;
     ImGui::SameLine();
     if (ImGui::Button("Reseed")) {
         std::random_device rd;
@@ -2915,12 +3213,10 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
     bool t_changed = false;
     const float sw = 150.f;
     ImGui::SetNextItemWidth(sw);
-    if (ImGui::SliderFloat("Duration", &t.duration, 1.f, 240.f, "%.0f f")) t_changed = true;
-    if (MiddleClickReset(t.duration, 30.0f)) t_changed = true;
+    if (FrameSlider("Hit Duration", t.duration, 1, 240, 30)) t_changed = true;
     ImGui::SameLine();
     ImGui::SetNextItemWidth(sw);
-    if (ImGui::SliderFloat("Attack", &t.attack, 0.f, t.duration, "%.1f f")) t_changed = true;
-    if (MiddleClickReset(t.attack, 5.0f)) t_changed = true;
+    if (FrameSlider("Hit Attack", t.attack, 0, static_cast<int>(t.duration), 5)) t_changed = true;
     // Opacity/gamma envelope tuned rarely — collapsed by default to
     // keep the common timing controls uncluttered.
     if (ImGui::TreeNode("Opacity / Gamma envelope")) {
@@ -2943,6 +3239,7 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
         if (chase_index < (int)state->chases.size()) {
             Chase& real = state->chases[chase_index];
             real.loop_seconds   = std::max(0.1f, loop_s);
+            real.loop_multiple  = loop_mult < 1 ? 1 : loop_mult;
             real.scatter_density = std::max(1, dens);
             real.random_seed    = static_cast<uint32_t>(seed_i);
             real.timing         = t;
@@ -2966,14 +3263,18 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
     if (ImGui::Button("Reset")) state->chase_preview_frame = 0.f;
     ImGui::SameLine();
     ImGui::SetNextItemWidth(280.f);
-    ImGui::SliderFloat("##scrub", &state->chase_preview_frame,
-                       0.f, std::max(1.f, total), "frame %.1f");
+    int cm_sf = static_cast<int>(std::lround(state->chase_preview_frame));
+    bool scrub_used = ImGui::SliderInt("##scrub", &cm_sf,
+                       0, static_cast<int>(std::max(1.f, total)), "frame %d");
+    if (scrub_used) state->chase_preview_frame = static_cast<float>(cm_sf);
+    if (scrub_used || ImGui::IsItemActive()) state->selected_hash = 0;
     ImGui::SameLine();
     ImGui::TextDisabled("/ %.0f f (%.1f s @ %.0f fps, loops)",
                         total, total / fps, fps);
 
     // ---- Composite (pin single clicked light, else scatter) ----
     {
+        const auto _pb0 = std::chrono::steady_clock::now();
         std::vector<uint8_t> rgba;
         int w = 0, h = 0;
         bool built = false;
@@ -3000,14 +3301,29 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
             state->chase_composite_h = 0;
             state->chase_composite_texture_id = 0;
         }
+        const double _pbms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - _pb0).count();
+        const double budget_ms = 1000.0 / (fps < 1.f ? 1.f : fps);
+        if (built && _pbms > budget_ms * 1.25) {
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.30f, 1.f),
+                "Preview slow: %.1f ms/frame > %.1f ms @ %.0f fps "
+                "\xC2\xB7 lower \"Preview thumb px\" in Sources",
+                _pbms, budget_ms, fps);
+        }
     }
 
     // ---- Split pane: per-light hit list | preview + centroid map ----
     ImGui::Separator();
     const float pane_h = std::max(160.f, ImGui::GetContentRegionAvail().y - 8.f);
-    const float right_w = std::min(420.f, std::max(200.f, panel_w * 0.42f));
-    const float left_w  = std::max(220.f,
-                            ImGui::GetContentRegionAvail().x - right_w - 12.f);
+    // Preview pane grows to the chosen resolution; hit list squished
+    // to a usable minimum so the whole composite is visible.
+    const float avail_x  = ImGui::GetContentRegionAvail().x;
+    const float min_left = 240.f;
+    float right_w = static_cast<float>(state->thumb_max_width) + 24.f;
+    right_w = std::min(right_w, std::max(300.f, avail_x - min_left - 12.f));
+    right_w = std::max(right_w, 300.f);
+    const float left_w = std::max(min_left, avail_x - right_w - 12.f);
 
     // Aggregate hits per light (for the table) + active set this frame.
     const int loop_frames = ChaseLoopFrames(cs, *state, fps);
@@ -3070,16 +3386,16 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
     ImGui::BeginChild("scatter_preview", ImVec2(right_w, pane_h), false);
     const bool pinned = !state->chase_preview_playing &&
                         state->selected_hash != 0;
+    DrawPreviewSizeButtons(state, snap.scanning);
     ImGui::TextDisabled(pinned ? "Preview (pinned \xE2\x80\x94 click "
                                  "elsewhere or Play)" : "Composite preview");
     if (state->chase_composite_texture_id != 0 &&
         state->chase_composite_w > 0 && state->chase_composite_h > 0) {
-        const float pw = ImGui::GetContentRegionAvail().x;
         const float aspect = float(state->chase_composite_h) /
                              float(state->chase_composite_w);
-        float w = pw, h = w * aspect;
-        const float max_h = pane_h * 0.55f;
-        if (h > max_h) { h = max_h; w = h / aspect; }
+        float w = static_cast<float>(state->thumb_max_width);
+        if (w < 64.f) w = 64.f; else if (w > 2048.f) w = 2048.f;
+        float h = w * aspect;
         ImGui::Image((ImTextureID)state->chase_composite_texture_id,
                      ImVec2(w, h));
     } else {

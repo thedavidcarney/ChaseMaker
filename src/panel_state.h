@@ -252,6 +252,13 @@ struct Chase {
     float                   loop_seconds   = 10.0f;
     int                     scatter_density = 5;
     std::vector<ScatterHit> scatter;
+    // Loop-mode only (animation source): the chase loop spans this
+    // many WHOLE source durations. Integer ≥ 1 by construction, so
+    // the loop is always an exact multiple of the source — it can
+    // never be a non-multiple that would break the seamless wrap /
+    // phase-lock with the scene animation. Ignored for still sources
+    // (those use loop_seconds).
+    int                     loop_multiple = 1;
 };
 
 // The big-three top-level tabs. Chase tabs live in their own vector
@@ -301,6 +308,7 @@ inline bool operator==(const Chase& a, const Chase& b) {
            a.random_scatter == b.random_scatter &&
            a.loop_seconds == b.loop_seconds &&
            a.scatter_density == b.scatter_density &&
+           a.loop_multiple == b.loop_multiple &&
            a.scatter == b.scatter;
 }
 
@@ -557,11 +565,17 @@ struct PanelState {
     // single texture and publishes the resulting id back here.
     bool                          chase_preview_playing = false;
     float                         chase_preview_frame   = 0.f;
-    // Tracks the active AE comp's frame rate. Written from the AEGP
-    // idle hook (ae_build::RefreshProjectFps) so the preview's
-    // seconds readout + playback speed match the project instead of
-    // a hardcoded value; read on the UI thread — hence atomic.
-    std::atomic<float>            chase_preview_fps{24.f};
+    // The ONE project frame rate — used by the preview AND the AE
+    // builder for every chase (never per-chase, never per-source).
+    // Auto-initialized from the active AE comp by the idle hook
+    // (ae_build::RefreshProjectFps) UNTIL the user sets it in the
+    // Sources tab; after that `project_fps_user` latches and the
+    // auto-tracking stops (the user's value wins, fixes the "stuck
+    // at 24 while the project is 30" bug). Atomic — written on the
+    // UI thread (Sources tab), read on the UI + idle-hook threads.
+    // Persisted in the session.
+    std::atomic<float>            project_fps{30.f};   // 30 = the 99% case
+    std::atomic<bool>             project_fps_user{false};
     // Click-to-pin uses the shared `selected_hash` (set by a chase
     // table row click or a centroid-dot click): when not playing and
     // that layer belongs to the chase, the preview freezes on its
@@ -725,8 +739,10 @@ inline int ChaseLoopFrames(const Chase& chase, const PanelState& state,
                            float fps)
 {
     const Source* src = ActiveSource(state);
-    if (src && src->animation && src->frame_count > 1)
-        return src->frame_count;
+    if (src && src->animation && src->frame_count > 1) {
+        const int m = chase.loop_multiple < 1 ? 1 : chase.loop_multiple;
+        return src->frame_count * m;   // always an exact source multiple
+    }
     return ScatterLoopFrames(chase, fps);
 }
 

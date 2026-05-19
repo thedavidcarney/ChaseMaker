@@ -350,9 +350,15 @@ std::string BuildSessionJson(const PanelState& state)
         "  \"next_source_id\": %u,\n"
         "  \"next_bind_id\": %u,\n"
         "  \"next_tag_id\": %u,\n"
-        "  \"next_chase_id\": %u,\n",
+        "  \"next_chase_id\": %u,\n"
+        "  \"project_fps\": %.4f,\n"
+        "  \"project_fps_user\": %d,\n"
+        "  \"thumb_max_width\": %d,\n",
         state.next_source_id, state.next_bind_id,
-        state.next_tag_id, state.next_chase_id);
+        state.next_tag_id, state.next_chase_id,
+        state.project_fps.load(),
+        state.project_fps_user.load() ? 1 : 0,
+        state.thumb_max_width);
     out += buf;
 
     // Sources (path + id only; layers regenerated on load)
@@ -446,12 +452,12 @@ std::string BuildSessionJson(const PanelState& state)
             "      \"desired_stage_count\": %d, \"symmetric_pairs\": %s, "
             "\"manual_stages\": %s,\n"
             "      \"random_scatter\": %s, \"loop_seconds\": %.3f, "
-            "\"scatter_density\": %d,\n",
+            "\"scatter_density\": %d, \"loop_multiple\": %d,\n",
             (int)c.sort_mode, c.sort_reverse ? "true" : "false", c.random_seed,
             c.desired_stage_count, c.symmetric_pairs ? "true" : "false",
             c.manual_stages ? "true" : "false",
             c.random_scatter ? "true" : "false", c.loop_seconds,
-            c.scatter_density);
+            c.scatter_density, c.loop_multiple < 1 ? 1 : c.loop_multiple);
         out += buf;
         out += "      \"tag_filter\": [";
         for (size_t ti = 0; ti < c.tag_filter.size(); ++ti) {
@@ -608,6 +614,16 @@ bool LoadSession(PanelState* state, const std::string& path)
         if (const JsonValue* v = root.find("next_bind_id"))   state->next_bind_id   = v->as_u32(1);
         if (const JsonValue* v = root.find("next_tag_id"))    state->next_tag_id    = v->as_u32(1);
         if (const JsonValue* v = root.find("next_chase_id")) state->next_chase_id = v->as_u32(1);
+        if (const JsonValue* v = root.find("project_fps")) {
+            float f = v->as_float(24.f);
+            state->project_fps.store(f < 1.f ? 1.f : (f > 240.f ? 240.f : f));
+        }
+        if (const JsonValue* v = root.find("project_fps_user"))
+            state->project_fps_user.store(v->as_int(0) != 0);
+        if (const JsonValue* v = root.find("thumb_max_width")) {
+            int tw = v->as_int(384);
+            state->thumb_max_width = tw < 64 ? 64 : (tw > 1024 ? 1024 : tw);
+        }
         if (const JsonValue* v = root.find("active_source_index"))
             state->active_source_index = v->as_int(-1);
 
@@ -679,6 +695,7 @@ bool LoadSession(PanelState* state, const std::string& path)
                 if (const JsonValue* x = e.find("random_scatter"))  c.random_scatter  = x->as_bool();
                 if (const JsonValue* x = e.find("loop_seconds"))    c.loop_seconds    = x->as_float(10.0f);
                 if (const JsonValue* x = e.find("scatter_density")) c.scatter_density = x->as_int(5);
+                if (const JsonValue* x = e.find("loop_multiple"))   c.loop_multiple   = x->as_int(1);
                 if (const JsonValue* x = e.find("tag_filter")) {
                     for (const auto& t : x->arr) c.tag_filter.push_back(t.as_u32());
                 }
