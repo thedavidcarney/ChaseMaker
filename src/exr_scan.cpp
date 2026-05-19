@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <ImfChannelList.h>
+#include <ImfCompression.h>
 #include <ImfFrameBuffer.h>
 #include <ImfHeader.h>
 #include <ImfInputPart.h>
@@ -157,6 +158,32 @@ std::vector<RgbGroup> BuildRgbGroups(Imf::MultiPartInputFile& file)
         out.push_back(std::move(grp));
     }
     return out;
+}
+
+// Human-readable EXR compression name — surfaced in skip reasons so a
+// decode failure points at the codec (a tester's "Unable to run
+// decoder" is far more actionable as "decoder error [DWAB]").
+const char* CompressionName(Imf::Compression c)
+{
+    switch (c) {
+        case Imf::NO_COMPRESSION:    return "none";
+        case Imf::RLE_COMPRESSION:   return "RLE";
+        case Imf::ZIPS_COMPRESSION:  return "ZIPS";
+        case Imf::ZIP_COMPRESSION:   return "ZIP";
+        case Imf::PIZ_COMPRESSION:   return "PIZ";
+        case Imf::PXR24_COMPRESSION: return "PXR24";
+        case Imf::B44_COMPRESSION:   return "B44";
+        case Imf::B44A_COMPRESSION:  return "B44A";
+        case Imf::DWAA_COMPRESSION:  return "DWAA";
+        case Imf::DWAB_COMPRESSION:  return "DWAB";
+        default:                     return "unknown";
+    }
+}
+
+std::string PartCompression(Imf::MultiPartInputFile& file, int part)
+{
+    try { return CompressionName(file.header(part).compression()); }
+    catch (...) { return "?"; }
 }
 
 // Read R+G+B for one layer as float32 buffers. Returns false on any
@@ -590,8 +617,25 @@ void DoScan(const std::string& input, PanelState* state,
             }
 
             int w = 0, h = 0;
-            if (!ReadRgbPart(file, grp, w, h, r_buf, g_buf, b_buf)) {
-                skipped.push_back({grp.display_name, "read failed"});
+            try {
+                if (!ReadRgbPart(file, grp, w, h, r_buf, g_buf, b_buf)) {
+                    skipped.push_back({grp.display_name, "read failed"});
+                    continue;
+                }
+            } catch (const std::exception& e) {
+                // One undecodable part must NOT abort the whole scan.
+                // OpenEXR throws here (e.g. "Unable to run decoder")
+                // on an unsupported/corrupt compressed part or a
+                // not-fully-materialized file. Record it with the
+                // part's compression and keep scanning the rest, so
+                // the user still gets every layer that DOES decode
+                // and a precise, actionable reason for the rest.
+                const std::string comp = PartCompression(file, grp.r.part);
+                CM_DIAG_LOG("scan: part %d '%s' decode failed [%s]: %s",
+                            grp.r.part, grp.display_name.c_str(),
+                            comp.c_str(), e.what());
+                skipped.push_back({grp.display_name,
+                    "decoder error [" + comp + "]: " + e.what()});
                 continue;
             }
 
