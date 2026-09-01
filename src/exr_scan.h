@@ -15,10 +15,37 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 struct PanelState;
+struct LayerInfo;
 
 namespace exr_scan {
+
+// Add a source by path, routing on file type. Video clips
+// (.mov/.mp4/.mxf) become a single-light "movie" source: a placeholder
+// Source is created immediately (so it shows in the Sources tab) and
+// queued for AE-render analysis (the OpenEXR scanner can't read video).
+// Everything else falls through to StartScan (the EXR/sequence path).
+// This is the ONE chokepoint for drag-in, the file picker, and session
+// restore so extension routing lives in a single place. `append`,
+// `source_id`, and `frame_index` carry the same meaning as StartScan.
+void AddSourcePath(const std::string& path, PanelState* state,
+                   bool append = true, uint32_t source_id = 0,
+                   int frame_index = 0);
+
+// Compute centroid metrics + thumbnail from ONE already-decoded frame
+// (linear R/G/B planes, w*h floats each) and write them into `out`
+// (cx/cy/cx_hot/cy_hot/peak_*/total and thumb_rgba/thumb_w/thumb_h/
+// thumb_peak; texture_id is left as-is so the renderer re-uploads).
+// Shares the exact metric + thumbnail math the EXR scan uses; the movie
+// path feeds it pixels from an AE-rendered frame instead of OpenEXR.
+// `thumb_max_w` mirrors PanelState::thumb_max_width.
+void AnalyzeFramePixels(const std::vector<float>& r,
+                        const std::vector<float>& g,
+                        const std::vector<float>& b,
+                        int w, int h, int thumb_max_w,
+                        LayerInfo& out);
 
 // Spawn a detached worker that scans `path`.
 //

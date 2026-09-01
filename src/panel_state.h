@@ -26,12 +26,22 @@
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 struct LayerInfo {
-    std::string display_name;     // e.g. "Curtain Column_001"
-    uint32_t    fnv1a_hash = 0;   // matches EXRDemux's hash byte-for-byte
+    std::string display_name;     // e.g. "Curtain Column_001" or a renamed single-light source name
+    // The EXR's internal layer name (after EXRDemux's X.X dedup) —
+    // what EXRDemux hashes at render time to pick the layer. For
+    // single-light sources we may rename `display_name` to the
+    // filename base (for differentiation in the panel + AE
+    // timeline), but the Demux effect's Layer Hash Hi/Lo params
+    // MUST be set from THIS name's FNV, not from `display_name`.
+    // Empty in older sessions before this field existed -> fall
+    // back to `display_name`.
+    std::string exr_layer_name;
+    uint32_t    fnv1a_hash = 0;   // identity (FNV of display_name); used as LayerRef key
     // ---- Centroid family (all normalized [0,1]) ----
     // cx/cy: luminance-weighted centroid over the WHOLE layer. Pulls
     //   toward broad-spread contributions; good for "where does this
@@ -69,11 +79,22 @@ struct LayerInfo {
     // visible in the layer table, but lies about relative brightness
     // — the composite preview undoes it). 0 = unknown (treat as 1).
     float       thumb_peak = 0.f;
+
+    // Transient: which Source owns this layer. NOT persisted —
+    // stamped at snapshot/scan time so the unified Staging table
+    // (which unions layers across every source) can build correct
+    // (source_id, hash) LayerRefs per row. Equals the owning
+    // Source's `source_id`.
+    uint32_t    source_id = 0;
 };
 
 struct SkippedLayer {
     std::string display_name;
     std::string reason;
+    // Transient: same purpose as LayerInfo::source_id. NOT
+    // persisted. Stamped by TakeSnapshot so DrawSkippedSection can
+    // promote a skipped layer back into its real owning source.
+    uint32_t    source_id = 0;
 };
 
 // One source file (EXR or PNG) loaded into the session. Each source
@@ -95,6 +116,19 @@ struct Source {
     // odd case where a multi-frame source should still be treated as
     // shift-in-time stills.
     bool                        animation = false;
+    // An AE-decoded single-light source: a self-contained movie clip
+    // (.mov/.mp4/.mxf) OR a still image (.png/.tif/.jpg/...). Either way
+    // the whole file is ONE light, imported as a single footage item
+    // (NOT an on-disk frame sequence — the build must NOT pass
+    // all_in_folder), and the built comp applies NO EXRDemux (no layers
+    // to demux). Pixels for the centroid sort + thumbnail come from AE
+    // rendering one frame (ae_build::DrainMovieAnalysis), since the
+    // OpenEXR scanner can't read these. animation/frame_count are read
+    // from the AE item during analysis (STILL flag → still light;
+    // multi-frame → loop-mode animation). Persisted in the session.
+    // (Name kept as is_movie for session-key stability; it now covers
+    // stills too.)
+    bool                        is_movie = false;
     int                         image_width = 0;
     int                         image_height = 0;
     std::vector<LayerInfo>      layers;
@@ -190,10 +224,19 @@ struct ScatterHit {
 // is fully parameterised. Hit duration + step duration together
 // imply overlap (if step < duration, hits overlap).
 struct ChaseTiming {
-    float duration       = 30.0f;  // frames; total envelope length per stage
+    float duration       = 30.0f;  // frames; rise + fall length (excludes hold)
     float attack         = 5.0f;   // frames from start to peak; release = duration - attack
+    float hold           = 0.0f;   // frames held at peak between attack and release
     float step_duration  = 4.0f;   // frames between successive stage starts
     float opacity_peak   = 100.f;  // % at peak
+    // Opacity FLOOR — the trough value the envelope bottoms out at (%),
+    // mirroring gamma_baseline for opacity. 0 = full off at the trough
+    // (legacy). >0 keeps the light partly ON for subtle chases ("never
+    // below 50%"). In loop mode (animation/movie sources) the layer
+    // spans the whole comp so this is a true global floor; in non-loop
+    // shift-in-time mode it sets where each trimmed hit fades to.
+    // Clamped to opacity_peak at apply time.
+    float opacity_floor  = 0.0f;   // % at the trough
     float gamma_peak     = 1.0f;   // Exposure 'Gamma Correction' at peak
     float gamma_baseline = 0.25f;  // Gamma Correction off-peak baseline
 };
@@ -259,6 +302,20 @@ struct Chase {
     // phase-lock with the scene animation. Ignored for still sources
     // (those use loop_seconds).
     int                     loop_multiple = 1;
+    // Loop-mode only (templated chases on animation source): the
+    // chase pattern repeats this many times INSIDE the comp loop
+    // (the inverse of `loop_multiple` — that makes the comp longer;
+    // this makes the chase faster). 1 = one sweep per loop (default);
+    // 2..50 = 2..50 sweeps per loop. Each stage fires `loop_cycles`
+    // times per comp, evenly spaced. Integer ≥ 1.
+    int                     loop_cycles = 1;
+    // Loop-mode only: master phase offset in frames. Shifts WHEN the
+    // chase starts inside the loop without changing the order of
+    // stages — useful for putting the "first beat" anywhere in the
+    // comp window. Range [0, period) where period = loop_frames /
+    // loop_cycles; values outside that are wrapped mod period at
+    // render time. 0 = legacy behavior (stage 0 fires at t=0).
+    int                     loop_offset = 0;
 };
 
 // The big-three top-level tabs. Chase tabs live in their own vector
@@ -285,8 +342,10 @@ inline bool operator==(const PositionOverride& a, const PositionOverride& b) {
 }
 inline bool operator==(const ChaseTiming& a, const ChaseTiming& b) {
     return a.duration == b.duration && a.attack == b.attack &&
+           a.hold == b.hold &&
            a.step_duration == b.step_duration &&
            a.opacity_peak == b.opacity_peak &&
+           a.opacity_floor == b.opacity_floor &&
            a.gamma_peak == b.gamma_peak &&
            a.gamma_baseline == b.gamma_baseline;
 }
@@ -309,6 +368,8 @@ inline bool operator==(const Chase& a, const Chase& b) {
            a.loop_seconds == b.loop_seconds &&
            a.scatter_density == b.scatter_density &&
            a.loop_multiple == b.loop_multiple &&
+           a.loop_cycles == b.loop_cycles &&
+           a.loop_offset == b.loop_offset &&
            a.scatter == b.scatter;
 }
 
@@ -408,6 +469,11 @@ struct PanelState {
     // the middle of an ImGui frame — that triggered reentrant
     // RenderFrame calls and a crash on Windows.
     std::atomic<bool>          want_pick_exr{false};
+    // "Add active project item": the Sources tab sets this; the idle
+    // hook (which has an AEGP context) drains it via
+    // ae_build::AddActiveProjectItem — pulls AE's focused Project-panel
+    // footage item and feeds its path through exr_scan::AddSourcePath.
+    std::atomic<bool>          want_add_active_item{false};
 
     // ---- Preview animation (cycles through included layers) ----
     // Touched only from the UI thread; no synchronisation needed.
@@ -483,6 +549,31 @@ struct PanelState {
     std::string                   session_save_path;
     std::atomic<bool>             want_save_session{false};
     std::atomic<bool>             want_load_session{false};
+    // AE project name (basename, no extension). Refreshed from the
+    // AEGP idle hook via ae_build::RefreshAEProjectName so the save
+    // dialog can pre-populate its filename. Empty until the first
+    // idle tick has run. UI thread + idle hook both touch; guarded
+    // by `mu`.
+    std::string                   ae_project_name;
+
+    // "Rescan all" queue: a snapshot of (source_id, path, frame) per
+    // source. Filled by the button; drained one entry per frame by
+    // the Sources tab whenever no scan is in flight (StartScan
+    // refuses re-entry while scanning, so we serialise). Guarded by
+    // `mu`.
+    struct PendingRescan { uint32_t id; std::string path; int frame; };
+    std::vector<PendingRescan>    pending_rescans;
+
+    // ---- Movie-source analysis queue ----
+    // Movie sources (.mov/.mp4/.mxf) can't go through the OpenEXR
+    // scanner. exr_scan::AddSourcePath creates a placeholder movie
+    // Source on drop and pushes its source_id here; the idle hook drains
+    // one per tick via ae_build::DrainMovieAnalysis, which asks AE to
+    // render one frame and fills in dimensions, frame_count, centroid
+    // metrics, and the thumbnail. Guarded by `mu`; the atomic is just a
+    // cheap "work pending" flag the idle hook can poll without the lock.
+    std::vector<uint32_t>         pending_movie_analysis;
+    std::atomic<bool>             want_analyze_movie{false};
 
     // ---- Comp builder ("dumb comps") ----
     // The plugin's entry point stashes pica_basicP and aegp_plugin_id
@@ -576,6 +667,23 @@ struct PanelState {
     // Persisted in the session.
     std::atomic<float>            project_fps{30.f};   // 30 = the 99% case
     std::atomic<bool>             project_fps_user{false};
+
+    // When ON, multi-source layers that share a `display_name` are
+    // treated as a single light: only ONE participates in Staging /
+    // autotag / chase generators / AE build. Default winner =
+    // highest scanned `total` luminance (so a working layer beats a
+    // broken/zero-decoded layer of the same name automatically).
+    // Override via `preferred_source_per_name` (right-click in the
+    // Staging table). OFF preserves the prior "every layer counts"
+    // behavior. Persisted in the session JSON. UI thread only.
+    bool                          dedupe_by_name = false;
+    // Explicit dedupe overrides — when dedupe_by_name is ON, these
+    // pin which source wins for a given display_name. Absent keys
+    // fall back to the auto-winner (highest `total`). Wired
+    // through the Staging tab's right-click menu and persisted in
+    // the session JSON.
+    std::unordered_map<std::string, uint32_t>
+                                  preferred_source_per_name;
     // Click-to-pin uses the shared `selected_hash` (set by a chase
     // table row click or a centroid-dot click): when not playing and
     // that layer belongs to the chase, the preview freezes on its
@@ -592,6 +700,77 @@ struct PanelState {
 // pure selections. Tuned to "I meant to grab" without making the
 // drag feel sluggish to the user who knows they want it.
 inline constexpr double kCentroidDragHoldSeconds = 1.0;
+
+// Set of canonical (source_id, hash) keys when `dedupe_by_name` is
+// on. For each display_name that appears in multiple sources, ONE
+// source's copy wins; all others are dropped from Staging /
+// autotag / chase generators / AE build. Winner-pick order:
+//   1. Explicit override in `state.preferred_source_per_name`
+//      (right-clicked "Use this source for …" in Staging).
+//   2. Otherwise the source whose layer has the highest scanned
+//      `total` luminance — which beats a broken/zero-pixel
+//      decode automatically since those have ~0 total.
+//   3. Ties / equal totals → first source in `sources` order.
+// Returns empty when dedupe is off; callers treat empty as "keep
+// everything." Caller must hold `state.mu`.
+//
+// Keys are packed as `(uint64_t(source_id) << 32) | fnv1a_hash`.
+inline std::unordered_set<uint64_t> BuildDedupeKeepSet(const PanelState& state)
+{
+    std::unordered_set<uint64_t> keep;
+    if (!state.dedupe_by_name) return keep;
+    // For each display_name, find the winner across all sources.
+    // Single pass: track current best per name.
+    struct Best { uint32_t source_id; uint32_t fnv1a_hash; double total; };
+    std::unordered_map<std::string, Best> best_by_name;
+    for (const Source& src : state.sources) {
+        for (const LayerInfo& L : src.layers) {
+            auto pit = state.preferred_source_per_name.find(L.display_name);
+            const bool prefer_this =
+                pit != state.preferred_source_per_name.end() &&
+                pit->second == src.source_id;
+            auto it = best_by_name.find(L.display_name);
+            if (it == best_by_name.end()) {
+                best_by_name.emplace(L.display_name,
+                    Best{ src.source_id, L.fnv1a_hash, L.total });
+                continue;
+            }
+            // An override always wins.
+            if (prefer_this) {
+                it->second = Best{ src.source_id, L.fnv1a_hash, L.total };
+                continue;
+            }
+            // Don't unseat an existing override.
+            auto pit_existing = state.preferred_source_per_name.find(L.display_name);
+            if (pit_existing != state.preferred_source_per_name.end() &&
+                pit_existing->second == it->second.source_id) {
+                continue;
+            }
+            // Otherwise prefer higher total luminance (= more data).
+            if (L.total > it->second.total) {
+                it->second = Best{ src.source_id, L.fnv1a_hash, L.total };
+            }
+        }
+    }
+    for (const auto& kv : best_by_name) {
+        uint64_t key = (uint64_t(kv.second.source_id) << 32) |
+                       kv.second.fnv1a_hash;
+        keep.insert(key);
+    }
+    return keep;
+}
+
+// True iff this (source_id, hash) survives dedupe. Cheap wrapper
+// around BuildDedupeKeepSet's output; pass an empty `keep` set when
+// dedupe is OFF (then every layer passes).
+inline bool DedupeKeeps(const std::unordered_set<uint64_t>& keep,
+                        bool dedupe_on,
+                        uint32_t source_id, uint32_t fnv1a_hash)
+{
+    if (!dedupe_on) return true;
+    uint64_t key = (uint64_t(source_id) << 32) | fnv1a_hash;
+    return keep.count(key) != 0;
+}
 
 // Convenience accessors. Caller must hold `state.mu` (or be the
 // scan worker that owns publication of the Source). Returns
@@ -722,24 +901,37 @@ inline int ScatterLoopFrames(const Chase& chase, float fps)
     return static_cast<int>(f < 1 ? 1 : f);
 }
 
-// True when the active source is an animation/sequence — chases run
-// as seamless loops over the source's own duration instead of the
-// shift-in-time "from black" model used for stills.
-inline bool ChaseLoopMode(const PanelState& state)
+// The session's loop driver: the first loaded source that's a
+// multi-frame animation (a movie or an image sequence). Loop mode is a
+// SESSION property, not a per-active-source one — a still light (e.g. a
+// lone PNG) loaded alongside animation sources rides their loop. Returns
+// nullptr when no animation source is loaded (pure still session).
+// Caller must hold state.mu (or be the scan worker publishing a Source).
+inline const Source* SessionAnimationSource(const PanelState& state)
 {
-    const Source* src = ActiveSource(state);
-    return src && src->animation && src->frame_count > 1;
+    for (const auto& s : state.sources) {
+        if (s.animation && s.frame_count > 1) return &s;
+    }
+    return nullptr;
 }
 
-// Seamless-loop length in frames for this chase. Animation source:
-// EXACTLY the source duration (frame_count) — the show requirement,
-// so the chase loop and the scene animation stay phase-locked.
-// Otherwise the scatter's own loop_seconds*fps (still-image scatter).
+// True when ANY loaded source is an animation/sequence — chases run as
+// seamless loops over that source's duration instead of the shift-in-
+// time "from black" model used for pure-still sessions. Session-wide so
+// still lights mixed with movies loop too.
+inline bool ChaseLoopMode(const PanelState& state)
+{
+    return SessionAnimationSource(state) != nullptr;
+}
+
+// Seamless-loop length in frames for this chase. With an animation
+// source in the session: EXACTLY its duration (frame_count) — the show
+// requirement, so the chase loop and the scene animation stay phase-
+// locked. Otherwise the scatter's own loop_seconds*fps (still scatter).
 inline int ChaseLoopFrames(const Chase& chase, const PanelState& state,
                            float fps)
 {
-    const Source* src = ActiveSource(state);
-    if (src && src->animation && src->frame_count > 1) {
+    if (const Source* src = SessionAnimationSource(state)) {
         const int m = chase.loop_multiple < 1 ? 1 : chase.loop_multiple;
         return src->frame_count * m;   // always an exact source multiple
     }
@@ -758,8 +950,7 @@ inline void RegenerateScatter(Chase& chase, const PanelState& state,
                               float fps)
 {
     chase.scatter.clear();
-    const Source* src = ActiveSource(state);
-    if (!src) return;
+    if (state.sources.empty()) return;
     const int loop_frames = ChaseLoopFrames(chase, state, fps);
     const int density = (chase.scatter_density < 1) ? 1
                                                     : chase.scatter_density;
@@ -767,30 +958,41 @@ inline void RegenerateScatter(Chase& chase, const PanelState& state,
     struct Lead { LayerRef repr; std::vector<LayerRef> members; };
     std::vector<Lead> leads;
     std::vector<uint32_t> bind_seen;
-    for (const auto& L : src->layers) {
-        if (!L.included) continue;
-        LayerRef ref{ src->source_id, L.fnv1a_hash };
-        if (!chase.tag_filter.empty()) {
-            bool in_any = false;
-            for (uint32_t tid : chase.tag_filter) {
-                if (const Tag* t = FindTagById(state, tid)) {
-                    for (const auto& m : t->members)
-                        if (m == ref) { in_any = true; break; }
+    // Iterate EVERY source so a chase pulls lights from the whole
+    // session (e.g. one big multilayer source + a few single-layer
+    // "extra" sequences). Sources are assumed to share resolution
+    // and frame rate; loop length is still taken from the active
+    // source (animation sources should all match per the user).
+    const auto dedupe_keep = BuildDedupeKeepSet(state);
+    const bool dedupe_on   = state.dedupe_by_name;
+    for (const Source& src : state.sources) {
+        for (const auto& L : src.layers) {
+            if (!L.included) continue;
+            if (!DedupeKeeps(dedupe_keep, dedupe_on,
+                             src.source_id, L.fnv1a_hash)) continue;
+            LayerRef ref{ src.source_id, L.fnv1a_hash };
+            if (!chase.tag_filter.empty()) {
+                bool in_any = false;
+                for (uint32_t tid : chase.tag_filter) {
+                    if (const Tag* t = FindTagById(state, tid)) {
+                        for (const auto& m : t->members)
+                            if (m == ref) { in_any = true; break; }
+                    }
+                    if (in_any) break;
                 }
-                if (in_any) break;
+                if (!in_any) continue;
             }
-            if (!in_any) continue;
-        }
-        if (const Bind* b = BindOfLayer(state, ref)) {
-            bool seen = false;
-            for (uint32_t id : bind_seen)
-                if (id == b->bind_id) { seen = true; break; }
-            if (!seen) {
-                bind_seen.push_back(b->bind_id);
-                leads.push_back({ ref, b->members });
+            if (const Bind* b = BindOfLayer(state, ref)) {
+                bool seen = false;
+                for (uint32_t id : bind_seen)
+                    if (id == b->bind_id) { seen = true; break; }
+                if (!seen) {
+                    bind_seen.push_back(b->bind_id);
+                    leads.push_back({ ref, b->members });
+                }
+            } else {
+                leads.push_back({ ref, { ref } });
             }
-        } else {
-            leads.push_back({ ref, { ref } });
         }
     }
     if (leads.empty()) return;
@@ -995,12 +1197,7 @@ inline void AutotagByName(PanelState* state)
 {
     if (!state) return;
     std::lock_guard<std::mutex> lk(state->mu);
-    if (state->active_source_index < 0 ||
-        state->active_source_index >= static_cast<int>(state->sources.size()))
-    {
-        return;
-    }
-    Source& src = state->sources[state->active_source_index];
+    if (state->sources.empty()) return;
 
     std::vector<std::pair<std::string, std::vector<LayerRef>>> by_prefix;
     auto group_for = [&](const std::string& key)
@@ -1010,10 +1207,25 @@ inline void AutotagByName(PanelState* state)
         by_prefix.emplace_back(key, std::vector<LayerRef>{});
         return by_prefix.back().second;
     };
-    for (const auto& L : src.layers) {
-        std::string prefix = ExtractTagPrefix(L.display_name);
-        if (prefix.empty()) continue;
-        group_for(prefix).push_back(LayerRef{ src.source_id, L.fnv1a_hash });
+    // Aggregate across EVERY source so a prefix shared by layers in
+    // different sources (e.g. SpeakersRowGroup1.exr + 2.exr) lands
+    // in one shared tag instead of getting orphaned as per-light tags.
+    // Excluded layers (`!L.included`) are skipped — the user's
+    // disable-in-Staging signal is "this light shouldn't participate
+    // anywhere," tags included. Re-run autotag after toggling
+    // includes to rebuild the tag set against the new selection.
+    const auto dedupe_keep = BuildDedupeKeepSet(*state);
+    const bool dedupe_on   = state->dedupe_by_name;
+    for (const Source& src : state->sources) {
+        for (const auto& L : src.layers) {
+            if (!L.included) continue;
+            if (!DedupeKeeps(dedupe_keep, dedupe_on,
+                             src.source_id, L.fnv1a_hash)) continue;
+            std::string prefix = ExtractTagPrefix(L.display_name);
+            if (prefix.empty()) continue;
+            group_for(prefix).push_back(
+                LayerRef{ src.source_id, L.fnv1a_hash });
+        }
     }
 
     int created = 0, updated = 0, members_added = 0;
@@ -1048,33 +1260,40 @@ inline void AutotagByName(PanelState* state)
     // separate "untagged" bucket by design; every light is tagged.
     // Idempotent (re-run after each scan): reuses an existing
     // same-named tag and skips members already present.
-    std::vector<uint32_t> covered;
+    // "covered" tracks (source_id, hash) — a bare hash could
+    // theoretically collide across sources for distinct names.
+    std::vector<LayerRef> covered;
     for (auto& kv : by_prefix) {
         if (kv.second.size() < 2) continue;
-        for (const auto& m : kv.second) covered.push_back(m.fnv1a_hash);
+        for (const auto& m : kv.second) covered.push_back(m);
     }
-    for (const auto& L : src.layers) {
-        bool is_covered = false;
-        for (uint32_t h : covered)
-            if (h == L.fnv1a_hash) { is_covered = true; break; }
-        if (is_covered) continue;
-        LayerRef ref{ src.source_id, L.fnv1a_hash };
-        Tag* tag = nullptr;
-        for (auto& t : state->tags)
-            if (t.name == L.display_name) { tag = &t; break; }
-        if (!tag) {
-            Tag nt;
-            nt.tag_id = state->next_tag_id++;
-            nt.name   = L.display_name;
-            nt.color  = ColorForId(nt.tag_id);
-            state->tags.push_back(std::move(nt));
-            tag = &state->tags.back();
-            ++created;
+    for (const Source& src : state->sources) {
+        for (const auto& L : src.layers) {
+            if (!L.included) continue;
+            if (!DedupeKeeps(dedupe_keep, dedupe_on,
+                             src.source_id, L.fnv1a_hash)) continue;
+            LayerRef ref{ src.source_id, L.fnv1a_hash };
+            bool is_covered = false;
+            for (const auto& cm : covered)
+                if (cm == ref) { is_covered = true; break; }
+            if (is_covered) continue;
+            Tag* tag = nullptr;
+            for (auto& t : state->tags)
+                if (t.name == L.display_name) { tag = &t; break; }
+            if (!tag) {
+                Tag nt;
+                nt.tag_id = state->next_tag_id++;
+                nt.name   = L.display_name;
+                nt.color  = ColorForId(nt.tag_id);
+                state->tags.push_back(std::move(nt));
+                tag = &state->tags.back();
+                ++created;
+            }
+            bool already = false;
+            for (const auto& em : tag->members)
+                if (em == ref) { already = true; break; }
+            if (!already) { tag->members.push_back(ref); ++members_added; }
         }
-        bool already = false;
-        for (const auto& em : tag->members)
-            if (em == ref) { already = true; break; }
-        if (!already) { tag->members.push_back(ref); ++members_added; }
     }
 
     if (created > 0 || members_added > 0) {

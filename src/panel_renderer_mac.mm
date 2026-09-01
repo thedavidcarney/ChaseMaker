@@ -247,7 +247,7 @@ void MacPanelRenderer::OnDroppedFiles(const std::vector<std::string>& paths)
 {
     for (const auto& p : paths) {
         if (p.empty()) continue;
-        exr_scan::StartScan(p, i_state, /*append=*/true, /*source_id=*/0);
+        exr_scan::AddSourcePath(p, i_state, /*append=*/true, /*source_id=*/0);
     }
     if (!paths.empty() && i_state) {
         std::lock_guard<std::mutex> lk(i_state->mu);
@@ -399,27 +399,31 @@ void MacPanelRenderer::RenderFrame(MTKView* view)
             }
             i_state->chase_composite_texture_id = 0;
         }
-        Source* src = ActiveSource(*i_state);
-        if (src) for (LayerInfo& L : src->layers) {
-            if (L.texture_id != 0) continue;
-            if (L.thumb_rgba.empty() || L.thumb_w <= 0 || L.thumb_h <= 0) continue;
-            MTLTextureDescriptor* td =
-                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                   width:(NSUInteger)L.thumb_w
-                                                                  height:(NSUInteger)L.thumb_h
-                                                               mipmapped:NO];
-            td.usage = MTLTextureUsageShaderRead;
-            id<MTLTexture> tex = [i_device newTextureWithDescriptor:td];
-            if (!tex) continue;
-            [tex replaceRegion:MTLRegionMake2D(0, 0, L.thumb_w, L.thumb_h)
-                   mipmapLevel:0
-                     withBytes:L.thumb_rgba.data()
-                   bytesPerRow:L.thumb_w * 4];
-            [i_thumb_textures addObject:tex];
-            // Bridge the texture pointer through to a uint64 ImTextureID.
-            // Lifetime is owned by i_thumb_textures; ImGui never deref's
-            // the value itself.
-            L.texture_id = (uint64_t)(uintptr_t)(__bridge void*)tex;
+        // Upload thumbnails for EVERY source's layers — the unified
+        // Staging table mixes layers from all sources, so a
+        // non-active source's preview needs its texture_id too.
+        for (Source& src : i_state->sources) {
+            for (LayerInfo& L : src.layers) {
+                if (L.texture_id != 0) continue;
+                if (L.thumb_rgba.empty() || L.thumb_w <= 0 || L.thumb_h <= 0) continue;
+                MTLTextureDescriptor* td =
+                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                       width:(NSUInteger)L.thumb_w
+                                                                      height:(NSUInteger)L.thumb_h
+                                                                   mipmapped:NO];
+                td.usage = MTLTextureUsageShaderRead;
+                id<MTLTexture> tex = [i_device newTextureWithDescriptor:td];
+                if (!tex) continue;
+                [tex replaceRegion:MTLRegionMake2D(0, 0, L.thumb_w, L.thumb_h)
+                       mipmapLevel:0
+                         withBytes:L.thumb_rgba.data()
+                       bytesPerRow:L.thumb_w * 4];
+                [i_thumb_textures addObject:tex];
+                // Bridge the texture pointer through to a uint64 ImTextureID.
+                // Lifetime is owned by i_thumb_textures; ImGui never deref's
+                // the value itself.
+                L.texture_id = (uint64_t)(uintptr_t)(__bridge void*)tex;
+            }
         }
     }
 
@@ -506,18 +510,21 @@ void MacPanelRenderer::RenderFrame(MTKView* view)
             return file_dialog::PickExr((__bridge void*)i_mtkView);
         });
         if (!path.empty()) {
-            exr_scan::StartScan(path, i_state, /*append=*/true, /*source_id=*/0);
+            exr_scan::AddSourcePath(path, i_state, /*append=*/true, /*source_id=*/0);
         }
     }
     if (i_state->want_save_session.exchange(false)) {
         std::string path;
+        std::string default_name;
         {
             std::lock_guard<std::mutex> lk(i_state->mu);
-            path = i_state->session_save_path;
+            path         = i_state->session_save_path;
+            default_name = i_state->ae_project_name;
         }
         if (path.empty()) {
             path = run_dialog([&](){
-                return file_dialog::PickSessionSavePath((__bridge void*)i_mtkView);
+                return file_dialog::PickSessionSavePath(
+                    (__bridge void*)i_mtkView, default_name);
             });
         }
         if (!path.empty()) session_io::WriteSession(i_state, path);

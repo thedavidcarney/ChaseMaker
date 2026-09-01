@@ -14,12 +14,16 @@ std::string PickExr(void* parent)
         panel.canChooseFiles = YES;
         panel.canChooseDirectories = NO;
         panel.allowsMultipleSelection = NO;
-        panel.title = @"Pick a multilayer EXR";
+        panel.title = @"Pick an EXR, PNG, or movie clip";
 
         if (@available(macOS 11.0, *)) {
             NSMutableArray<UTType*>* types = [NSMutableArray array];
-            if (UTType* t = [UTType typeWithFilenameExtension:@"exr"]) [types addObject:t];
-            if (UTType* t = [UTType typeWithFilenameExtension:@"png"]) [types addObject:t];
+            for (NSString* ext in @[@"exr", @"png", @"tif", @"tiff", @"jpg",
+                                    @"jpeg", @"tga", @"dpx", @"hdr",
+                                    @"mov", @"mp4", @"mxf"]) {
+                if (UTType* t = [UTType typeWithFilenameExtension:ext])
+                    [types addObject:t];
+            }
             if (types.count) panel.allowedContentTypes = types;
         }
 
@@ -47,12 +51,21 @@ std::string PickExr(void* parent)
     }
 }
 
-std::string PickSessionSavePath(void* parent)
+std::string PickSessionSavePath(void* parent,
+                                const std::string& default_basename)
 {
     @autoreleasepool {
         NSSavePanel* panel = [NSSavePanel savePanel];
         panel.title = @"Save Chase Maker session";
-        panel.nameFieldStringValue = @"session.chasemaker.json";
+        if (!default_basename.empty()) {
+            // Pre-populate with the AE project's basename so the user
+            // just hits Enter to save it next to the .aep.
+            NSString* seed = [NSString stringWithFormat:@"%s.chasemaker.json",
+                              default_basename.c_str()];
+            panel.nameFieldStringValue = seed;
+        } else {
+            panel.nameFieldStringValue = @"session.chasemaker.json";
+        }
         if (@available(macOS 11.0, *)) {
             if (UTType* t = [UTType typeWithFilenameExtension:@"json"]) {
                 panel.allowedContentTypes = @[t];

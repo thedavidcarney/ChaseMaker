@@ -213,6 +213,20 @@ private:
             ae_build::BuildAllChases(&self->i_panel_state);
             did_build = true;
         }
+        // Drain movie-source analysis (AE renders one frame per queued
+        // clip to compute its centroid/thumbnail). One clip per tick;
+        // treat like a build so the fps poll below is skipped while AE
+        // is busy rendering.
+        if (self->i_panel_state.want_analyze_movie.load()) {
+            ae_build::DrainMovieAnalysis(&self->i_panel_state);
+            did_build = true;
+        }
+        // "Add active project item" button: pull AE's focused
+        // Project-panel footage item (needs this hook's AEGP context).
+        if (self->i_panel_state.want_add_active_item.exchange(false)) {
+            ae_build::AddActiveProjectItem(&self->i_panel_state);
+            did_build = true;
+        }
         // Keep the chase preview's fps in sync with the active comp —
         // but THROTTLED and guarded. Polling AEGP project/comp state
         // every idle (~10Hz, unconditionally) destabilised AE while it
@@ -225,6 +239,7 @@ private:
             s_fps_tick = 0;
             CM_DIAG_LOG("idle: RefreshProjectFps begin");
             ae_build::RefreshProjectFps(&self->i_panel_state);
+            ae_build::RefreshAEProjectName(&self->i_panel_state);
             CM_DIAG_LOG("idle: RefreshProjectFps end");
         }
         // max_sleep is in 60ths of a second. Asking AE to wake us at

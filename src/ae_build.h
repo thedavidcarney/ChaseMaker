@@ -48,4 +48,30 @@ BuildResult BuildAllChases(PanelState* state);
 // AEGP context. Must run from a registered-hook context (idle hook).
 void RefreshProjectFps(PanelState* state);
 
+// Pull the active AE project's filename (basename only, no .aep
+// extension and no directory) into state->ae_project_name so the
+// session-save dialog can default to it. Cheap, idempotent; safe
+// every idle tick. No-op without an AEGP context — must run from a
+// registered-hook context (idle hook) for the same reason as
+// RefreshProjectFps.
+void RefreshAEProjectName(PanelState* state);
+
+// Drain the movie-source analysis queue (state->pending_movie_analysis).
+// For ONE queued movie source per call, ask AE to render a single frame
+// of the clip and fill in its dimensions, frame_count, centroid metrics,
+// and thumbnail (a movie can't go through the OpenEXR scanner). One clip
+// per call keeps each synchronous render off AE's hot path. Must run from
+// a registered-hook context (the idle hook) — it imports footage and
+// calls the render suite on the main thread. No-op without an AEGP
+// context or when the queue is empty.
+void DrainMovieAnalysis(PanelState* state);
+
+// Add AE's currently-active Project-panel footage item as a source.
+// Reads the item's file path via AEGP and feeds it through
+// exr_scan::AddSourcePath (so it routes by type and reads still/sequence
+// from the item). Drives the Sources-tab "Add active project item"
+// button. Must run from a registered-hook context (the idle hook); no-op
+// without an AEGP context or when no footage item is active.
+void AddActiveProjectItem(PanelState* state);
+
 } // namespace ae_build

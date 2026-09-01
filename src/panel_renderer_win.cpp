@@ -173,7 +173,7 @@ public:
     {
         for (const auto& p : paths) {
             if (p.empty()) continue;
-            exr_scan::StartScan(p, i_state, /*append=*/true, /*source_id=*/0);
+            exr_scan::AddSourcePath(p, i_state, /*append=*/true, /*source_id=*/0);
         }
         // Status update so user sees feedback even if scan is queued.
         if (!paths.empty() && i_state) {
@@ -651,38 +651,42 @@ private:
         }
 
         std::lock_guard<std::mutex> lk(i_state->mu);
-        Source* src = ActiveSource(*i_state);
-        if (!src) return;
-        for (size_t idx = 0; idx < src->layers.size(); ++idx) {
-            LayerInfo& L = src->layers[idx];
-            if (L.texture_id != 0) continue;
-            if (L.thumb_rgba.empty() || L.thumb_w <= 0 || L.thumb_h <= 0) continue;
+        // Upload thumbnails for EVERY source's layers — the unified
+        // Staging table mixes layers across all loaded sources, so a
+        // non-active source's layer needs its texture_id populated
+        // too or the preview pane shows "(thumbnail not ready)".
+        for (Source& src : i_state->sources) {
+            for (size_t idx = 0; idx < src.layers.size(); ++idx) {
+                LayerInfo& L = src.layers[idx];
+                if (L.texture_id != 0) continue;
+                if (L.thumb_rgba.empty() || L.thumb_w <= 0 || L.thumb_h <= 0) continue;
 
-            D3D11_TEXTURE2D_DESC desc{};
-            desc.Width = L.thumb_w;
-            desc.Height = L.thumb_h;
-            desc.MipLevels = 1;
-            desc.ArraySize = 1;
-            desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            desc.SampleDesc.Count = 1;
-            desc.Usage = D3D11_USAGE_IMMUTABLE;
-            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                D3D11_TEXTURE2D_DESC desc{};
+                desc.Width = L.thumb_w;
+                desc.Height = L.thumb_h;
+                desc.MipLevels = 1;
+                desc.ArraySize = 1;
+                desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                desc.SampleDesc.Count = 1;
+                desc.Usage = D3D11_USAGE_IMMUTABLE;
+                desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-            D3D11_SUBRESOURCE_DATA srd{};
-            srd.pSysMem = L.thumb_rgba.data();
-            srd.SysMemPitch = L.thumb_w * 4;
+                D3D11_SUBRESOURCE_DATA srd{};
+                srd.pSysMem = L.thumb_rgba.data();
+                srd.SysMemPitch = L.thumb_w * 4;
 
-            ID3D11Texture2D* tex = nullptr;
-            if (FAILED(i_device->CreateTexture2D(&desc, &srd, &tex)) || !tex) {
-                continue;
+                ID3D11Texture2D* tex = nullptr;
+                if (FAILED(i_device->CreateTexture2D(&desc, &srd, &tex)) || !tex) {
+                    continue;
+                }
+                ID3D11ShaderResourceView* srv = nullptr;
+                HRESULT hr = i_device->CreateShaderResourceView(tex, nullptr, &srv);
+                tex->Release();
+                if (FAILED(hr) || !srv) continue;
+
+                i_thumb_srvs.push_back(srv);
+                L.texture_id = reinterpret_cast<uint64_t>(srv);
             }
-            ID3D11ShaderResourceView* srv = nullptr;
-            HRESULT hr = i_device->CreateShaderResourceView(tex, nullptr, &srv);
-            tex->Release();
-            if (FAILED(hr) || !srv) continue;
-
-            i_thumb_srvs.push_back(srv);
-            L.texture_id = reinterpret_cast<uint64_t>(srv);
         }
     }
 
@@ -703,18 +707,22 @@ private:
         if (i_state->want_pick_exr.exchange(false)) {
             std::string path = run_dialog([&](){ return file_dialog::PickExr(i_host); });
             if (!path.empty()) {
-                exr_scan::StartScan(path, i_state, /*append=*/true, /*source_id=*/0);
+                exr_scan::AddSourcePath(path, i_state, /*append=*/true, /*source_id=*/0);
             }
             InvalidateRect(i_host, nullptr, FALSE);
         }
         if (i_state->want_save_session.exchange(false)) {
             std::string path;
+            std::string default_name;
             {
                 std::lock_guard<std::mutex> lk(i_state->mu);
-                path = i_state->session_save_path;
+                path         = i_state->session_save_path;
+                default_name = i_state->ae_project_name;
             }
             if (path.empty()) {
-                path = run_dialog([&](){ return file_dialog::PickSessionSavePath(i_host); });
+                path = run_dialog([&](){
+                    return file_dialog::PickSessionSavePath(i_host, default_name);
+                });
             }
             if (!path.empty()) {
                 session_io::WriteSession(i_state, path);

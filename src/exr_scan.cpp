@@ -87,7 +87,12 @@ struct ChannelLookup {
 
 struct RgbGroup {
     std::string   layer_key;     // raw layer key before X.X dedup
-    std::string   display_name;  // after dedup
+    std::string   display_name;  // after dedup; may later be renamed
+    // The EXR-internal (post-dedup) name as it lives in the file —
+    // what EXRDemux hashes at render. Captured BEFORE our optional
+    // single-light filename rename, so the Demux Hi/Lo params stay
+    // matchable even after we change display_name.
+    std::string   render_name;
     ChannelLookup r, g, b;
     bool          complete = false;
 };
@@ -143,6 +148,9 @@ std::vector<RgbGroup> BuildRgbGroups(Imf::MultiPartInputFile& file)
             if (grp.layer_key.empty()) {
                 grp.layer_key = layer_key;
                 grp.display_name = DedupDoubledPrefix(layer_key);
+                // EXR-internal name = the dedup'd display before any
+                // ChaseMaker rename. Used for the EXRDemux hash.
+                grp.render_name  = grp.display_name;
             }
             ChannelLookup lookup{ p, raw };
             if (sub_upper == "R") grp.r = lookup;
@@ -610,6 +618,41 @@ void DoScan(const std::string& input, PanelState* state,
 
         std::vector<RgbGroup> groups = BuildRgbGroups(file);
 
+        // Single-light source: rename the lone real layer to the
+        // FILENAME base (frame digits stripped) so multi-file
+        // workflows like SpeakersRowGroup1.exr / 2.exr / ... produce
+        // differentiated per-file layer names that the auto-tag-by-
+        // prefix groups together ("SpeakersRowGroup"). Counted
+        // AFTER the skip list (cryptomattes, Image/Alpha, World,
+        // Ambient, HDRI, RGB-incomplete) — Blender exports with
+        // cryptomatte naturally have multiple raw groups but only
+        // one "real" light layer. Multilayer EXRs (2+ real layers)
+        // are untouched; their internal names self-describe.
+        {
+            int effective = 0;
+            RgbGroup* sole = nullptr;
+            for (auto& g : groups) {
+                if (!g.complete) continue;
+                if (!SkipReason(g.display_name).empty()) continue;
+                ++effective;
+                sole = &g;
+            }
+            if (effective == 1 && sole) {
+                fs::path p(path);
+                std::string base = p.stem().string();
+                if (frame_count > 1) {
+                    size_t e = base.size();
+                    while (e > 0 && std::isdigit(
+                               static_cast<unsigned char>(base[e - 1]))) --e;
+                    while (e > 0 && (base[e - 1] == '_' || base[e - 1] == '-' ||
+                                      base[e - 1] == '.' || base[e - 1] == ' '))
+                        --e;
+                    if (e > 0) base.resize(e);
+                }
+                if (!base.empty()) sole->display_name = base;
+            }
+        }
+
         // Use the data window of part 0 as the headline image size.
         int img_w = 0, img_h = 0;
         if (file.parts() > 0) {
@@ -674,8 +717,9 @@ void DoScan(const std::string& input, PanelState* state,
             }
 
             LayerInfo info;
-            info.display_name = grp.display_name;
-            info.fnv1a_hash   = FNV1a32(grp.display_name);
+            info.display_name   = grp.display_name;
+            info.exr_layer_name = grp.render_name;        // EXR-internal name (for Demux hash)
+            info.fnv1a_hash     = FNV1a32(grp.display_name);
             info.cx           = m.cx;
             info.cy           = m.cy;
             info.cx_hot       = m.cx_hot;
@@ -808,6 +852,122 @@ void StartScan(const std::string& path, PanelState* state,
     }).detach();
 }
 
+void AddSourcePath(const std::string& path, PanelState* state,
+                   bool append, uint32_t source_id, int frame_index)
+{
+    if (!state) return;
+
+    // Route by extension. Self-contained single-light files (movies and
+    // still images) can't go through the OpenEXR multilayer reader; they
+    // take the AE-render analysis path. Multilayer .exr stays on the
+    // OpenEXR scanner (it extracts many light layers per file).
+    std::string ext;
+    {
+        const size_t dot = path.find_last_of('.');
+        if (dot != std::string::npos) ext = LowerCopy(path.substr(dot));
+    }
+    const bool single_light =
+        // movies
+        ext == ".mov" || ext == ".mp4"  || ext == ".mxf" ||
+        // still images (one light each; a PNG sequence imported in AE is
+        // detected as an animation at analysis time via the item's flags)
+        ext == ".png" || ext == ".tif"  || ext == ".tiff" ||
+        ext == ".jpg" || ext == ".jpeg" || ext == ".tga"  ||
+        ext == ".dpx" || ext == ".hdr";
+    if (!single_light) {
+        StartScan(path, state, append, source_id, frame_index);
+        return;
+    }
+
+    // Single-light: create a placeholder Source immediately so it shows
+    // in the Sources tab, then queue it for AE-render analysis (idle hook
+    // → ae_build::DrainMovieAnalysis) which reads the AE item to set
+    // still-vs-animation, dimensions, frame_count, centroid metrics, and
+    // thumbnail. We do NOT bump scan_generation (that tears down other
+    // sources' textures).
+    namespace fs = std::filesystem;
+    std::string stem = fs::path(path).stem().string();
+    if (stem.empty()) stem = "Clip";
+
+    uint32_t new_id = 0;
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        Source src;
+        if (source_id != 0) {
+            src.source_id = source_id;
+            if (state->next_source_id <= source_id) {
+                state->next_source_id = source_id + 1;
+            }
+        } else {
+            src.source_id = state->next_source_id++;
+        }
+        new_id = src.source_id;
+        src.path        = path;
+        src.scan_path   = path;     // the file itself is the "frame"
+        src.is_movie    = true;     // AE-decoded single-light source
+        src.animation   = false;    // analysis sets it from the AE item
+        src.frame_count = 1;        // real count filled in at analysis
+
+        LayerInfo info;
+        info.display_name = stem;
+        info.fnv1a_hash   = FNV1a32(stem);
+        info.cx = info.cy = 0.5f;          // placeholder until analyzed
+        info.cx_hot = info.cy_hot = 0.5f;
+        info.included     = true;
+        src.layers.push_back(std::move(info));
+
+        if (!append) {
+            state->sources.clear();
+        }
+        // Replace an existing source with the same id in place (session
+        // restore / re-add) so the row keeps its slot; else append.
+        int replaced = -1;
+        if (source_id != 0) {
+            for (size_t i = 0; i < state->sources.size(); ++i) {
+                if (state->sources[i].source_id == source_id) {
+                    state->sources[i] = std::move(src);
+                    replaced = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        if (replaced < 0) {
+            state->sources.push_back(std::move(src));
+            state->active_source_index =
+                static_cast<int>(state->sources.size()) - 1;
+        } else {
+            state->active_source_index = replaced;
+        }
+        state->pending_movie_analysis.push_back(new_id);
+        state->last_error.clear();
+        state->last_status = "Analyzing clip: " + stem + "...";
+    }
+    state->want_analyze_movie.store(true);
+}
+
+void AnalyzeFramePixels(const std::vector<float>& r,
+                        const std::vector<float>& g,
+                        const std::vector<float>& b,
+                        int w, int h, int thumb_max_w,
+                        LayerInfo& out)
+{
+    // ComputeMetrics / GenerateThumbnail live in the anonymous
+    // namespace above; they're visible here in the enclosing exr_scan
+    // namespace. Same math the EXR scan uses, fed AE-decoded pixels.
+    ScanMetrics m = ComputeMetrics(r, g, b, w, h);
+    out.total    = m.total;
+    out.cx       = m.cx;     out.cy     = m.cy;
+    out.cx_hot   = m.cx_hot; out.cy_hot = m.cy_hot;
+    out.peak_x   = m.peak_x; out.peak_y = m.peak_y;
+    out.peak_lum = m.peak_lum;
+
+    int tw = 0, th = 0;
+    GenerateThumbnail(r, g, b, w, h, thumb_max_w,
+                      out.thumb_rgba, tw, th, out.thumb_peak);
+    out.thumb_w = tw;
+    out.thumb_h = th;
+}
+
 bool IncludeSkippedLayer(PanelState* state, uint32_t source_id,
                          const std::string& display_name)
 {
@@ -857,8 +1017,9 @@ bool IncludeSkippedLayer(PanelState* state, uint32_t source_id,
         ScanMetrics m = ComputeMetrics(r_buf, g_buf, b_buf, w, h);
 
         LayerInfo info;
-        info.display_name = display_name;
-        info.fnv1a_hash   = FNV1a32(display_name);
+        info.display_name   = display_name;
+        info.exr_layer_name = display_name;   // un-renamed path: same as display
+        info.fnv1a_hash     = FNV1a32(display_name);
         info.cx           = m.cx;
         info.cy           = m.cy;
         info.cx_hot       = m.cx_hot;

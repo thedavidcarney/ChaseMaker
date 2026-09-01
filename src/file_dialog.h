@@ -15,8 +15,10 @@ namespace file_dialog {
 std::string PickExr(void* parent);
 
 // Save dialog: returns the chosen path (UTF-8) with a default
-// extension of ".chasemaker.json". Empty on cancel.
-std::string PickSessionSavePath(void* parent);
+// extension of ".chasemaker.json". `default_basename` pre-fills the
+// filename field (no extension); empty falls back to a generic name.
+std::string PickSessionSavePath(void* parent,
+                                const std::string& default_basename = {});
 
 // Open dialog: returns the chosen path to a .chasemaker.json. Empty
 // on cancel.

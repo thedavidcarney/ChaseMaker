@@ -117,6 +117,7 @@ struct SourceSummary {
     int         scan_frame  = 0;
     int         frame_count = 1;
     bool        animation   = false;
+    bool        is_movie    = false;
     int         image_width = 0;
     int         image_height = 0;
     size_t      layer_count = 0;
@@ -167,8 +168,55 @@ FrameSnapshot TakeSnapshot(PanelState* state)
         s.exr_path         = src->path;
         s.image_width      = src->image_width;
         s.image_height     = src->image_height;
-        s.layers           = src->layers;
-        s.skipped          = src->skipped;
+    }
+    // Unify Staging / centroid / skipped across EVERY loaded
+    // source — "all sources are the same scene, activated at all
+    // times." Each LayerInfo carries its owning Source's
+    // `source_id` (transient) so the table, canvas, and bulk
+    // actions build correct LayerRefs per-row. `active_source_id`
+    // is informational + drives rescan focus only.
+    //
+    // When `dedupe_by_name` is on, layers sharing a display_name
+    // across sources collapse to ONE row — the winner picked by
+    // BuildDedupeKeepSet (explicit user override > highest
+    // `total` luminance > first-seen). Using the same keep-set
+    // here that autotag / chase generators / AE build use keeps
+    // the Staging table consistent with downstream output.
+    // Skipped is NOT deduped (it's a diagnostic list; duplicates
+    // there don't drive build output).
+    //
+    // First: build the set of names that DECODED SUCCESSFULLY in
+    // ANY source — used to filter the Skipped UI: a layer broken
+    // in one source but working in another isn't user-actionable.
+    std::unordered_set<std::string> working_names;
+    for (const Source& src : state->sources) {
+        for (const LayerInfo& L : src.layers) {
+            working_names.insert(L.display_name);
+        }
+    }
+    const auto dedupe_keep = BuildDedupeKeepSet(*state);
+    const bool dedupe_on   = state->dedupe_by_name;
+    for (const Source& src : state->sources) {
+        s.layers.reserve(s.layers.size() + src.layers.size());
+        for (const LayerInfo& src_L : src.layers) {
+            if (!DedupeKeeps(dedupe_keep, dedupe_on,
+                             src.source_id, src_L.fnv1a_hash)) continue;
+            LayerInfo L = src_L;
+            L.source_id = src.source_id;
+            s.layers.push_back(std::move(L));
+        }
+        s.skipped.reserve(s.skipped.size() + src.skipped.size());
+        for (const SkippedLayer& src_sk : src.skipped) {
+            // Hide skipped entries that have a working equivalent
+            // somewhere — they're noise (broken in this source,
+            // fine in another). The build path already prefers the
+            // working one; the Staging "Skipped" list is for
+            // genuinely unrecoverable layers.
+            if (working_names.count(src_sk.display_name)) continue;
+            SkippedLayer sk = src_sk;
+            sk.source_id = src.source_id;
+            s.skipped.push_back(std::move(sk));
+        }
     }
     s.source_summaries.reserve(state->sources.size());
     for (const Source& src : state->sources) {
@@ -179,6 +227,7 @@ FrameSnapshot TakeSnapshot(PanelState* state)
         ss.scan_frame    = src.scan_frame;
         ss.frame_count   = src.frame_count;
         ss.animation     = src.animation;
+        ss.is_movie      = src.is_movie;
         ss.image_width   = src.image_width;
         ss.image_height  = src.image_height;
         ss.layer_count   = src.layers.size();
@@ -193,26 +242,75 @@ FrameSnapshot TakeSnapshot(PanelState* state)
     return s;
 }
 
-// Push layer inclusion changes back into the active source. Matches by
-// display_name so a concurrent scan that swapped layers simply ignores
-// stale toggles. Also publishes any drag-reorder we recorded as a
-// reordering of the active source's layers vector.
+// Push layer inclusion changes back into every owning source. With
+// the unified Staging table the working copy can contain layers from
+// multiple sources, so we dispatch each row by (source_id +
+// display_name). Stale rows (e.g. a layer scrubbed mid-edit by a
+// concurrent rescan) are silently ignored.
 void PublishInclusionChanges(PanelState* state,
                              const std::vector<LayerInfo>& working)
 {
     std::lock_guard<std::mutex> lk(state->mu);
-    Source* src = ActiveSource(*state);
-    if (!src) return;
-    if (src->layers.size() != working.size()) return;
-    for (size_t i = 0; i < working.size(); ++i) {
-        if (src->layers[i].display_name == working[i].display_name) {
-            src->layers[i].included = working[i].included;
+    // Build (source_id -> Source*) for O(1) dispatch.
+    std::unordered_map<uint32_t, Source*> by_id;
+    by_id.reserve(state->sources.size());
+    for (Source& src : state->sources) by_id[src.source_id] = &src;
+    for (const LayerInfo& w : working) {
+        auto it = by_id.find(w.source_id);
+        if (it == by_id.end()) continue;
+        Source* src = it->second;
+        for (LayerInfo& L : src->layers) {
+            if (L.display_name == w.display_name) {
+                L.included = w.included;
+                break;
+            }
         }
     }
 }
 
-// Reorder the active source's layers by display_name to match
-// `desired_order`. Called when the user drags rows in the Staging tab.
+// Reorder layers by display_name to match `desired_order`. With the
+// unified Staging table `desired_order` is a flat list across all
+// sources, so we scope the reorder per-source: each source's layers
+// vector is permuted to follow the order in which ITS rows appear in
+// `desired_order`. Cross-source drags don't migrate a layer between
+// sources — they just change the relative order within whichever
+// source the dragged row belongs to.
+void PublishLayerReorder(PanelState* state,
+                         const std::vector<std::string>& desired_order,
+                         const std::vector<uint32_t>& desired_source_ids)
+{
+    std::lock_guard<std::mutex> lk(state->mu);
+    if (desired_order.size() != desired_source_ids.size()) return;
+    // Per-source: list of display names in the order they appear in
+    // the unified working list.
+    std::unordered_map<uint32_t, std::vector<std::string>> per_src;
+    for (size_t i = 0; i < desired_order.size(); ++i) {
+        per_src[desired_source_ids[i]].push_back(desired_order[i]);
+    }
+    for (Source& src : state->sources) {
+        auto it = per_src.find(src.source_id);
+        if (it == per_src.end()) continue;
+        const std::vector<std::string>& order = it->second;
+        if (order.size() != src.layers.size()) continue;
+        std::unordered_map<std::string, size_t> idx;
+        idx.reserve(src.layers.size());
+        for (size_t i = 0; i < src.layers.size(); ++i) {
+            idx.emplace(src.layers[i].display_name, i);
+        }
+        std::vector<LayerInfo> reordered;
+        reordered.reserve(src.layers.size());
+        bool ok = true;
+        for (const std::string& nm : order) {
+            auto fi = idx.find(nm);
+            if (fi == idx.end()) { ok = false; break; }
+            reordered.push_back(src.layers[fi->second]);
+        }
+        if (ok) src.layers = std::move(reordered);
+    }
+}
+
+// Legacy single-arg overload (kept for now for any call site that
+// still treats Staging as single-source).
 void PublishLayerReorder(PanelState* state,
                          const std::vector<std::string>& desired_order)
 {
@@ -220,7 +318,6 @@ void PublishLayerReorder(PanelState* state,
     Source* src = ActiveSource(*state);
     if (!src) return;
     if (src->layers.size() != desired_order.size()) return;
-    // Build name -> current-index map, then permute.
     std::unordered_map<std::string, size_t> idx;
     idx.reserve(src->layers.size());
     for (size_t i = 0; i < src->layers.size(); ++i) {
@@ -238,8 +335,9 @@ void PublishLayerReorder(PanelState* state,
 
 // Re-scan the active source in place (same source_id) — used by the
 // preview-size buttons to regenerate thumbnails at the new
-// resolution. StartScan bumps scan_generation, so the renderer
-// releases the old thumbnail textures (no GPU/memory accumulation).
+// resolution. Routes via AddSourcePath so a movie source re-runs its
+// AE-render analysis instead of the OpenEXR scanner. (EXR re-scan
+// bumps scan_generation so the renderer frees old thumbnail textures.)
 void RequestActiveSourceRescan(PanelState* state)
 {
     if (!state || state->scanning.load()) return;
@@ -254,13 +352,17 @@ void RequestActiveSourceRescan(PanelState* state)
         sid   = s->source_id;
         frame = s->scan_frame;
     }
-    exr_scan::StartScan(path, state, /*append=*/true, sid, frame);
+    exr_scan::AddSourcePath(path, state, /*append=*/true, sid, frame);
 }
 
 // Buttons row above the preview: pick the preview RESOLUTION (which
 // is also its on-screen size — bigger res = bigger preview, the
-// user's mental model). Changing it regenerates thumbnails for the
-// active source. Default stays the small size.
+// user's mental model). Changing it regenerates thumbnails for
+// EVERY loaded source (multi-source preview composites need all
+// thumbs at a consistent size — the active-source-only rescan left
+// other sources at their old size, which leaked through as
+// missing/mismatched halves of e.g. Center Out symmetric pairs).
+// Default stays the small size.
 void DrawPreviewSizeButtons(PanelState* state, bool scanning)
 {
     static const int  kSizes[] = { 256, 384, 512, 768, 1024 };
@@ -275,12 +377,22 @@ void DrawPreviewSizeButtons(PanelState* state, bool scanning)
         ImGui::BeginDisabled(scanning);
         if (ImGui::SmallButton(kLabels[i])) {
             state->thumb_max_width = kSizes[i];
-            RequestActiveSourceRescan(state);  // regen at new res
+            // Queue every source for rescan; the Sources tab drains
+            // one per frame (StartScan refuses re-entry while one is
+            // running, so we serialise via pending_rescans).
+            std::lock_guard<std::mutex> lk(state->mu);
+            state->pending_rescans.clear();
+            for (const Source& s : state->sources) {
+                if (s.path.empty()) continue;
+                state->pending_rescans.push_back(
+                    { s.source_id, s.path, s.scan_frame });
+            }
         }
         ImGui::EndDisabled();
         if (cur) ImGui::PopStyleColor();
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%d px (regenerates thumbnails)", kSizes[i]);
+            ImGui::SetTooltip("%d px (regenerates thumbnails for all sources)",
+                              kSizes[i]);
         ImGui::SameLine();
     }
     ImGui::NewLine();
@@ -340,9 +452,13 @@ void DrawCentroidCanvas(const std::vector<LayerInfo>& layers,
     dl->AddLine(ImVec2(midx, origin.y), ImVec2(midx, max.y),
                 IM_COL32(48, 50, 56, 255));
 
+    // Per-row source_id: with the unified Staging table each
+    // LayerInfo carries its owning Source's id, so override matching
+    // uses L.source_id (not the function-scope `source_id`, which is
+    // now the active source — informational only).
     auto override_pos = [&](const LayerInfo& L, float& ox, float& oy) -> bool {
         for (const auto& po : overrides) {
-            if (po.layer.source_id == source_id &&
+            if (po.layer.source_id == L.source_id &&
                 po.layer.fnv1a_hash == L.fnv1a_hash) {
                 ox = po.cx;
                 oy = po.cy;
@@ -361,7 +477,7 @@ void DrawCentroidCanvas(const std::vector<LayerInfo>& layers,
     //   4. Scanned centroid
     auto effective_xy = [&](const LayerInfo& L, float& dx, float& dy) {
         if (state) {
-            LayerRef ref{ source_id, L.fnv1a_hash };
+            LayerRef ref{ L.source_id, L.fnv1a_hash };
             if (const Bind* b = BindOfLayer(*state, ref)) {
                 // Any-member override wins.
                 for (const auto& m : b->members) {
@@ -434,7 +550,10 @@ void DrawCentroidCanvas(const std::vector<LayerInfo>& layers,
                 // drags are disabled we still select on press so the
                 // click-to-pin preview works in the chase editor.
                 if (allow_drag) {
-                    state->drag_armed_source_id  = source_id;
+                    // Arm against the HIT dot's owning source so a
+                    // drag on a non-active-source layer still writes
+                    // the override to the right (source_id, hash).
+                    state->drag_armed_source_id  = layers[hit].source_id;
                     state->drag_armed_layer_hash = layers[hit].fnv1a_hash;
                     state->drag_armed_press_time = ImGui::GetTime();
                 }
@@ -517,7 +636,7 @@ void DrawCentroidCanvas(const std::vector<LayerInfo>& layers,
         const LayerInfo& L = layers[i];
         float dx, dy;
         if (state && state->drag_layer_hash == L.fnv1a_hash &&
-            state->drag_layer_source_id == source_id)
+            state->drag_layer_source_id == L.source_id)
         {
             dx = state->drag_cursor_x;
             dy = state->drag_cursor_y;
@@ -536,7 +655,7 @@ void DrawCentroidCanvas(const std::vector<LayerInfo>& layers,
         const LayerInfo& L = layers[selected_index];
         float dx, dy;
         if (state && state->drag_layer_hash == L.fnv1a_hash &&
-            state->drag_layer_source_id == source_id)
+            state->drag_layer_source_id == L.source_id)
         {
             dx = state->drag_cursor_x;
             dy = state->drag_cursor_y;
@@ -701,11 +820,14 @@ TableInteractionResult DrawLayersTable(std::vector<LayerInfo>& layers,
     ImGui::TableNextColumn();
     header_with_click("Z", TableCol::Z, "Click to sort by Z (mostly 0)");
 
-    // Build per-layer lookups for bind + tag membership.
+    // Build per-layer lookups for bind + tag membership. Each row
+    // matches against ITS OWN source_id (the unified Staging table
+    // mixes layers from every loaded source).
     auto bind_for = [&](const LayerInfo& L) -> const Bind* {
         for (const auto& b : binds) {
             for (const auto& m : b.members) {
-                if (m.source_id == source_id && m.fnv1a_hash == L.fnv1a_hash)
+                if (m.source_id == L.source_id &&
+                    m.fnv1a_hash == L.fnv1a_hash)
                     return &b;
             }
         }
@@ -715,7 +837,8 @@ TableInteractionResult DrawLayersTable(std::vector<LayerInfo>& layers,
         out.clear();
         for (const auto& t : tags) {
             for (const auto& m : t.members) {
-                if (m.source_id == source_id && m.fnv1a_hash == L.fnv1a_hash) {
+                if (m.source_id == L.source_id &&
+                    m.fnv1a_hash == L.fnv1a_hash) {
                     out.push_back(&t);
                     break;
                 }
@@ -809,10 +932,11 @@ TableInteractionResult DrawLayersTable(std::vector<LayerInfo>& layers,
         ImGui::TableNextColumn();
         ImGui::Checkbox("##on", &L.included);
 
-        // Source column (only when 2+ sources)
+        // Source column (only when 2+ sources). Shows each row's
+        // OWN source_id so the unified table is readable.
         if (show_source_col) {
             ImGui::TableNextColumn();
-            ImGui::TextDisabled("#%u", source_id);
+            ImGui::TextDisabled("#%u", L.source_id);
         }
 
         // Layer column (name + optional bind badge)
@@ -882,13 +1006,24 @@ TableInteractionResult DrawLayersTable(std::vector<LayerInfo>& layers,
     return r;
 }
 
-void DrawSkippedSection(PanelState* state, uint32_t source_id,
+void DrawSkippedSection(PanelState* state, uint32_t /*active_src*/,
                         const std::vector<SkippedLayer>& skipped)
 {
     if (skipped.empty()) return;
     std::string header = "Skipped (" + std::to_string(skipped.size()) +
                          ")  \xE2\x80\x94  click Include if a layer was "
                          "wrongly classified###skipped";
+    // Resolve source_id -> filename tail once so each row can name
+    // its source instead of just showing an opaque numeric id.
+    std::unordered_map<uint32_t, std::string> src_tail;
+    if (state) {
+        std::lock_guard<std::mutex> lk(state->mu);
+        for (const Source& src : state->sources) {
+            size_t p = src.path.find_last_of("/\\");
+            src_tail[src.source_id] = (p == std::string::npos)
+                ? src.path : src.path.substr(p + 1);
+        }
+    }
     if (ImGui::CollapsingHeader(header.c_str())) {
         for (size_t i = 0; i < skipped.size(); ++i) {
             const SkippedLayer& s = skipped[i];
@@ -903,11 +1038,19 @@ void DrawSkippedSection(PanelState* state, uint32_t source_id,
                 (s.reason != "not RGB-complete");
             ImGui::BeginDisabled(!includable || state == nullptr);
             if (ImGui::SmallButton("Include")) {
-                exr_scan::IncludeSkippedLayer(state, source_id, s.display_name);
+                // Use each row's OWN source_id (the unified Skipped
+                // list mixes every loaded source); active_src is
+                // ignored.
+                exr_scan::IncludeSkippedLayer(state, s.source_id,
+                                              s.display_name);
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
-            ImGui::Text("%s  \xE2\x80\x94  %s",
+            auto tit = src_tail.find(s.source_id);
+            const char* src_name = tit != src_tail.end()
+                ? tit->second.c_str() : "(unknown)";
+            ImGui::Text("[%s]  %s  \xE2\x80\x94  %s",
+                        src_name,
                         s.display_name.c_str(), s.reason.c_str());
             ImGui::PopID();
         }
@@ -918,10 +1061,28 @@ void DrawSkippedSection(PanelState* state, uint32_t source_id,
 
 void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
 {
-    ImGui::TextWrapped("Drag EXR or PNG files (from Explorer/Finder, "
-                       "or AE's Project panel) onto this panel to add "
-                       "sources. Switch which source the Staging tab "
-                       "focuses on with the Use buttons below.");
+    ImGui::TextWrapped("Drag EXR, PNG, movie (.mov/.mp4), or still-image "
+                       "files (from Explorer/Finder) onto this panel to add "
+                       "sources. Each movie or still becomes one light; a "
+                       "multilayer EXR contributes its light layers. To pull "
+                       "an item from AE's Project panel, select it and click "
+                       "\"Add active project item\" below (import a PNG "
+                       "sequence as a sequence in AE first to loop it). "
+                       "Switch the Staging tab's focus with the Use buttons.");
+    ImGui::Spacing();
+    if (ImGui::Button("Add active project item")) {
+        // Deferred to the idle hook (needs an AEGP context to read the
+        // active Project-panel item). Routes by type once it has a path.
+        state->want_add_active_item.store(true);
+        std::lock_guard<std::mutex> lk(state->mu);
+        state->last_status = "Adding active project item...";
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Adds the footage item currently selected in AE's "
+                          "Project panel. Stills come in as one light; movies "
+                          "and image sequences come in as loop-mode animation "
+                          "(read from the item — no checkbox needed).");
+    }
     ImGui::Spacing();
 
     if (snap.scanning) {
@@ -930,6 +1091,27 @@ void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
     } else if (!snap.last_error.empty()) {
         ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.45f, 1.f),
                            "%s", snap.last_error.c_str());
+    }
+
+    // Drain the "Rescan all" queue one source per frame. StartScan
+    // refuses re-entry while another scan is in flight, so we wait
+    // for the current scan to finish before kicking the next.
+    if (!snap.scanning) {
+        PanelState::PendingRescan p;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lk(state->mu);
+            if (!state->pending_rescans.empty()) {
+                p = state->pending_rescans.front();
+                state->pending_rescans.erase(
+                    state->pending_rescans.begin());
+                have = true;
+            }
+        }
+        if (have) {
+            exr_scan::AddSourcePath(p.path, state, /*append=*/true,
+                                    p.id, p.frame);
+        }
     }
 
     // Project settings — the ONE frame rate used by EVERY chase
@@ -975,12 +1157,56 @@ void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
         }
         ImGui::SameLine();
         ImGui::TextDisabled("applies on next scan");
+
+        // Rescan every source at once. Useful after a thumb-px change
+        // or when EXR files on disk have been re-rendered. Each
+        // source's existing scan_frame is preserved; identity
+        // (source_id) is reused so binds/tags/chases still resolve.
+        // Queue is drained serially at the top of this tab.
+        {
+            size_t pending_n = 0;
+            {
+                std::lock_guard<std::mutex> lk(state->mu);
+                pending_n = state->pending_rescans.size();
+            }
+            const bool disabled = snap.scanning || pending_n > 0 ||
+                                  snap.source_summaries.empty();
+            ImGui::BeginDisabled(disabled);
+            if (ImGui::Button("Rescan all")) {
+                std::lock_guard<std::mutex> lk(state->mu);
+                state->pending_rescans.clear();
+                for (const Source& s : state->sources) {
+                    if (s.path.empty()) continue;
+                    state->pending_rescans.push_back(
+                        { s.source_id, s.path, s.scan_frame });
+                }
+            }
+            ImGui::EndDisabled();
+            if (pending_n > 0) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("rescanning %zu source(s)...",
+                                    pending_n);
+            }
+        }
+
+        // Dedupe-by-name toggle. ON = identical display names across
+        // sources collapse to one row everywhere (Staging table,
+        // autotag, chase generators, AE build). Off = every layer
+        // counts as its own light. Re-runs autotag immediately so the
+        // tag set reflects the new filter.
+        bool dedupe = state->dedupe_by_name;
+        if (ImGui::Checkbox("Dedupe layers by name", &dedupe)) {
+            state->dedupe_by_name = dedupe;
+            AutotagByName(state);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("collapse same-named layers across sources");
     }
 
     ImGui::Spacing();
     if (snap.source_summaries.empty()) {
         ImGui::Dummy(ImVec2(0.f, 8.f));
-        ImGui::TextDisabled("No sources loaded yet. Drop an EXR/PNG anywhere on the panel.");
+        ImGui::TextDisabled("No sources loaded yet. Drop an EXR, PNG, or movie clip anywhere on the panel.");
         return;
     }
 
@@ -1035,12 +1261,21 @@ void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
             // / sort / thumbnails — the chase is the animation layered
             // on top, not the underlying scene motion.
             ImGui::TableNextColumn();
-            if (ss.frame_count > 1) {
+            if (ss.is_movie) {
+                // A movie is one self-contained clip; there's no
+                // per-frame scan to step (analysis always samples a
+                // representative frame). Show the clip length instead.
+                ImGui::TextDisabled("movie");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Movie clip — %d frame%s @ project fps",
+                                      ss.frame_count,
+                                      ss.frame_count == 1 ? "" : "s");
+            } else if (ss.frame_count > 1) {
                 const bool busy = snap.scanning;
                 ImGui::BeginDisabled(busy || ss.scan_frame <= 0);
                 if (ImGui::SmallButton("<")) {
-                    exr_scan::StartScan(ss.path, state, /*append=*/true,
-                                        ss.source_id, ss.scan_frame - 1);
+                    exr_scan::AddSourcePath(ss.path, state, /*append=*/true,
+                                            ss.source_id, ss.scan_frame - 1);
                 }
                 ImGui::EndDisabled();
                 ImGui::SameLine();
@@ -1051,8 +1286,8 @@ void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
                 ImGui::BeginDisabled(busy ||
                                      ss.scan_frame >= ss.frame_count - 1);
                 if (ImGui::SmallButton(">")) {
-                    exr_scan::StartScan(ss.path, state, /*append=*/true,
-                                        ss.source_id, ss.scan_frame + 1);
+                    exr_scan::AddSourcePath(ss.path, state, /*append=*/true,
+                                            ss.source_id, ss.scan_frame + 1);
                 }
                 ImGui::EndDisabled();
             } else {
@@ -1084,9 +1319,11 @@ void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
                 // In-place re-scan (same source_id) — picks up a new
                 // Preview thumb size and bumps scan_generation so the
                 // renderer releases the old thumbnail textures (no
-                // GPU/memory accumulation on repeated rescans).
-                exr_scan::StartScan(ss.path, state, /*append=*/true,
-                                    ss.source_id, ss.scan_frame);
+                // GPU/memory accumulation on repeated rescans). Routes
+                // via AddSourcePath so a movie re-runs AE-render
+                // analysis instead of the OpenEXR scanner.
+                exr_scan::AddSourcePath(ss.path, state, /*append=*/true,
+                                        ss.source_id, ss.scan_frame);
             }
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered())
@@ -1118,7 +1355,7 @@ void DrawStagingTab(PanelState* state, FrameSnapshot& snap, float w, float h)
 {
     if (snap.layers.empty()) {
         ImGui::Dummy(ImVec2(0.f, 8.f));
-        ImGui::TextDisabled("Active source has no layers yet. Add an EXR in the Sources tab.");
+        ImGui::TextDisabled("Active source has no layers yet. Add an EXR, PNG, or movie clip in the Sources tab.");
         if (!snap.skipped.empty()) {
             DrawSkippedSection(state, snap.active_source_id, snap.skipped);
         }
@@ -1333,9 +1570,14 @@ void DrawStagingTab(PanelState* state, FrameSnapshot& snap, float w, float h)
         if (target > (int)snap.layers.size()) target = (int)snap.layers.size();
         snap.layers.insert(snap.layers.begin() + target, std::move(moved));
         std::vector<std::string> order;
+        std::vector<uint32_t>    sids;
         order.reserve(snap.layers.size());
-        for (const auto& L : snap.layers) order.push_back(L.display_name);
-        PublishLayerReorder(state, order);
+        sids.reserve(snap.layers.size());
+        for (const auto& L : snap.layers) {
+            order.push_back(L.display_name);
+            sids.push_back(L.source_id);
+        }
+        PublishLayerReorder(state, order, sids);
     }
 
     // ---- Keyboard nav ----
@@ -1357,10 +1599,14 @@ void DrawStagingTab(PanelState* state, FrameSnapshot& snap, float w, float h)
             if (tgt >= 0 && tgt < n) {
                 std::swap(snap.layers[cur], snap.layers[tgt]);
                 std::vector<std::string> order;
+                std::vector<uint32_t>    sids;
                 order.reserve(n);
-                for (const auto& L : snap.layers)
+                sids.reserve(n);
+                for (const auto& L : snap.layers) {
                     order.push_back(L.display_name);
-                PublishLayerReorder(state, order);
+                    sids.push_back(L.source_id);
+                }
+                PublishLayerReorder(state, order, sids);
                 state->selected_hash = snap.layers[tgt].fnv1a_hash;
             }
         } else if (!ctrl && (up || down)) {
@@ -1421,7 +1667,7 @@ void DrawStagingTab(PanelState* state, FrameSnapshot& snap, float w, float h)
             // Mirror the drag cursor onto the thumbnail so the user
             // sees where they're placing the override in image space.
             if (state->drag_layer_hash == L.fnv1a_hash &&
-                state->drag_layer_source_id == snap.active_source_id)
+                state->drag_layer_source_id == L.source_id)
             {
                 const float gx = img_p_min.x + state->drag_cursor_x * tw;
                 const float gy = img_p_min.y + state->drag_cursor_y * th;
@@ -1483,9 +1729,29 @@ void DrawStagingTab(PanelState* state, FrameSnapshot& snap, float w, float h)
     }
     if (ImGui::BeginPopup("row_actions")) {
         // Collect the active selection as a set of LayerRefs.
+        // selected_hashes is still a raw uint32_t set (deferred
+        // refactor — see project_multi_source_unification.md), so
+        // resolve each hash to its owning source_id by scanning the
+        // unified snapshot. If a hash matches layers in multiple
+        // sources we add a ref for EACH — keeps bulk actions
+        // hitting every visible row with that hash.
         std::vector<LayerRef> sel_refs;
         for (uint32_t h : state->selected_hashes) {
-            sel_refs.push_back(LayerRef{ snap.active_source_id, h });
+            bool any = false;
+            for (const LayerInfo& L : snap.layers) {
+                if (L.fnv1a_hash == h) {
+                    sel_refs.push_back(LayerRef{ L.source_id, h });
+                    any = true;
+                }
+            }
+            // Fallback when the hash isn't visible in the unified
+            // snapshot (concurrent rescan / hidden source) — keep
+            // the legacy behavior of stamping the active source so
+            // we don't silently drop the operation.
+            if (!any) {
+                sel_refs.push_back(
+                    LayerRef{ snap.active_source_id, h });
+            }
         }
         // Expand any bound member to include all its bind siblings —
         // tag / bind / override operations act on the whole bind.
@@ -1637,9 +1903,69 @@ void DrawStagingTab(PanelState* state, FrameSnapshot& snap, float w, float h)
                 ImGui::EndMenu();
             }
 
+            // ---- "Use this source for [name]" — per-name dedupe
+            //      winner override. Visible whenever this display
+            //      name appears in 2+ loaded sources, regardless of
+            //      the dedupe-by-name toggle (so the user can
+            //      author the preference before flipping dedupe on).
+            //      Single-row only. Persisted in
+            //      state.preferred_source_per_name. ----
+            if (N == 1 && focus_L) {
+                // Collect every source_id that has a layer with
+                // this display name. (Done under lock so we get a
+                // consistent snapshot of state->sources.)
+                std::vector<std::pair<uint32_t, std::string>> candidates;
+                std::string name = focus_L->display_name;
+                {
+                    std::lock_guard<std::mutex> lk(state->mu);
+                    for (const Source& src : state->sources) {
+                        for (const LayerInfo& Ls : src.layers) {
+                            if (Ls.display_name == name) {
+                                // Path tail for the menu label.
+                                size_t p = src.path.find_last_of("/\\");
+                                std::string tail = (p == std::string::npos)
+                                    ? src.path : src.path.substr(p + 1);
+                                candidates.emplace_back(src.source_id,
+                                                        std::move(tail));
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (candidates.size() >= 2) {
+                    if (ImGui::BeginMenu("Use this source for this name...")) {
+                        uint32_t current = 0;
+                        {
+                            std::lock_guard<std::mutex> lk(state->mu);
+                            auto it = state->preferred_source_per_name.find(name);
+                            if (it != state->preferred_source_per_name.end())
+                                current = it->second;
+                        }
+                        for (const auto& kv : candidates) {
+                            char buf[256];
+                            std::snprintf(buf, sizeof(buf), "%s %s  (src #%u)",
+                                kv.first == current ? "\xE2\x97\x8F" : "  ",
+                                kv.second.c_str(), kv.first);
+                            if (ImGui::MenuItem(buf)) {
+                                std::lock_guard<std::mutex> lk(state->mu);
+                                state->preferred_source_per_name[name] = kv.first;
+                            }
+                        }
+                        ImGui::Separator();
+                        if (ImGui::MenuItem("Auto (highest total)")) {
+                            std::lock_guard<std::mutex> lk(state->mu);
+                            state->preferred_source_per_name.erase(name);
+                        }
+                        ImGui::EndMenu();
+                    }
+                }
+            }
+
             // ---- Position override (single-row only) ----
             if (N == 1 && focus_L) {
-                LayerRef ref{ snap.active_source_id, focus_L->fnv1a_hash };
+                // focus_L's source_id is set by the unified snapshot;
+                // build the ref from it (not from active_source_id).
+                LayerRef ref{ focus_L->source_id, focus_L->fnv1a_hash };
                 if (ImGui::BeginMenu("Position override...")) {
                     PositionOverride* found = nullptr;
                     for (auto& po : state->position_overrides) {
@@ -1782,26 +2108,28 @@ inline bool IntSlider(const char* label, int& value,
     }
     return false;
 }
-
 // ===== Chase preview compositing ======================================
 
 // Defined later; the wrapped (seamless-loop) triangle envelope.
-float ScatterHitEnvelope(float playhead, float start, int loop_frames,
+float ScatterHitEnvelope(float playhead, float start, float loop_frames,
                          const ChaseTiming& t);
 
 // Envelope value (0..1) for a stage at the given playhead frame.
-// Linear triangle: rises from 0 at stage_start to 1 at attack, falls
-// back to 0 at duration. Returns 0 when the stage is inactive.
+// Shape: linear ramp up over `attack` frames, hold at peak for
+// `hold` frames, linear ramp down for `duration - attack` frames.
+// Total hit length = duration + hold. Returns 0 outside the hit.
 float StageEnvelope(int stage_idx, float playhead, const ChaseTiming& t)
 {
+    const float hold = std::max(0.f, t.hold);
+    const float total = t.duration + hold;
     const float stage_start = stage_idx * t.step_duration;
     const float local_t = playhead - stage_start;
-    if (local_t < 0.f || local_t >= t.duration) return 0.f;
-    const float dur = std::max(0.001f, t.duration);
-    const float t01 = local_t / dur;
-    float peak = std::max(0.001f, std::min(0.999f, t.attack / dur));
-    if (t01 < peak) return t01 / peak;
-    return (1.f - t01) / (1.f - peak);
+    if (local_t < 0.f || local_t >= total) return 0.f;
+    const float att = std::max(0.001f, std::min(t.attack, t.duration - 0.001f));
+    if (local_t < att) return local_t / att;                 // rising
+    if (local_t < att + hold) return 1.f;                    // holding
+    const float fall_len = std::max(0.001f, t.duration - att);
+    return (total - local_t) / fall_len;                     // falling
 }
 
 // Total chase duration in frames: when the last stage's release ends.
@@ -1820,9 +2148,52 @@ float ChaseStageEnvelopeAt(const Chase& chase, size_t si, float playhead,
 {
     const size_t n = chase.stages.size();
     if (loop_frames > 0 && n > 0) {
-        const float phase = static_cast<float>(si) *
-            (static_cast<float>(loop_frames) / static_cast<float>(n));
-        return ScatterHitEnvelope(playhead, phase, loop_frames, chase.timing);
+        // `loop_cycles` repeats the chase pattern INSIDE the comp
+        // loop (the inverse of loop_multiple, which makes the comp
+        // longer). Cycles=2 = chase sweeps twice per loop. We
+        // implement it by wrapping the envelope with a shorter
+        // period = loop_frames / cycles — the triangle then tiles
+        // `cycles` times automatically across [0, loop_frames).
+        const int cy = chase.loop_cycles < 1 ? 1 : chase.loop_cycles;
+        // FRACTIONAL period — must match the builder's
+        // `loopL / cycles` (double) exactly. Integer truncation here
+        // (e.g. 179/8 = 22 instead of 22.375) would make the envelope
+        // wrap on a SHORTER period than the actual loop, causing the
+        // preview to visibly start a new cycle a few frames before
+        // the loop boundary (the "chase starts from left at frame
+        // 176-177 then black at 178" jitter).
+        const float period = static_cast<float>(loop_frames) /
+                             static_cast<float>(cy);
+        // Master offset shifts every stage's start time by the same
+        // amount inside the period. Wrap is handled by
+        // ScatterHitEnvelope's fmod, so order + cycle behavior is
+        // preserved automatically.
+        float off = static_cast<float>(chase.loop_offset);
+        if (period > 0.f) {
+            off = std::fmod(off, period);
+            if (off < 0.f) off += period;
+        } else {
+            off = 0.f;
+        }
+        // Stages evenly spaced across the FULL cycle period.
+        // step = period / n = loop_frames / (n * cycles) — the
+        // distance between consecutive hits anywhere in the loop.
+        // With env_d <= step the chase has "no tail" (each hit ends
+        // before the next starts); with env_d > step hits overlap.
+        // Either is a valid user choice — we just expose evenly-
+        // spaced phases and let env_d control hit shape.
+        //
+        // Seamless loop is GUARANTEED by env_at's periodicity (with
+        // period * cycles == loop_frames exactly), so frame
+        // loop_frames-1 naturally flows into frame 0 of the next
+        // iteration just like any other 1-frame transition. We
+        // explicitly do NOT pin frame loop_frames-1 to env(0): that
+        // would make AE play two consecutive frames with the same
+        // value — a 2-frame freeze every loop iteration. The
+        // natural-period sampling IS the seamless behavior.
+        const float step = period / static_cast<float>(n);
+        const float phase = static_cast<float>(si) * step + off;
+        return ScatterHitEnvelope(playhead, phase, period, chase.timing);
     }
     return StageEnvelope(static_cast<int>(si), playhead, chase.timing);
 }
@@ -1861,19 +2232,47 @@ bool LightenComposite(const std::vector<CompositeContribution>& contribs,
     for (const auto& c : contribs) {
         const LayerInfo* L = c.L;
         if (!L || L->thumb_rgba.empty()) continue;
-        if (L->thumb_w != out_w || L->thumb_h != out_h) continue;
+        if (L->thumb_w <= 0 || L->thumb_h <= 0) continue;
         if (c.k <= 0.f) continue;
         // thumb byte = sqrt(linear / thumb_peak) * 255, so
         // linear / shared_peak = (byte/255)^2 * thumb_peak/shared_peak.
         const float lp = L->thumb_peak > 0.f ? L->thumb_peak : 1.f;
         const float scale = (lp / sp) * c.k;
         const uint8_t* s = L->thumb_rgba.data();
-        for (size_t i = 0; i < n; ++i) {
-            for (int ch = 0; ch < 3; ++ch) {
-                const float u = s[i * 4 + ch] * (1.f / 255.f);
-                const float lin = u * u * scale;
-                float& a = acc[i * 3 + ch];
-                if (lin > a) a = lin;              // Lighten
+        // Same-size fast path; otherwise nearest-neighbour resample
+        // into the output canvas. Layers from different sources may
+        // disagree on thumb_w/thumb_h (different scan-time
+        // thumb_max_width, or different EXR aspect ratios). Dropping
+        // those silently was hiding one half of e.g. Center Out
+        // symmetric pairs whose partners lived in another source.
+        // Nearest-neighbor is good enough — these are preview
+        // thumbnails (~256 px), and centroids are normalized so the
+        // sources cover the same image region in [0,1].
+        if (L->thumb_w == out_w && L->thumb_h == out_h) {
+            for (size_t i = 0; i < n; ++i) {
+                for (int ch = 0; ch < 3; ++ch) {
+                    const float u = s[i * 4 + ch] * (1.f / 255.f);
+                    const float lin = u * u * scale;
+                    float& a = acc[i * 3 + ch];
+                    if (lin > a) a = lin;          // Lighten
+                }
+            }
+        } else {
+            const int sw = L->thumb_w;
+            const int sh = L->thumb_h;
+            for (int y = 0; y < out_h; ++y) {
+                const int sy = (y * sh) / out_h;
+                for (int x = 0; x < out_w; ++x) {
+                    const int sx = (x * sw) / out_w;
+                    const uint8_t* p = s + (sy * sw + sx) * 4;
+                    const size_t di = static_cast<size_t>(y) * out_w + x;
+                    for (int ch = 0; ch < 3; ++ch) {
+                        const float u = p[ch] * (1.f / 255.f);
+                        const float lin = u * u * scale;
+                        float& a = acc[di * 3 + ch];
+                        if (lin > a) a = lin;      // Lighten
+                    }
+                }
             }
         }
     }
@@ -1922,8 +2321,14 @@ bool BuildChaseComposite(const Chase& chase, const PanelState& state,
     std::vector<CompositeContribution> contribs;
     for (size_t si = 0; si < chase.stages.size(); ++si) {
         float env = ChaseStageEnvelopeAt(chase, si, playhead, loop_frames);
-        if (env <= 0.f) continue;
-        const float opacity = (chase.timing.opacity_peak / 100.f) * env;
+        float op_pk = chase.timing.opacity_peak;
+        float op_fl = chase.timing.opacity_floor;
+        if (op_fl < 0.f) op_fl = 0.f;
+        if (op_fl > op_pk) op_fl = op_pk;
+        // With a floor, a light at env=0 still sits at the floor, so we
+        // can't skip inactive stages. Keep the fast path when floor=0.
+        if (env <= 0.f && op_fl <= 0.f) continue;
+        const float opacity = (op_fl + (op_pk - op_fl) * env) / 100.f;
         const float gamma_t = chase.timing.gamma_baseline +
             (chase.timing.gamma_peak - chase.timing.gamma_baseline) * env;
         const float k = opacity * gamma_t;
@@ -2001,26 +2406,33 @@ void RegenerateChaseStages(Chase& chase, const PanelState& state,
     // it survives the per-frame refresh and session round-trips.
     if (chase.manual_stages) return;
     chase.stages.clear();
-    const Source* src = ActiveSource(state);
-    if (!src) return;
-    // Gather candidates from the active source filtered by tags.
+    if (state.sources.empty()) return;
+    // Gather candidates from EVERY source (multi-source chases pull
+    // from the whole session). Tag filter is session-wide and
+    // already keyed by (source_id, hash), so it works unchanged.
+    const auto dedupe_keep = BuildDedupeKeepSet(state);
+    const bool dedupe_on   = state.dedupe_by_name;
     std::vector<LayerRef> candidates;
-    for (const auto& L : src->layers) {
-        if (!L.included) continue;
-        LayerRef ref{ src->source_id, L.fnv1a_hash };
-        if (!chase.tag_filter.empty()) {
-            bool in_any = false;
-            for (uint32_t tid : chase.tag_filter) {
-                if (const Tag* t = FindTagById(state, tid)) {
-                    for (const auto& m : t->members) {
-                        if (m == ref) { in_any = true; break; }
+    for (const Source& src : state.sources) {
+        for (const auto& L : src.layers) {
+            if (!L.included) continue;
+            if (!DedupeKeeps(dedupe_keep, dedupe_on,
+                             src.source_id, L.fnv1a_hash)) continue;
+            LayerRef ref{ src.source_id, L.fnv1a_hash };
+            if (!chase.tag_filter.empty()) {
+                bool in_any = false;
+                for (uint32_t tid : chase.tag_filter) {
+                    if (const Tag* t = FindTagById(state, tid)) {
+                        for (const auto& m : t->members) {
+                            if (m == ref) { in_any = true; break; }
+                        }
+                        if (in_any) break;
                     }
-                    if (in_any) break;
                 }
+                if (!in_any) continue;
             }
-            if (!in_any) continue;
+            candidates.push_back(ref);
         }
-        candidates.push_back(ref);
     }
     // Sort candidates per chase.sort_mode. Done over the LayerInfo
     // lookups, not a copy of LayerInfo, for clarity.
@@ -2157,18 +2569,20 @@ void RegenerateChaseStages(Chase& chase, const PanelState& state,
 
 // Envelope (0..1) of a scattered hit at `playhead`, seamless-wrapped:
 // a hit whose tail crosses the loop end re-enters at the start.
-float ScatterHitEnvelope(float playhead, float start, int loop_frames,
+float ScatterHitEnvelope(float playhead, float start, float loop_frames,
                          const ChaseTiming& t)
 {
-    float local = std::fmod(playhead - start,
-                            static_cast<float>(loop_frames));
-    if (local < 0.f) local += static_cast<float>(loop_frames);
-    if (local >= t.duration) return 0.f;
-    const float dur  = std::max(0.001f, t.duration);
-    const float t01  = local / dur;
-    const float peak = std::max(0.001f, std::min(0.999f, t.attack / dur));
-    if (t01 < peak) return t01 / peak;
-    return (1.f - t01) / (1.f - peak);
+    if (loop_frames <= 0.f) return 0.f;
+    const float hold  = std::max(0.f, t.hold);
+    const float total = t.duration + hold;
+    float local = std::fmod(playhead - start, loop_frames);
+    if (local < 0.f) local += loop_frames;
+    if (local >= total) return 0.f;
+    const float att = std::max(0.001f, std::min(t.attack, t.duration - 0.001f));
+    if (local < att) return local / att;                     // rising
+    if (local < att + hold) return 1.f;                      // holding
+    const float fall_len = std::max(0.001f, t.duration - att);
+    return (total - local) / fall_len;                       // falling
 }
 
 // Composite a scatter chase at `playhead` (loop-relative frames).
@@ -2195,8 +2609,14 @@ bool BuildScatterComposite(const Chase& chase, const PanelState& state,
     for (const auto& hit : chase.scatter) {
         const float env = ScatterHitEnvelope(playhead, hit.start_frame,
                                               loop_frames, chase.timing);
-        if (env <= 0.f) continue;
-        const float opacity = (chase.timing.opacity_peak / 100.f) * env;
+        float op_pk = chase.timing.opacity_peak;
+        float op_fl = chase.timing.opacity_floor;
+        if (op_fl < 0.f) op_fl = 0.f;
+        if (op_fl > op_pk) op_fl = op_pk;
+        // With a floor every hit holds the light at >= floor, so don't
+        // skip troughs; Lighten max-combines duplicate floor contribs.
+        if (env <= 0.f && op_fl <= 0.f) continue;
+        const float opacity = (op_fl + (op_pk - op_fl) * env) / 100.f;
         const float gamma_t = chase.timing.gamma_baseline +
             (chase.timing.gamma_peak - chase.timing.gamma_baseline) * env;
         const float k = opacity * gamma_t;
@@ -2259,13 +2679,13 @@ std::string BuildChaseExportJson(const Chase& chase, const PanelState& state)
 }
 
 // ===== Chase tab + wizard =============================================
-
 const char* kChaseTemplateNames[] = {
     "Left to Right",
     "Top to Bottom",
     "Center Out",
     "3 Step Chase",
     "Random",
+    "Hit",
     "Custom",
 };
 
@@ -2309,7 +2729,20 @@ void ApplyTemplateToChase(Chase& c, int template_idx)
         c.random_seed = rd();
         break;
     }
-    case 5: default: break; // custom — leave as-is
+    case 5:
+        // Hit: one stage with ALL lights firing together exactly
+        // once. In loop-mode the envelope sits at phase 0 and the
+        // wrapped triangle is 0 outside [0, hit_duration), so it
+        // plays once at the start then stays black for the rest of
+        // the loop — "black to black", no looping/wrapping in the
+        // animation. Cycles forced to 1 so a cycle setting carried
+        // over from another template doesn't repeat the hit.
+        c.sort_mode = SortMode::HotspotX;
+        c.sort_reverse = false;
+        c.desired_stage_count = 1;     // 1 chunk = all lights in one stage
+        c.loop_cycles = 1;             // exactly one hit per loop
+        break;
+    case 6: default: break; // custom — leave as-is
     }
 }
 
@@ -2397,7 +2830,7 @@ void DrawWizardForChaseTab(PanelState* state, FrameSnapshot& snap, int chase_ind
     ImGui::EndChild();
 
     ImGui::SetNextItemWidth(220.f);
-    FrameSlider("Hit duration", state->wizard_hit_duration, 1, 240, 30);
+    FrameSlider("Hit duration", state->wizard_hit_duration, 1, 600, 30);
     ImGui::SetNextItemWidth(220.f);
     FrameSlider("Step duration", state->wizard_step_duration, 1, 120, 4);
 
@@ -2592,10 +3025,13 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     bool t_changed = false;
     const float slider_w = 150.f;
     ImGui::SetNextItemWidth(slider_w);
-    if (FrameSlider("Hit Duration", t.duration, 1, 240, 30)) t_changed = true;
+    if (FrameSlider("Hit Duration", t.duration, 1, 600, 30)) t_changed = true;
     ImGui::SameLine();
     ImGui::SetNextItemWidth(slider_w);
     if (FrameSlider("Hit Attack", t.attack, 0, static_cast<int>(t.duration), 5)) t_changed = true;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(slider_w);
+    if (FrameSlider("Hit Hold", t.hold, 0, 600, 0)) t_changed = true;
     ImGui::SameLine();
     ImGui::SetNextItemWidth(slider_w);
     const bool loop_mode = ChaseLoopMode(*state);
@@ -2608,18 +3044,54 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
         if (IntSlider("Source loops", loop_mult, 1, 60, 1)) t_changed = true;
         if (loop_mult < 1) loop_mult = 1;
         cs.loop_multiple = loop_mult;
+        // Cycles = inverse of Source loops: how many times the
+        // chase pattern repeats INSIDE the comp loop. 1 = one sweep
+        // (default); 2..10 = 2..10 sweeps per loop.
+        int loop_cyc = cs.loop_cycles < 1 ? 1 : cs.loop_cycles;
+        if (IntSlider("Cycles", loop_cyc, 1, 50, 1)) t_changed = true;
+        if (loop_cyc < 1) loop_cyc = 1;
+        cs.loop_cycles = loop_cyc;
         const int   lf  = ChaseLoopFrames(cs, *state, 0.f);
-        const int   per = loop_mult > 0 ? lf / loop_mult : lf;
+        const int   per_src = loop_mult > 0 ? lf / loop_mult : lf;
         const size_t n  = cs.stages.empty() ? 1 : cs.stages.size();
-        const float derived_step = static_cast<float>(lf) /
-                                   static_cast<float>(n);
+        const float cyc_period   = static_cast<float>(lf) /
+                                   static_cast<float>(loop_cyc);
+        const float derived_step = cyc_period / static_cast<float>(n);
         t.step_duration = derived_step;
-        // Step is auto (loop / stages) in loop-mode — shown read-only
-        // here, no overflowing disabled slider.
+        // Master offset: shift the first beat anywhere inside the
+        // cycle period. Wraps seamlessly, so the chase still loops
+        // and respects the cycle count. Slider range = [0, period-1]
+        // — beyond that just repeats. Clamp/wrap on commit.
+        const int per_int  = static_cast<int>(cyc_period + 0.5f);
+        const int max_off  = per_int > 0 ? per_int - 1 : 0;
+        int loop_off = cs.loop_offset;
+        if (per_int > 0) {
+            loop_off %= per_int;
+            if (loop_off < 0) loop_off += per_int;
+        } else {
+            loop_off = 0;
+        }
+        if (IntSlider("Master offset", loop_off, 0, max_off, 0)) {
+            t_changed = true;
+        }
+        if (per_int > 0) {
+            loop_off %= per_int;
+            if (loop_off < 0) loop_off += per_int;
+        } else {
+            loop_off = 0;
+        }
+        cs.loop_offset = loop_off;
+        // Step is auto (period/stages = loop/(stages*cycles)).
+        // Stages fire at integer multiples of step; if user picks
+        // Duration <= step, hits have no tail. If > step, hits
+        // overlap. The trailing tip nudges them toward no-tail.
         ImGui::TextDisabled(
             "Seamless loop: %d-frame source \xC3\x97%d = %d f \xC2\xB7 "
-            "%zu stages \xC2\xB7 auto step %.2f f",
-            per, loop_mult, lf, n, derived_step);
+            "%d cycle(s) \xC2\xB7 %zu stages \xC2\xB7 auto step %.2f f "
+            "(set Duration \xE2\x89\xA4 %.2f for no tail) "
+            "\xC2\xB7 offset %d f",
+            per_src, loop_mult, lf, loop_cyc, n,
+            derived_step, derived_step, loop_off);
     } else {
         if (FrameSlider("Step", t.step_duration, 1, 120, 4)) t_changed = true;
     }
@@ -2630,6 +3102,15 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
         if (ImGui::SliderFloat("Opacity peak", &t.opacity_peak, 0.f, 100.f, "%.0f%%")) t_changed = true;
         if (MiddleClickReset(t.opacity_peak, 100.0f)) t_changed = true;
         ImGui::SameLine();
+        ImGui::SetNextItemWidth(slider_w);
+        // Floor: the trough the envelope bottoms out at (never below
+        // this %). Clamped to peak on apply. Loop mode = true global
+        // floor; still mode = where each trimmed hit fades to.
+        if (ImGui::SliderFloat("Opacity floor", &t.opacity_floor, 0.f, 100.f, "%.0f%%")) t_changed = true;
+        if (MiddleClickReset(t.opacity_floor, 0.0f)) t_changed = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Minimum ON%% the light bottoms out to "
+                              "(0 = fully off between hits).");
         ImGui::SetNextItemWidth(slider_w);
         if (ImGui::SliderFloat("Gamma peak", &t.gamma_peak, 0.01f, 4.f, "%.2f")) t_changed = true;
         if (MiddleClickReset(t.gamma_peak, 1.0f)) t_changed = true;
@@ -2649,6 +3130,8 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
             real.timing = t;
             real.desired_stage_count = desired;
             real.loop_multiple = cs.loop_multiple < 1 ? 1 : cs.loop_multiple;
+            real.loop_cycles   = cs.loop_cycles   < 1 ? 1 : cs.loop_cycles;
+            real.loop_offset   = cs.loop_offset   < 0 ? 0 : cs.loop_offset;
             state->default_timing = t;
         }
     }
@@ -2666,10 +3149,38 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     if (ImGui::Button(play_label)) state->chase_preview_playing = !state->chase_preview_playing;
     ImGui::SameLine();
     if (ImGui::Button("Reset")) state->chase_preview_frame = 0.f;
+    // -/+ step the playhead one whole frame at a time. Handy for
+    // checking exact frame values around the loop boundary or stage
+    // transitions when you can't tell from playback alone.
+    ImGui::SameLine();
+    if (ImGui::Button("-")) {
+        float f = state->chase_preview_frame - 1.f;
+        if (f < 0.f) f = std::max(0.f, total - 1.f);
+        state->chase_preview_frame = f;
+        state->chase_preview_playing = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+")) {
+        float f = state->chase_preview_frame + 1.f;
+        if (f >= total) f = 0.f;
+        state->chase_preview_frame = f;
+        state->chase_preview_playing = false;
+    }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(280.f);
-    bool scrub_used = ImGui::SliderFloat("##scrub", &state->chase_preview_frame,
-                       0.f, std::max(1.f, total), "frame %.1f");
+    // SliderFloat with integer-frame snapping: scrub at integer
+    // resolution so clicking the slider lands exactly on whole
+    // frames (no sub-frame fractional positions). The display
+    // format reads as a whole frame.
+    int scrub_frame = static_cast<int>(std::lround(state->chase_preview_frame));
+    const int total_frames_i = std::max(1, static_cast<int>(std::round(total)));
+    bool scrub_used = ImGui::SliderInt("##scrub", &scrub_frame,
+                       0, total_frames_i, "frame %d");
+    if (scrub_used) {
+        if (scrub_frame < 0) scrub_frame = 0;
+        if (scrub_frame > total_frames_i) scrub_frame = total_frames_i;
+        state->chase_preview_frame = static_cast<float>(scrub_frame);
+    }
     // Grabbing the timeline releases click-to-pin so the preview
     // follows the playhead in realtime instead of staying frozen on
     // the pinned light (the "scrubbing doesn't update" report).
@@ -3188,7 +3699,7 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
     ImGui::TextUnformatted("Density");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(150.f);
-    if (ImGui::SliderInt("##dens", &dens, 1, 12, "%d /light")) changed = true;
+    if (ImGui::SliderInt("##dens", &dens, 1, 25, "%d /light")) changed = true;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Copies of each light spread across the loop.");
     ImGui::TextUnformatted("Seed");
@@ -3213,10 +3724,13 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
     bool t_changed = false;
     const float sw = 150.f;
     ImGui::SetNextItemWidth(sw);
-    if (FrameSlider("Hit Duration", t.duration, 1, 240, 30)) t_changed = true;
+    if (FrameSlider("Hit Duration", t.duration, 1, 600, 30)) t_changed = true;
     ImGui::SameLine();
     ImGui::SetNextItemWidth(sw);
     if (FrameSlider("Hit Attack", t.attack, 0, static_cast<int>(t.duration), 5)) t_changed = true;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(sw);
+    if (FrameSlider("Hit Hold", t.hold, 0, 600, 0)) t_changed = true;
     // Opacity/gamma envelope tuned rarely — collapsed by default to
     // keep the common timing controls uncluttered.
     if (ImGui::TreeNode("Opacity / Gamma envelope")) {
@@ -3224,6 +3738,14 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
         if (ImGui::SliderFloat("Opacity peak", &t.opacity_peak, 0.f, 100.f, "%.0f%%")) t_changed = true;
         if (MiddleClickReset(t.opacity_peak, 100.0f)) t_changed = true;
         ImGui::SameLine();
+        ImGui::SetNextItemWidth(sw);
+        // Floor: the trough the envelope bottoms out at (never below
+        // this %). Clamped to peak on apply.
+        if (ImGui::SliderFloat("Opacity floor", &t.opacity_floor, 0.f, 100.f, "%.0f%%")) t_changed = true;
+        if (MiddleClickReset(t.opacity_floor, 0.0f)) t_changed = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Minimum ON%% the light bottoms out to "
+                              "(0 = fully off between hits).");
         ImGui::SetNextItemWidth(sw);
         if (ImGui::SliderFloat("Gamma peak", &t.gamma_peak, 0.01f, 4.f, "%.2f")) t_changed = true;
         if (MiddleClickReset(t.gamma_peak, 1.0f)) t_changed = true;
@@ -3261,6 +3783,20 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
         state->chase_preview_playing = !state->chase_preview_playing;
     ImGui::SameLine();
     if (ImGui::Button("Reset")) state->chase_preview_frame = 0.f;
+    ImGui::SameLine();
+    if (ImGui::Button("-")) {
+        float f = state->chase_preview_frame - 1.f;
+        if (f < 0.f) f = std::max(0.f, total - 1.f);
+        state->chase_preview_frame = f;
+        state->chase_preview_playing = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+")) {
+        float f = state->chase_preview_frame + 1.f;
+        if (f >= total) f = 0.f;
+        state->chase_preview_frame = f;
+        state->chase_preview_playing = false;
+    }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(280.f);
     int cm_sf = static_cast<int>(std::lround(state->chase_preview_frame));
