@@ -153,6 +153,13 @@ enum class SortMode : int {
     TagName,              // alphabetical by first tag's name, untagged last
     EffectiveX,           // by override-aware X
     EffectiveY,           // by override-aware Y
+    // Order by the single brightest pixel. peak_x/peak_y have been
+    // computed for every layer since the first scan and, until now,
+    // nothing read them. Sharper than the hotspot centroid and more
+    // noise-sensitive — a third choice of "where is this light", not a
+    // replacement. APPEND ONLY: sort_mode is persisted as an int.
+    PeakX,
+    PeakY,
 };
 
 // Stable reference to a layer across a session: (source_id, layer
@@ -291,9 +298,30 @@ struct Chase {
     // `random_seed`. When true, sort_mode / desired_stage_count /
     // symmetric_pairs / manual_stages / stages are all ignored;
     // `scatter` is the cached output (regenerated each frame).
+    // A chunked chase (3 Step) REPEATS instead of ending in black: the
+    // chunks keep firing `step_duration` apart forever, so the repeat
+    // period is `stages * step_duration`. Because the hit outlasts the
+    // step, the last chunk's tail hangs past that point and wraps
+    // round to the start — the same seamless behaviour Random has, and
+    // the only thing that distinguishes a 3 Step from a one-shot
+    // sweep. Its length still comes from the hit and the overlap, NOT
+    // from the 10-second scatter convention.
+    bool                    loops = false;
+    // Chunk the lights by AUTO-TAG rather than as contiguous blocks of
+    // the sort order: divide EACH tag by the chunk count so every tag
+    // is represented in every chunk (David: "if there's a
+    // StringLights_A, b and c I need those to be in all 3 chunks
+    // each"). Uneven divisions are settled by brightness so the chunks
+    // end up as evenly lit as possible. Set by the 3 Step template;
+    // the Advanced editor's Chunks stays the contiguous split.
+    bool                    tag_balanced_chunks = false;
+
     bool                    random_scatter = false;
     float                   loop_seconds   = 10.0f;
-    int                     scatter_density = 5;
+    // Copies of each light across the loop. FRACTIONAL: below 1
+    // there are fewer slots than lights, so some sit the loop out
+    // — the only way a large rig with a long hit gets sparse.
+    float                   scatter_density = 5.f;
     std::vector<ScatterHit> scatter;
     // Loop-mode only (animation source): the chase loop spans this
     // many WHOLE source durations. Integer ≥ 1 by construction, so
@@ -324,6 +352,7 @@ struct Chase {
 enum class PanelTab : int {
     Sources = 0,
     Staging,
+    Review,       // the contact sheet: every chase at once
     Chase,        // active_chase_index selects which chase
 };
 
@@ -355,6 +384,11 @@ inline bool operator==(const ChaseStage& a, const ChaseStage& b) {
 inline bool operator==(const ScatterHit& a, const ScatterHit& b) {
     return a.ref == b.ref && a.start_frame == b.start_frame;
 }
+// Compares what the artist AUTHORED. `scatter`, and `stages` unless
+// hand-arranged, are caches the editors regenerate every frame; counting
+// them made merely opening a chase an undo step, and undoing that step
+// restored a stale cache that the next frame regenerated — pushing a
+// fresh step and wiping redo, so Ctrl+Z appeared to go back only once.
 inline bool operator==(const Chase& a, const Chase& b) {
     return a.chase_id == b.chase_id && a.name == b.name &&
            a.sort_mode == b.sort_mode && a.sort_reverse == b.sort_reverse &&
@@ -363,14 +397,16 @@ inline bool operator==(const Chase& a, const Chase& b) {
            a.symmetric_pairs == b.symmetric_pairs &&
            a.manual_stages == b.manual_stages &&
            a.tag_filter == b.tag_filter &&
-           a.stages == b.stages && a.timing == b.timing &&
+           (!a.manual_stages || a.stages == b.stages) &&
+           a.timing == b.timing &&
            a.random_scatter == b.random_scatter &&
+           a.loops == b.loops &&
+           a.tag_balanced_chunks == b.tag_balanced_chunks &&
            a.loop_seconds == b.loop_seconds &&
            a.scatter_density == b.scatter_density &&
            a.loop_multiple == b.loop_multiple &&
            a.loop_cycles == b.loop_cycles &&
-           a.loop_offset == b.loop_offset &&
-           a.scatter == b.scatter;
+           a.loop_offset == b.loop_offset;
 }
 
 // ===== Undo snapshot ==================================================
@@ -423,15 +459,16 @@ struct UndoSnapshot {
     uint32_t                          next_tag_id = 1;
     uint32_t                          next_chase_id = 1;
 };
+// Navigation (active tab / chase / source, wizard open) is deliberately
+// NOT compared: moving around is not an edit, and counting it as one
+// made Ctrl+Z spend presses flipping tabs back (David, 2026-09-26). It
+// is still captured and restored, so an undo lands you on the tab
+// where the undone edit was made.
 inline bool operator==(const UndoSnapshot& a, const UndoSnapshot& b) {
     return a.sources == b.sources && a.binds == b.binds &&
            a.tags == b.tags && a.position_overrides == b.position_overrides &&
            a.chases == b.chases && a.sort_mode == b.sort_mode &&
            a.sort_reverse == b.sort_reverse && a.random_seed == b.random_seed &&
-           a.active_source_index == b.active_source_index &&
-           a.active_tab == b.active_tab &&
-           a.active_chase_index == b.active_chase_index &&
-           a.chase_in_wizard == b.chase_in_wizard &&
            a.default_timing == b.default_timing &&
            a.hide_unchecked == b.hide_unchecked &&
            a.next_source_id == b.next_source_id &&
@@ -547,6 +584,21 @@ struct PanelState {
     // ---- Session file ----
     // Where the last load/save lives. Empty = unsaved.
     std::string                   session_save_path;
+    // ---- Export naming ----
+    // Built comps are named "<prefix>_<ChaseName>_v<N>", e.g.
+    // "USC_CatTowers_LeftToRight_v1". Asked for on every export,
+    // prefilled with whatever was used last (or the AE project name).
+    std::string                   export_prefix;
+    // Split each chase into one comp per lightgroup on export, plus an
+    // assemble comp that stacks them. Export-only: the chase itself is
+    // unchanged.
+    bool                          export_split_groups = false;
+    // The export the prefix dialog is arming: -2 none, -1 all chases,
+    // >= 0 that one chase.
+    int                           export_pending_index = -2;
+    // Focus the prefix field on the frame the dialog opens, and only
+    // then: re-grabbing focus every frame eats clicks on its buttons.
+    bool                          export_focus_field = false;
     std::atomic<bool>             want_save_session{false};
     std::atomic<bool>             want_load_session{false};
     // AE project name (basename, no extension). Refreshed from the
@@ -555,6 +607,23 @@ struct PanelState {
     // idle tick has run. UI thread + idle hook both touch; guarded
     // by `mu`.
     std::string                   ae_project_name;
+    // ---- The session, stored in the .aep ----
+    // The AE project is the default store: the session rides along in
+    // an item comment rather than having to be loaded from a file every
+    // time. `project_session_key` is the project we last synced with,
+    // so switching projects in AE swaps the session with it.
+    std::string                   project_session_key;
+    // Something changed and has not been written to the project yet.
+    // Set by the same auto-snapshot pass that feeds undo.
+    std::atomic<bool>             session_dirty{false};
+    // Idle ticks since the last change — the write is debounced so a
+    // slider drag does not push a stack of AE undo steps.
+    int                           session_dirty_ticks = 0;
+    // Hash of what was last written, so an unchanged session never
+    // rewrites (each write IS an AE undo step).
+    uint64_t                      project_store_hash = 0;
+    // Human-readable result of the last store, shown in the toolbar.
+    std::string                   project_store_status;
 
     // "Rescan all" queue: a snapshot of (source_id, path, frame) per
     // source. Filled by the button; drained one entry per frame by
@@ -586,6 +655,14 @@ struct PanelState {
     // HandleDeferredActions. want_build_chase_index = -1 means idle.
     std::atomic<int>              want_build_chase_index{-1};
     std::atomic<bool>             want_build_all_chases{false};
+    // Chase indices queued by the Review tab's "Build checked". Drained
+    // one per idle tick through the same per-chase build path, so each
+    // lands as its own AE undo step (unlike Build-all, which is one).
+    std::vector<int>              build_queue;          // guarded by mu
+    std::atomic<bool>             want_build_queue{false};
+    // Set by the Review tab to pull the tab bar onto a chase; the tab
+    // bar clears it once it has taken effect.
+    int                           want_focus_chase_index = -1;
     // Status feedback from the last build for the UI to display.
     std::string                   last_build_status;
     // Last build ran but EXRDemux wasn't installed — drives a
@@ -602,6 +679,61 @@ struct PanelState {
     std::vector<uint32_t>         wizard_tag_filter;
     float                         wizard_step_duration = 4.0f;
     float                         wizard_hit_duration = 30.0f;
+
+    // ---- Standard-pack form state (transient, not persisted) ----
+    // Which scopes the next "Generate pack" covers: the whole scene
+    // and/or one pack per checked tag (the per-fixture-group families
+    // David used to hand-build one chase at a time).
+    bool                          pack_scope_all = true;
+    std::vector<uint32_t>         pack_scope_tags;
+    // Target concurrency for the generated timing — literally how many
+    // lights are lit at any instant (hit duration / step).
+    float                         pack_lights_on = 2.5f;
+    // Regenerating after trimming the included lights is the normal
+    // second pass, so replacing is the default; unticking appends.
+    bool                          pack_replace = true;
+    // How many lights the current scope selection covers, and a
+    // signature of that selection. CountEligibleLights runs the real
+    // stage generator, so it is recomputed only when the ticks change.
+    uint64_t                      pack_sel_sig = 0;
+    int                           pack_sel_count = 0;
+    // A tab the UI should switch to on the next frame (-1 = none).
+    // ImGui owns tab selection, so this is applied as a SetSelected
+    // flag when that tab is next drawn.
+    int                           want_tab = -1;
+    // ---- Review tab (the contact sheet) ----
+    // One transport PER CELL, keyed by chase_id: the chases in a set
+    // run different lengths, so a single shared position is arbitrary
+    // for all but one of them. `first` is the chase id, `second` the
+    // playhead in frames.
+    std::vector<std::pair<uint32_t, float>> sheet_playheads;
+    // Which cells are PAUSED. Stored as the exception so previews run
+    // the moment they appear — a generated set should be moving when
+    // you arrive, not waiting to be started one cell at a time.
+    std::vector<uint32_t>         sheet_paused_ids;
+    bool                          sheet_all_paused = false;   // pause-all
+    int                           sheet_cols = 3;
+    // Chase ids the user has UNCHECKED for building. Absent = build it;
+    // storing the exceptions means newly generated chases arrive
+    // checked without anything having to notice them.
+    std::vector<uint32_t>         sheet_unchecked;
+    // Last-composited signature, so a parked transport doesn't
+    // recomposite the grid every frame.
+    uint64_t                      sheet_sig = 0;
+    int                           sheet_t_key = -1;
+    // Grid layout of the last composited sheet, kept so the frames we
+    // skip can still draw it. Plain ints rather than the
+    // chase_gen::ContactSheetLayout struct, which lives in a header
+    // that includes this one.
+    int  sheet_count = 0, sheet_grid_cols = 0, sheet_grid_rows = 0;
+    int  sheet_cell_w = 0, sheet_cell_h = 0;
+    int  sheet_px_w = 0, sheet_px_h = 0;
+
+    // Live light counts per scope, refreshed when the popup opens (too
+    // costly to recompute every frame across many tags). `first` is a
+    // tag id, 0 for the whole scene. Counts resolvable lights only —
+    // tags can carry members whose source is long gone.
+    std::vector<std::pair<uint32_t, int>> pack_scope_counts;
 
     // Remembered defaults for new chases (last-used wins).
     ChaseTiming                   default_timing;
@@ -915,19 +1047,48 @@ inline const Source* SessionAnimationSource(const PanelState& state)
     return nullptr;
 }
 
-// True when ANY loaded source is an animation/sequence — chases run as
-// seamless loops over that source's duration instead of the shift-in-
-// time "from black" model used for pure-still sessions. Session-wide so
-// still lights mixed with movies loop too.
-inline bool ChaseLoopMode(const PanelState& state)
+// SOURCE ANIMATION. True when ANY loaded source is a movie or image
+// sequence. This is a property of the FOOTAGE, not of any chase: the
+// scene itself is moving, so every light's footage is time-locked
+// (offset 0, spanning the comp) and the build runs over the source's
+// duration instead of the still-image "shift in time, end in black"
+// model. Session-wide so a still light loaded alongside movies rides
+// their duration too. This is what the Sources tab calls "Animation" —
+// it was called "Loop", which is exactly why it kept getting mixed up
+// with the unrelated question below.
+inline bool SessionAnimates(const PanelState& state)
 {
     return SessionAnimationSource(state) != nullptr;
 }
 
-// Seamless-loop length in frames for this chase. With an animation
-// source in the session: EXACTLY its duration (frame_count) — the show
-// requirement, so the chase loop and the scene animation stay phase-
-// locked. Otherwise the scatter's own loop_seconds*fps (still scatter).
+// PATTERN LOOPING. Does this chase's own pattern repeat instead of
+// running once and fading to black? Random always does; a chunked
+// 3 Step does (its chunks keep firing, so the last tail wraps to the
+// start). A sweep does not. Nothing to do with the footage — a still
+// scene can hold a looping chase, and an animated scene can hold a
+// one-shot sweep.
+inline bool ChasePatternLoops(const Chase& chase)
+{
+    if (chase.random_scatter) return true;
+    return chase.loops && !chase.stages.empty();
+}
+
+// Is there a wrap period at all — from either cause above? Callers use
+// this to decide whether to wrap the envelope rather than let it end.
+inline bool ChaseWraps(const Chase& chase, const PanelState& state)
+{
+    return SessionAnimates(state) || ChasePatternLoops(chase);
+}
+
+// How many frames one cycle covers, or 0 if this chase does not wrap.
+//
+// PRECEDENCE, and it is an OPEN QUESTION (David, 2026-09-08): when the
+// session animates, the source's duration wins outright, so a 3 Step in
+// an animated scene is stretched to the scene loop rather than running
+// on its own hit-and-overlap period. That is the pre-existing shipped
+// behaviour for every chase type and it is left alone deliberately —
+// how a self-looping chase should sit inside an animated scene has not
+// been decided yet. Do not quietly pick a rule here.
 inline int ChaseLoopFrames(const Chase& chase, const PanelState& state,
                            float fps)
 {
@@ -935,94 +1096,29 @@ inline int ChaseLoopFrames(const Chase& chase, const PanelState& state,
         const int m = chase.loop_multiple < 1 ? 1 : chase.loop_multiple;
         return src->frame_count * m;   // always an exact source multiple
     }
+    // A self-looping chunked chase sets its own period from its own
+    // spacing: chunks keep coming every `step_duration`, so one cycle
+    // is `stages * step`. The hit outlasting the step is exactly what
+    // makes the tail wrap instead of leaving a black seam.
+    if (chase.loops && !chase.random_scatter && !chase.stages.empty()) {
+        const float step = (chase.timing.step_duration > 0.05f)
+                           ? chase.timing.step_duration : 0.05f;
+        const long f = std::lround(step * static_cast<float>(
+                                       chase.stages.size()));
+        return (f < 1) ? 1 : static_cast<int>(f);
+    }
+    // A one-shot sweep on a still scene has no cycle: 0, as documented.
+    // Returning the scatter length here regardless is what hid the
+    // clip-length slider on every sweep — the UI reads a non-zero loop
+    // as "this chase's length is the scene's, not yours."
+    if (!chase.random_scatter) return 0;
     return ScatterLoopFrames(chase, fps);
 }
 
-// Regenerate a scatter chase's hit list deterministically from
-// (random_seed, scatter_density, loop_seconds, fps, eligible set).
-// Shared by the UI (per-frame, for the preview) AND the AE builder
-// (so a Random comp is fully populated even when its tab was never
-// opened / after a session load / via Build-all — otherwise the
-// comp would be empty/black). Per light: one jittered hit per
-// stratified time bucket + a per-light phase, so a light never
-// self-stacks and coverage stays even. Binds share each hit time.
-inline void RegenerateScatter(Chase& chase, const PanelState& state,
-                              float fps)
-{
-    chase.scatter.clear();
-    if (state.sources.empty()) return;
-    const int loop_frames = ChaseLoopFrames(chase, state, fps);
-    const int density = (chase.scatter_density < 1) ? 1
-                                                    : chase.scatter_density;
+// RegenerateScatter moved to chase_gen.cpp — it grew a
+// brightness-balancing pass that has no business inline in a
+// header, and lives better beside the other generators.
 
-    struct Lead { LayerRef repr; std::vector<LayerRef> members; };
-    std::vector<Lead> leads;
-    std::vector<uint32_t> bind_seen;
-    // Iterate EVERY source so a chase pulls lights from the whole
-    // session (e.g. one big multilayer source + a few single-layer
-    // "extra" sequences). Sources are assumed to share resolution
-    // and frame rate; loop length is still taken from the active
-    // source (animation sources should all match per the user).
-    const auto dedupe_keep = BuildDedupeKeepSet(state);
-    const bool dedupe_on   = state.dedupe_by_name;
-    for (const Source& src : state.sources) {
-        for (const auto& L : src.layers) {
-            if (!L.included) continue;
-            if (!DedupeKeeps(dedupe_keep, dedupe_on,
-                             src.source_id, L.fnv1a_hash)) continue;
-            LayerRef ref{ src.source_id, L.fnv1a_hash };
-            if (!chase.tag_filter.empty()) {
-                bool in_any = false;
-                for (uint32_t tid : chase.tag_filter) {
-                    if (const Tag* t = FindTagById(state, tid)) {
-                        for (const auto& m : t->members)
-                            if (m == ref) { in_any = true; break; }
-                    }
-                    if (in_any) break;
-                }
-                if (!in_any) continue;
-            }
-            if (const Bind* b = BindOfLayer(state, ref)) {
-                bool seen = false;
-                for (uint32_t id : bind_seen)
-                    if (id == b->bind_id) { seen = true; break; }
-                if (!seen) {
-                    bind_seen.push_back(b->bind_id);
-                    leads.push_back({ ref, b->members });
-                }
-            } else {
-                leads.push_back({ ref, { ref } });
-            }
-        }
-    }
-    if (leads.empty()) return;
-
-    const float bucket = static_cast<float>(loop_frames) /
-                         static_cast<float>(density);
-    for (const auto& lead : leads) {
-        uint32_t s = chase.random_seed ^
-            (lead.repr.fnv1a_hash * 2654435761u + 0x9E3779B9u);
-        std::mt19937 rng(s ? s : 1u);
-        std::uniform_real_distribution<float> u01(0.f, 1.f);
-        const float phase = u01(rng) * static_cast<float>(loop_frames);
-        for (int k = 0; k < density; ++k) {
-            float t = bucket * (static_cast<float>(k) + u01(rng)) + phase;
-            t = std::fmod(t, static_cast<float>(loop_frames));
-            if (t < 0.f) t += static_cast<float>(loop_frames);
-            for (const auto& m : lead.members)
-                chase.scatter.push_back(ScatterHit{ m, t });
-        }
-    }
-}
-
-// In-place sort. Layer fields are all pre-computed on scan, so any
-// sort mode is a pure comparator change — no re-scanning needed.
-// `reverse` flips the result. `seed` only matters for Random.
-//
-// `state` and `source_id` are only consulted by modes that look at
-// per-layer external context (tag membership, position overrides):
-// TagName, EffectiveX, EffectiveY. Pass nullptr for state and the
-// sort will still work for all other modes.
 inline void SortLayers(std::vector<LayerInfo>& layers,
                        PanelState::SortMode mode,
                        bool reverse,
@@ -1097,6 +1193,8 @@ inline void SortLayers(std::vector<LayerInfo>& layers,
             effective_xy(a, ax, ay); effective_xy(b, bx, by);
             return ax < bx;
         }
+        case PanelState::SortMode::PeakX:            return a.peak_x < b.peak_x;
+        case PanelState::SortMode::PeakY:            return a.peak_y < b.peak_y;
         case PanelState::SortMode::EffectiveY: {
             float ax, ay, bx, by;
             effective_xy(a, ax, ay); effective_xy(b, bx, by);
@@ -1438,6 +1536,11 @@ inline bool PerformUndo(PanelState& state)
     // doesn't think the undo itself is a change worth recording.
     state.last_stable = CaptureUndoSnapshot(state);
     state.has_last_stable = true;
+    // That same refresh hides the change from the auto-snapshot's
+    // dirty flag, so say it here — otherwise the session stored in the
+    // .aep keeps the edit that was just undone.
+    state.session_dirty = true;
+    state.session_dirty_ticks = 0;
     return true;
 }
 
@@ -1453,5 +1556,7 @@ inline bool PerformRedo(PanelState& state)
     RestoreUndoSnapshot(state, s);
     state.last_stable = CaptureUndoSnapshot(state);
     state.has_last_stable = true;
+    state.session_dirty = true;             // see PerformUndo
+    state.session_dirty_ticks = 0;
     return true;
 }

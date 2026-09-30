@@ -41,6 +41,38 @@ BuildResult BuildChase(PanelState* state, int chase_index);
 // across chases (TODO — for now binds expand as flat layer lists).
 BuildResult BuildAllChases(PanelState* state);
 
+// ===== The session, stored inside the .aep ============================
+//
+// The AE project is the DEFAULT store: the session travels with the
+// .aep instead of having to be loaded from a sidecar every time. Held
+// as an item comment on a project-root "ChaseMaker Session" folder —
+// an AEGP plugin has no per-project blob API, and comments are the
+// documented mechanism it does have. The .chasemaker.json remains, as
+// export/import and as the recovery path.
+//
+// All three must run from a registered-hook context (the idle hook).
+
+// Serialize the session into the project. Verifies by reading back:
+// the comment length limit is undocumented and a real show session runs
+// to ~100 KB, so a silent truncation would look like success. Returns
+// false with a reason in `out_error`.
+bool SaveSessionToProject(PanelState* state, std::string* out_error);
+
+// Restore the session from the project. False (with a reason) when the
+// project carries none, or when the blob no longer parses — the comment
+// is user-visible and user-editable, so that is an ordinary outcome.
+bool LoadSessionFromProject(PanelState* state, std::string* out_error);
+
+// Does this project carry a ChaseMaker session? Cheap enough to poll.
+bool ProjectHasSession(PanelState* state);
+
+// Keep the session and the AE project in step, from the idle hook:
+// load when AE switches to a project that carries one, and write back
+// (debounced, and only when the bytes changed) when the session is
+// dirty. Must be called on the SAME throttle as RefreshProjectFps —
+// polling AEGP project state every idle tick destabilised AE.
+void MaintainProjectSession(PanelState* state);
+
 // Auto-seed state->project_fps from the active AE comp's frame rate
 // so preview + build timing match the project — UNLESS the user has
 // pinned the FPS in the Sources tab (project_fps_user), in which case

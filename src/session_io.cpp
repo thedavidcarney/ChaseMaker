@@ -1,21 +1,29 @@
 #include "session_io.h"
 
 #include "panel_state.h"
+#include "chase_gen.h"
 #include "exr_scan.h"
 
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
-#include <filesystem>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
 
 namespace session_io {
 
@@ -265,77 +273,6 @@ std::string LayerRefJson(const LayerRef& ref) {
     return buf;
 }
 
-std::string BasenameNoExt(const std::filesystem::path& p) {
-    return p.stem().string();
-}
-
-std::string SafeForFilename(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) {
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
-            out += c;
-        } else if (c == ' ') {
-            out += '_';
-        }
-        // else: drop other characters (slashes, colons, etc.)
-    }
-    if (out.empty()) out = "chase";
-    return out;
-}
-
-// ===== Chase exporter (single-chase .chase.json) ======================
-
-std::string BuildChaseJson(const Chase& chase, const PanelState& state)
-{
-    std::string out;
-    out += "{\n";
-    out += "  \"version\": 1,\n";
-    out += "  \"name\": \"" + Escape(chase.name) + "\",\n";
-    out += "  \"sort_mode\": " + std::to_string((int)chase.sort_mode) + ",\n";
-    out += "  \"sort_reverse\": ";
-    out += chase.sort_reverse ? "true" : "false";
-    out += ",\n";
-    out += "  \"random_seed\": " + std::to_string(chase.random_seed) + ",\n";
-    char tbuf[256];
-    std::snprintf(tbuf, sizeof(tbuf),
-        "  \"timing\": {\n"
-        "    \"duration\": %.3f,\n"
-        "    \"attack\": %.3f,\n"
-        "    \"step_duration\": %.3f,\n"
-        "    \"opacity_peak\": %.3f,\n"
-        "    \"gamma_peak\": %.3f,\n"
-        "    \"gamma_baseline\": %.3f\n"
-        "  },\n",
-        chase.timing.duration, chase.timing.attack,
-        chase.timing.step_duration, chase.timing.opacity_peak,
-        chase.timing.gamma_peak, chase.timing.gamma_baseline);
-    out += tbuf;
-    out += "  \"stages\": [\n";
-    for (size_t si = 0; si < chase.stages.size(); ++si) {
-        out += "    [";
-        const auto& stage = chase.stages[si];
-        for (size_t mi = 0; mi < stage.members.size(); ++mi) {
-            const LayerRef& m = stage.members[mi];
-            const LayerInfo* L = FindLayerByRef(state, m);
-            const Source* src = FindSourceById(state, m.source_id);
-            std::snprintf(tbuf, sizeof(tbuf),
-                "\n      {\"source_id\": %u, \"fnv1a_hash\": %u, "
-                "\"source\": \"%s\", \"layer\": \"%s\"}%s",
-                m.source_id, m.fnv1a_hash,
-                src ? Escape(std::filesystem::path(src->path).filename().string()).c_str() : "",
-                L ? Escape(L->display_name).c_str() : "",
-                (mi + 1 < stage.members.size()) ? "," : "");
-            out += tbuf;
-        }
-        out += (si + 1 < chase.stages.size()) ? "\n    ],\n" : "\n    ]\n";
-    }
-    out += "  ]\n";
-    out += "}\n";
-    return out;
-}
-
 // ===== Session writer =================================================
 
 std::string BuildSessionJson(const PanelState& state)
@@ -354,14 +291,20 @@ std::string BuildSessionJson(const PanelState& state)
         "  \"project_fps\": %.4f,\n"
         "  \"project_fps_user\": %d,\n"
         "  \"thumb_max_width\": %d,\n"
-        "  \"dedupe_by_name\": %d,\n",
+        "  \"dedupe_by_name\": %d,\n"
+        "  \"export_split_groups\": %d,\n",
         state.next_source_id, state.next_bind_id,
         state.next_tag_id, state.next_chase_id,
         state.project_fps.load(),
         state.project_fps_user.load() ? 1 : 0,
         state.thumb_max_width,
-        state.dedupe_by_name ? 1 : 0);
+        state.dedupe_by_name ? 1 : 0,
+        state.export_split_groups ? 1 : 0);
     out += buf;
+
+    // The comp-name prefix the artist last exported with
+    // ("USC_CatTowers"), so the next export dialog opens prefilled.
+    out += "  \"export_prefix\": \"" + Escape(state.export_prefix) + "\",\n";
 
     // Per-name dedupe winner overrides — pinned by the user via
     // the Staging tab's right-click. Keyed by display_name.
@@ -497,8 +440,9 @@ std::string BuildSessionJson(const PanelState& state)
             "      \"desired_stage_count\": %d, \"symmetric_pairs\": %s, "
             "\"manual_stages\": %s,\n"
             "      \"random_scatter\": %s, \"loop_seconds\": %.3f, "
-            "\"scatter_density\": %d, \"loop_multiple\": %d, "
-            "\"loop_cycles\": %d, \"loop_offset\": %d,\n",
+            "\"scatter_density\": %.4f, \"loop_multiple\": %d, "
+            "\"loop_cycles\": %d, \"loop_offset\": %d, \"loops\": %s,\n"
+            "      \"tag_balanced_chunks\": %s,\n",
             (int)c.sort_mode, c.sort_reverse ? "true" : "false", c.random_seed,
             c.desired_stage_count, c.symmetric_pairs ? "true" : "false",
             c.manual_stages ? "true" : "false",
@@ -506,7 +450,9 @@ std::string BuildSessionJson(const PanelState& state)
             c.scatter_density,
             c.loop_multiple < 1 ? 1 : c.loop_multiple,
             c.loop_cycles   < 1 ? 1 : c.loop_cycles,
-            c.loop_offset   < 0 ? 0 : c.loop_offset);
+            c.loop_offset   < 0 ? 0 : c.loop_offset,
+            c.loops ? "true" : "false",
+            c.tag_balanced_chunks ? "true" : "false");
         out += buf;
         out += "      \"tag_filter\": [";
         for (size_t ti = 0; ti < c.tag_filter.size(); ++ti) {
@@ -596,10 +542,9 @@ bool WriteSession(PanelState* state, const std::string& path)
         session_json = BuildSessionJson(*state);
     }
 
-    // Write session JSON. Per-chase .chase.json sidecars are no
-    // longer emitted — the chase output path is now a direct AEGP
-    // comp-builder (under construction). The session JSON itself
-    // still contains every chase's data so authoring round-trips.
+    // Write session JSON. The chase output path is the in-process
+    // AEGP comp-builder; the session JSON carries every chase's data
+    // so authoring round-trips.
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) {
         std::lock_guard<std::mutex> lk(state->mu);
@@ -622,6 +567,13 @@ bool WriteSession(PanelState* state, const std::string& path)
     return true;
 }
 
+std::string SerializeSession(PanelState* state)
+{
+    if (!state) return {};
+    std::lock_guard<std::mutex> lk(state->mu);
+    return BuildSessionJson(*state);
+}
+
 bool LoadSession(PanelState* state, const std::string& path)
 {
     if (!state) return false;
@@ -634,7 +586,16 @@ bool LoadSession(PanelState* state, const std::string& path)
     }
     std::ostringstream buf;
     buf << in.rdbuf();
-    std::string text = buf.str();
+    return LoadSessionText(state, buf.str(), path);
+}
+
+// The whole of loading, minus where the bytes came from. `path` is
+// remembered as the save default and may be empty — it is when the
+// session came out of the AE project rather than off disk.
+bool LoadSessionText(PanelState* state, const std::string& text,
+                     const std::string& path)
+{
+    if (!state) return false;
 
     JsonValue root;
     try {
@@ -661,6 +622,10 @@ bool LoadSession(PanelState* state, const std::string& path)
     // mark these false to restore the user's Staging unchecks).
     struct ExcludedRef { uint32_t source_id; std::string name; };
     std::vector<ExcludedRef> excluded_layers;
+    // Whether the file carried the field at all. An empty list means
+    // "nothing is excluded"; a missing field means "this session
+    // predates the list" — those must not be treated the same.
+    bool saw_excluded_list = false;
 
     {
         std::lock_guard<std::mutex> lk(state->mu);
@@ -686,6 +651,10 @@ bool LoadSession(PanelState* state, const std::string& path)
             state->project_fps_user.store(v->as_int(0) != 0);
         if (const JsonValue* v = root.find("dedupe_by_name"))
             state->dedupe_by_name = v->as_int(0) != 0;
+        if (const JsonValue* v = root.find("export_split_groups"))
+            state->export_split_groups = v->as_int(0) != 0;
+        if (const JsonValue* v = root.find("export_prefix"))
+            state->export_prefix = v->as_string();
         if (const JsonValue* v = root.find("preferred_source_per_name")) {
             // Object: display_name -> source_id. Keys are the
             // user's pinned dedupe winners (right-click "Use this
@@ -723,6 +692,7 @@ bool LoadSession(PanelState* state, const std::string& path)
         // these). Older sessions without this field simply load
         // everything as included.
         if (const JsonValue* arr = root.find("excluded_layers")) {
+            saw_excluded_list = true;
             for (const auto& e : arr->arr) {
                 ExcludedRef er;
                 if (const JsonValue* x = e.find("source_id"))
@@ -784,8 +754,11 @@ bool LoadSession(PanelState* state, const std::string& path)
                 if (const JsonValue* x = e.find("symmetric_pairs")) c.symmetric_pairs = x->as_bool();
                 if (const JsonValue* x = e.find("manual_stages"))   c.manual_stages   = x->as_bool();
                 if (const JsonValue* x = e.find("random_scatter"))  c.random_scatter  = x->as_bool();
+                // Absent in sessions written before 3 Step looped.
+                if (const JsonValue* x = e.find("loops"))           c.loops           = x->as_bool();
+                if (const JsonValue* x = e.find("tag_balanced_chunks")) c.tag_balanced_chunks = x->as_bool();
                 if (const JsonValue* x = e.find("loop_seconds"))    c.loop_seconds    = x->as_float(10.0f);
-                if (const JsonValue* x = e.find("scatter_density")) c.scatter_density = x->as_int(5);
+                if (const JsonValue* x = e.find("scatter_density")) c.scatter_density = x->as_float(5.f);
                 if (const JsonValue* x = e.find("loop_multiple"))   c.loop_multiple   = x->as_int(1);
                 if (const JsonValue* x = e.find("loop_cycles"))     c.loop_cycles     = x->as_int(1);
                 if (const JsonValue* x = e.find("loop_offset"))     c.loop_offset     = x->as_int(0);
@@ -834,26 +807,241 @@ bool LoadSession(PanelState* state, const std::string& path)
             if (Source* s = FindSourceById(*state, kv.id))
                 s->animation = (kv.anim != 0);
         }
-        // Re-apply Staging-tab uncheck state for this source. The
-        // scanner sets `included=true` for every layer; restore the
-        // user's saved unchecks by matching display_name.
-        {
+        // Re-apply the Staging-tab tick state for this source. The
+        // saved list is AUTHORITATIVE: a layer named in it is
+        // unchecked, and anything else is checked. Restoring only the
+        // unchecks would be wrong for single-light sources, where the
+        // scanner excludes scenery names (World.mov and friends) by
+        // default — a user who deliberately ticked one back on would
+        // find it unticked again on every reload.
+        //
+        // Sessions saved before the excluded list existed carry none,
+        // so they load fully included, as they always have.
+        if (saw_excluded_list) {
             std::lock_guard<std::mutex> lk(state->mu);
             Source* s = FindSourceById(*state, kv.id);
             if (s) {
-                for (const ExcludedRef& er : excluded_layers) {
-                    if (er.source_id != kv.id) continue;
-                    for (LayerInfo& L : s->layers) {
-                        if (L.display_name == er.name) {
-                            L.included = false;
+                for (LayerInfo& L : s->layers) {
+                    bool excluded = false;
+                    for (const ExcludedRef& er : excluded_layers) {
+                        if (er.source_id == kv.id && er.name == L.display_name) {
+                            excluded = true;
                             break;
                         }
                     }
+                    L.included = !excluded;
                 }
             }
         }
     }
+
+    // Drop references to sources this session file never listed. Those
+    // accumulate when a source is removed and re-added (the new one
+    // mints a fresh id, and the old refs were never cleaned up); they
+    // can never resolve, and they inflate every count the UI shows.
+    //
+    // Keyed on the ids the FILE listed, NOT on what actually loaded: a
+    // failed scan adds no Source at all, so judging by state.sources
+    // would cost the user their tags whenever an EXR had moved.
+    {
+        std::vector<uint32_t> from_file;
+        from_file.reserve(sources_to_rescan.size());
+        for (const auto& kv : sources_to_rescan) from_file.push_back(kv.id);
+
+        std::lock_guard<std::mutex> lk(state->mu);
+        const int dropped = chase_gen::PruneOrphanedRefs(*state, from_file);
+        if (dropped > 0) {
+            char buf[144];
+            std::snprintf(buf, sizeof(buf),
+                          "Cleaned up %d stale reference%s to sources that "
+                          "are no longer in this session.", dropped,
+                          dropped == 1 ? "" : "s");
+            state->last_status = buf;
+        }
+    }
     return true;
+}
+
+// ===== User preferences ===============================================
+//
+// Deliberately NOT part of a session. A session describes a scene; this
+// describes how one person likes to look at scenes, and importing a
+// fresh scene must not reset it. Best-effort at every step: a missing
+// directory, an unwritable path or a mangled file all mean "use the
+// defaults", never an error the artist has to acknowledge.
+
+namespace {
+
+std::string PrefsPath()
+{
+    // An override so the tests can round-trip prefs without writing
+    // over the real user's file.
+    if (const char* over = std::getenv("CHASEMAKER_PREFS_DIR")) {
+        if (*over) return std::string(over) + "/prefs.json";
+    }
+    // No function-local static holding the base: this is called from
+    // the plugin constructor AND from the UI thread, and a static that
+    // gets REWRITTEN on each call is a data race waiting to happen.
+    // Build the whole path locally and return it by value.
+#ifdef _WIN32
+    if (const char* appdata = std::getenv("APPDATA")) {
+        if (*appdata) {
+            return std::string(appdata) + "/ChaseMaker/prefs.json";
+        }
+    }
+#else
+    // macOS: ~/Library/Application Support, the conventional home for
+    // per-user application state. AE plugins are not sandboxed, so this
+    // is writable. Untested on Mac — see the Mac catch-up notes.
+    if (const char* home = std::getenv("HOME")) {
+        if (*home) {
+            return std::string(home) +
+                   "/Library/Application Support/ChaseMaker/prefs.json";
+        }
+    }
+#endif
+    return {};
+}
+
+// mkdir -p for the directories we need, without pulling <filesystem>
+// into this translation unit's error handling. Walks the whole path
+// rather than making only the last component: on a machine where
+// ~/Library/Application Support somehow doesn't exist, a single mkdir
+// of the leaf would fail and the prefs would silently never save.
+// Existing directories are expected to fail with EEXIST; ignore that.
+void EnsurePrefsDir(const std::string& file_path)
+{
+    const size_t last = file_path.find_last_of("/\\");
+    if (last == std::string::npos) return;
+
+    for (size_t i = 1; i <= last; ++i) {
+        const char c = file_path[i];
+        if (i != last && c != '/' && c != '\\') continue;
+        const std::string dir = file_path.substr(0, i);
+        if (dir.empty()) continue;
+#ifdef _WIN32
+        // Skip a bare drive prefix ("C:").
+        if (dir.size() == 2 && dir[1] == ':') continue;
+        _mkdir(dir.c_str());
+#else
+        mkdir(dir.c_str(), 0755);
+#endif
+    }
+}
+
+} // namespace
+
+void LoadPrefs(PanelState* state)
+{
+    if (!state) return;
+    const std::string path = PrefsPath();
+    if (path.empty()) return;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return;
+    std::string text((std::istreambuf_iterator<char>(f)),
+                     std::istreambuf_iterator<char>());
+    if (text.empty()) return;
+
+    try {
+        JsonParser parser(text);
+        const JsonValue root = parser.Parse();
+        if (const JsonValue* v = root.find("sheet_cols")) {
+            const int cols = v->as_int(state->sheet_cols);
+            // Clamp rather than trust the file: the Zoom control only
+            // offers 1..6 columns and a wild value would draw nothing.
+            state->sheet_cols = (cols < 1) ? 1 : (cols > 6 ? 6 : cols);
+        }
+    } catch (const std::exception&) {
+        // Corrupt prefs are not worth telling anyone about.
+    }
+}
+
+void SavePrefs(const PanelState* state)
+{
+    if (!state) return;
+    const std::string path = PrefsPath();
+    if (path.empty()) return;
+    EnsurePrefsDir(path);
+
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "{\n  \"sheet_cols\": %d\n}\n", state->sheet_cols);
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    f << buf;
+}
+
+// Back to a freshly-opened panel: no sources, no chases, no tags, no
+// undo history, nothing cached from the last scene. Deliberately does
+// NOT reset the per-user preferences (contact-sheet zoom) or the
+// project FPS pin — those are how this person works, not what this
+// scene is.
+//
+// Clearing sources drops every LayerInfo, and with it the texture ids
+// the renderer handed out. That is exactly what LoadSession already
+// does, and `scan_generation` is what tells the renderer its thumbnail
+// cache is stale — bump it so a reopened panel doesn't draw the old
+// scene's textures.
+void NewSession(PanelState* state)
+{
+    if (!state) return;
+    std::lock_guard<std::mutex> lk(state->mu);
+
+    state->sources.clear();
+    state->active_source_index = -1;
+    state->binds.clear();
+    state->tags.clear();
+    state->position_overrides.clear();
+    state->chases.clear();
+    state->active_chase_index = -1;
+    state->chase_in_wizard = false;
+    state->chase_pending_close_index = -1;
+
+    state->next_source_id = 1;
+    state->next_bind_id   = 1;
+    state->next_tag_id    = 1;
+    state->next_chase_id  = 1;
+
+    state->selected_hashes.clear();
+    state->preferred_source_per_name.clear();
+    state->dedupe_by_name = false;
+    state->exclude_filter[0] = 0;
+
+    // Review tab: every cached playhead, pause and grid measurement
+    // belongs to chases that no longer exist.
+    state->sheet_playheads.clear();
+    state->sheet_paused_ids.clear();
+    state->sheet_unchecked.clear();
+    state->sheet_all_paused = false;
+    state->sheet_sig = 0;
+    state->sheet_t_key = -1;
+    state->sheet_count = 0;
+    state->sheet_grid_cols = 0;
+    state->sheet_grid_rows = 0;
+    state->sheet_cell_w = 0;
+    state->sheet_cell_h = 0;
+    state->sheet_px_w = 0;
+    state->sheet_px_h = 0;
+
+    state->chase_composite_rgba.clear();
+    state->chase_composite_w = 0;
+    state->chase_composite_h = 0;
+    state->chase_composite_dirty = true;
+
+    state->build_queue.clear();
+    state->want_build_queue = false;
+
+    // Undo history from a scene that is gone would restore that scene.
+    state->undo_stack.clear();
+    state->redo_stack.clear();
+    state->has_last_stable = false;
+
+    state->session_save_path.clear();
+    state->last_error.clear();
+    state->last_status = "New session.";
+
+    // Invalidate any in-flight scan's thumbnails.
+    state->scan_generation.fetch_add(1);
 }
 
 } // namespace session_io

@@ -5,6 +5,7 @@
 #include "diag_log.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -13,6 +14,8 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -26,6 +29,7 @@
 #include <ImfMultiPartInputFile.h>
 #include <ImfStringAttribute.h>
 #include <ImathBox.h>
+#include <openexr.h>
 
 namespace exr_scan {
 
@@ -60,26 +64,6 @@ std::string DedupDoubledPrefix(const std::string& key)
     return key;
 }
 
-// Returns a non-empty reason string if this layer should be skipped
-// from chase ordering by default. Empty = include.
-//
-// Names skipped here aren't pure beauty/lightgroup passes — they're
-// either non-luminance data (cryptomattes, hash-encoded), the full-
-// frame beauty pass (Image/Alpha — bright everywhere, useless for
-// per-light positioning), or environment/ambient passes (World /
-// Ambient / HDRI — broad scene illumination rather than a single
-// directional light). Matches the disable-by-default list in
-// EXRDemux's SplitAndSortPassesToPrecomps.jsx.
-std::string SkipReason(const std::string& display)
-{
-    std::string low = LowerCopy(display);
-    if (low.find("crypto") != std::string::npos) return "cryptomatte";
-    if (low == "image"  || low == "alpha")       return "beauty/alpha";
-    if (low == "world"  || low == "hdri")        return "environment";
-    if (low == "ambient")                        return "ambient";
-    return {};
-}
-
 struct ChannelLookup {
     int   part = -1;
     std::string in_file_name;  // the raw channel name within the part
@@ -101,6 +85,111 @@ struct RgbGroup {
 // R/G/B triples. Channels are grouped by:
 //   - last-dot prefix of the channel name (e.g. "World.R" -> "World")
 //   - or, if the channel has no dot, by the part's "name" attribute
+} // namespace  (SkipReason/EnvironmentHint are part of the API)
+
+// Returns a non-empty reason string if this layer should be skipped
+// from chase ordering by default. Empty = include.
+//
+// Names skipped here aren't pure beauty/lightgroup passes — they're
+// either non-luminance data (cryptomattes, hash-encoded), the full-
+// frame beauty pass (Image/Alpha — bright everywhere, useless for
+// per-light positioning), or environment/ambient passes (World /
+// Ambient / HDRI — broad scene illumination rather than a single
+// directional light). Matches the disable-by-default list in
+// EXRDemux's SplitAndSortPassesToPrecomps.jsx.
+std::string SkipReason(const std::string& display)
+{
+    const std::string low = LowerCopy(display);
+    if (low.find("crypto") != std::string::npos) return "cryptomatte";
+
+    // Blender writes its built-in passes into the view-layer part, so
+    // they reach us as "ViewLayer.Combined" / "ViewLayer.Noisy Image"
+    // while a lightgroup arrives bare. Matching only the whole string
+    // let every one of those through into Staging (David, testing
+    // USC_CatTowers). Compare the part after the last dot as well.
+    std::string tail = low;
+    const size_t dot = low.find_last_of('.');
+    if (dot != std::string::npos && dot + 1 < low.size()) {
+        tail = low.substr(dot + 1);
+    }
+
+    struct Rule { const char* name; const char* why; };
+    static const Rule kExact[] = {
+        // The full-frame beauty pass under its various names. Bright
+        // everywhere, so useless for per-light positioning.
+        { "image",            "beauty/alpha" },
+        { "alpha",            "beauty/alpha" },
+        { "combined",         "beauty pass"  },
+        { "noisy image",      "beauty pass"  },
+        // Broad scene illumination rather than one directional light.
+        { "world",            "environment"  },
+        { "hdri",             "environment"  },
+        { "ambient",          "ambient"      },
+        // Cycles denoiser inputs — data, not light. Albedo is the one
+        // David hit; Normal and Depth are written alongside it by the
+        // same setting and are equally not lights.
+        { "denoising albedo", "denoise data" },
+        { "denoising normal", "denoise data" },
+        { "denoising depth",  "denoise data" },
+        // Newer Blender writes these two as well (David, first project
+        // of the 2026 season).
+        { "denoising specular albedo", "denoise data" },
+        { "denoising roughness",       "denoise data" },
+    };
+    for (const Rule& r : kExact) {
+        if (tail == r.name || low == r.name) return r.why;
+    }
+
+    // "Combined_Ambient" and friends: Blender's beauty pass qualified
+    // by an environment lightgroup. Strip the beauty token and re-test,
+    // so the pass is caught WITHOUT turning the environment words into
+    // a substring search.
+    //
+    // That distinction is the whole policy here and it is deliberate:
+    // "Ambient_Fill" and "World_Light" are NOT skipped, because a pass
+    // name is an arbitrary string and one of those may well be a real
+    // fixture. They get a scenery SUGGESTION the artist confirms
+    // (EnvironmentHint below). Only a name that also carries a known
+    // built-in pass token is skipped outright.
+    static const char* const kBeautyPrefixes[] = { "combined", "noisy image" };
+    for (const char* pre : kBeautyPrefixes) {
+        const size_t n = std::strlen(pre);
+        if (tail.size() <= n + 1) continue;
+        if (tail.compare(0, n, pre) != 0) continue;
+        const char sep = tail[n];
+        if (sep != '_' && sep != '-' && sep != ' ' && sep != '.') continue;
+        const std::string rest = tail.substr(n + 1);
+        for (const Rule& r : kExact) {
+            if (rest == r.name) return r.why;
+        }
+    }
+    return {};
+}
+
+std::string EnvironmentHint(const std::string& display)
+{
+    if (!SkipReason(display).empty()) return {};   // already excluded
+    const std::string low = LowerCopy(display);
+    // Deliberately a short list of unambiguous scenery words. This only
+    // ever produces a suggestion the user confirms, but a chatty
+    // suggestion is still noise — "sky" is left out precisely because
+    // "Skyline_02" is a plausible fixture name.
+    struct Hint { const char* needle; const char* why; };
+    static const Hint kHints[] = {
+        { "world",       "looks like a world pass" },
+        { "ambient",     "looks like an ambient pass" },
+        { "hdri",        "looks like an HDRI pass" },
+        { "environment", "looks like an environment pass" },
+        { "ibl",         "looks like an image-based lighting pass" },
+    };
+    for (const Hint& h : kHints) {
+        if (low.find(h.needle) != std::string::npos) return h.why;
+    }
+    return {};
+}
+
+namespace {
+
 std::vector<RgbGroup> BuildRgbGroups(Imf::MultiPartInputFile& file)
 {
     std::map<std::string, RgbGroup> by_key;
@@ -196,7 +285,101 @@ std::string PartCompression(Imf::MultiPartInputFile& file, int part)
 
 // Read R+G+B for one layer as float32 buffers. Returns false on any
 // OpenEXR / I/O failure.
-bool ReadRgbPart(Imf::MultiPartInputFile& file, const RgbGroup& grp,
+// OpenEXR 3.4's DWAA/DWAB decoder breaks when one decode pipeline is
+// reused across chunks: the first chunk decodes, every later one fails
+// with "Unable to run decoder" (reproduced standalone on a 290-channel
+// single-part Blender EXR). The C++ reader reuses its pipeline whenever
+// it runs single-threaded, so scanline parts are read here through the
+// Core API with a FRESH pipeline per chunk. Returns false (caller falls
+// back to the C++ reader) for layouts this doesn't handle: tiled/deep
+// parts or subsampled channels. Decode errors throw, like the C++ path.
+//
+// Takes a BATCH of groups from one part: DWA decompresses a whole chunk
+// (every channel in the part) no matter how few channels are wanted, so
+// a 290-channel render read one light at a time decompressed the whole
+// file once per light (~5 min for 85 lights). Each chunk is decoded
+// once per batch instead. bufs[i] is the R/G/B triple for grps[i],
+// each pointing at w*h floats.
+bool ReadRgbPartsCore(const std::string& path,
+                      const std::vector<const RgbGroup*>& grps,
+                      int w, int h, int min_y,
+                      const std::vector<std::array<float*, 3>>& bufs)
+{
+    if (grps.empty()) return false;
+    struct Ctx {
+        exr_context_t c = nullptr;
+        ~Ctx() { if (c) exr_finish(&c); }
+    } ctx;
+    exr_context_initializer_t init = EXR_DEFAULT_CONTEXT_INITIALIZER;
+    if (exr_start_read(&ctx.c, path.c_str(), &init) != EXR_ERR_SUCCESS)
+        return false;
+
+    const int part = grps[0]->r.part;
+    std::map<std::string, float*> targets;   // channel name -> buffer
+    for (size_t i = 0; i < grps.size(); ++i) {
+        const RgbGroup& g = *grps[i];
+        if (g.r.part != part || g.g.part != part || g.b.part != part)
+            return false;
+        targets[g.r.in_file_name] = bufs[i][0];
+        targets[g.g.in_file_name] = bufs[i][1];
+        targets[g.b.in_file_name] = bufs[i][2];
+    }
+
+    exr_storage_t storage;
+    exr_compression_t comp;
+    int32_t lines_per_chunk = 0, chunk_count = 0;
+    if (exr_get_compression(ctx.c, part, &comp) != EXR_ERR_SUCCESS ||
+        (comp != EXR_COMPRESSION_DWAA && comp != EXR_COMPRESSION_DWAB) ||
+        exr_get_storage(ctx.c, part, &storage) != EXR_ERR_SUCCESS ||
+        storage != EXR_STORAGE_SCANLINE ||
+        exr_get_scanlines_per_chunk(ctx.c, part, &lines_per_chunk) != EXR_ERR_SUCCESS ||
+        exr_get_chunk_count(ctx.c, part, &chunk_count) != EXR_ERR_SUCCESS ||
+        lines_per_chunk <= 0)
+        return false;
+
+    for (int ci = 0; ci < chunk_count; ++ci) {
+        exr_chunk_info_t cinfo;
+        if (exr_read_scanline_chunk_info(ctx.c, part, min_y + ci * lines_per_chunk,
+                                         &cinfo) != EXR_ERR_SUCCESS)
+            throw std::runtime_error("Unable to read chunk table");
+
+        exr_decode_pipeline_t dec = EXR_DECODE_PIPELINE_INITIALIZER;
+        struct Pipe {
+            exr_context_t c; exr_decode_pipeline_t* d;
+            ~Pipe() { exr_decoding_destroy(c, d); }
+        } pipe{ctx.c, &dec};
+        if (exr_decoding_initialize(ctx.c, part, &cinfo, &dec) != EXR_ERR_SUCCESS)
+            throw std::runtime_error("Unable to initialize decoder");
+
+        const int row0 = cinfo.start_y - min_y;
+        size_t found = 0;
+        for (int k = 0; k < dec.channel_count; ++k) {
+            exr_coding_channel_info_t& ch = dec.channels[k];
+            ch.decode_to_ptr = nullptr;
+            auto it = targets.find(ch.channel_name);
+            if (it == targets.end()) continue;
+            if (ch.x_samples != 1 || ch.y_samples != 1 || ch.width != w)
+                return false;
+            ch.decode_to_ptr = reinterpret_cast<uint8_t*>(
+                it->second + static_cast<size_t>(row0) * w);
+            ch.user_pixel_stride      = sizeof(float);
+            ch.user_line_stride       = static_cast<int32_t>(sizeof(float) * w);
+            ch.user_bytes_per_element = sizeof(float);
+            ch.user_data_type         = EXR_PIXEL_FLOAT;
+            ++found;
+        }
+        if (found != targets.size() || row0 < 0 || row0 + cinfo.height > h)
+            return false;
+
+        if (exr_decoding_choose_default_routines(ctx.c, part, &dec) != EXR_ERR_SUCCESS ||
+            exr_decoding_run(ctx.c, part, &dec) != EXR_ERR_SUCCESS)
+            throw std::runtime_error("Unable to run decoder");
+    }
+    return true;
+}
+
+bool ReadRgbPart(Imf::MultiPartInputFile& file, const std::string& path,
+                 const RgbGroup& grp,
                  int& w_out, int& h_out,
                  std::vector<float>& r_buf,
                  std::vector<float>& g_buf,
@@ -211,6 +394,13 @@ bool ReadRgbPart(Imf::MultiPartInputFile& file, const RgbGroup& grp,
     r_buf.assign(static_cast<size_t>(w) * h, 0.0f);
     g_buf.assign(static_cast<size_t>(w) * h, 0.0f);
     b_buf.assign(static_cast<size_t>(w) * h, 0.0f);
+
+    if (ReadRgbPartsCore(path, {&grp}, w, h, dw.min.y,
+                         {{r_buf.data(), g_buf.data(), b_buf.data()}})) {
+        w_out = w;
+        h_out = h;
+        return true;
+    }
 
     // OpenEXR slice base must point at image coord (0,0). Our buffers
     // are indexed by (y - dw.min.y) * w + (x - dw.min.x), so the base
@@ -492,13 +682,21 @@ bool SplitSeqName(const std::string& fn, std::string& prefix,
 // false + a human-readable reason on failure.
 bool ResolveExrFrame(const std::string& input, int frame_index,
                      std::string& out_file, int& out_count,
-                     int& out_used_index, std::string& out_err)
+                     int& out_used_index, std::string& out_err,
+                     bool* out_asked_for_sequence)
 {
+    // Whether the INPUT asked for a sequence (a folder, or a ####/%04d
+    // token) as opposed to naming one concrete file. Sibling frames are
+    // still discovered either way — that is how the Sources tab can
+    // offer to treat a single dropped frame as an animation — but
+    // dropping shot_0001.exr must not silently make it one.
+    if (out_asked_for_sequence) *out_asked_for_sequence = false;
     std::error_code ec;
     fs::path in(input);
     std::vector<std::string> frames;
 
     if (fs::is_directory(in, ec)) {
+        if (out_asked_for_sequence) *out_asked_for_sequence = true;
         // A folder can hold MULTIPLE distinct sequences (e.g.
         // TestFile_### alongside TestFile_Test_###). Don't merge
         // them: take the alphabetically-first .exr as the reference
@@ -532,6 +730,7 @@ bool ResolveExrFrame(const std::string& input, int frame_index,
         }
     } else {
         // Doesn't exist as-is: treat the filename as a sequence token.
+        if (out_asked_for_sequence) *out_asked_for_sequence = true;
         fs::path parent = in.parent_path();
         if (!fs::is_directory(parent, ec)) {
             out_err = "Path not found: " + input;
@@ -589,10 +788,11 @@ void DoScan(const std::string& input, PanelState* state,
 {
     std::string path;
     int frame_count = 1, used_frame = 0;
+    bool asked_for_sequence = false;
     {
         std::string rerr;
         if (!ResolveExrFrame(input, frame_index, path, frame_count,
-                              used_frame, rerr)) {
+                              used_frame, rerr, &asked_for_sequence)) {
             CM_DIAG_LOG("DoScan: resolve failed input='%s' err='%s'",
                         input.c_str(), rerr.c_str());
             std::lock_guard<std::mutex> lk(state->mu);
@@ -669,7 +869,62 @@ void DoScan(const std::string& input, PanelState* state,
         size_t scanned_idx = 0;
         const size_t scan_total = groups.size();
 
-        for (const auto& grp : groups) {
+        // DWA parts decompress every channel per chunk, so lights that
+        // share one are decoded together in batches (ReadRgbPartsCore)
+        // and handed to the per-light loop below from `prefetched`.
+        // Bounded by kBatchBytes of float planes; a batch that fails is
+        // dropped and its lights fall back to the one-at-a-time read,
+        // which records each light's own error.
+        constexpr size_t kBatchBytes = 768ull << 20;
+        std::map<size_t, std::array<std::vector<float>, 3>> prefetched;
+        std::set<int> no_batch_parts;
+        auto scannable = [](const RgbGroup& g) {
+            return g.complete && SkipReason(g.display_name).empty();
+        };
+        auto prefetch_from = [&](size_t gi) {
+            const int part = groups[gi].r.part;
+            if (no_batch_parts.count(part)) return;
+            const Imf::Compression c = file.header(part).compression();
+            if (c != Imf::DWAA_COMPRESSION && c != Imf::DWAB_COMPRESSION) {
+                no_batch_parts.insert(part);
+                return;
+            }
+            const Imath::Box2i dw = file.header(part).dataWindow();
+            const int w = dw.max.x - dw.min.x + 1;
+            const int h = dw.max.y - dw.min.y + 1;
+            if (w <= 0 || h <= 0) return;
+            const size_t light_bytes = static_cast<size_t>(w) * h * sizeof(float) * 3;
+            const size_t k_max = kBatchBytes / light_bytes;
+            std::vector<size_t> idx;
+            for (size_t j = gi; j < groups.size() && idx.size() < k_max; ++j)
+                if (scannable(groups[j]) && groups[j].r.part == part &&
+                    groups[j].g.part == part && groups[j].b.part == part)
+                    idx.push_back(j);
+            if (idx.size() < 2) return;   // nothing to share
+
+            std::vector<std::array<std::vector<float>, 3>> planes(idx.size());
+            std::vector<const RgbGroup*> grps;
+            std::vector<std::array<float*, 3>> ptrs;
+            for (size_t i = 0; i < idx.size(); ++i) {
+                for (auto& p : planes[i]) p.assign(static_cast<size_t>(w) * h, 0.f);
+                grps.push_back(&groups[idx[i]]);
+                ptrs.push_back({planes[i][0].data(), planes[i][1].data(),
+                                planes[i][2].data()});
+            }
+            bool ok = false;
+            try {
+                ok = ReadRgbPartsCore(path, grps, w, h, dw.min.y, ptrs);
+            } catch (const std::exception& e) {
+                CM_DIAG_LOG("scan: batch of %d on part %d failed: %s",
+                            (int)idx.size(), part, e.what());
+            }
+            if (!ok) { no_batch_parts.insert(part); return; }
+            for (size_t i = 0; i < idx.size(); ++i)
+                prefetched[idx[i]] = std::move(planes[i]);
+        };
+
+        for (size_t gi = 0; gi < groups.size(); ++gi) {
+            const RgbGroup& grp = groups[gi];
             ++scanned_idx;
             {
                 std::lock_guard<std::mutex> lk(state->mu);
@@ -688,8 +943,17 @@ void DoScan(const std::string& input, PanelState* state,
             }
 
             int w = 0, h = 0;
-            try {
-                if (!ReadRgbPart(file, grp, w, h, r_buf, g_buf, b_buf)) {
+            if (!prefetched.count(gi)) prefetch_from(gi);
+            if (auto it = prefetched.find(gi); it != prefetched.end()) {
+                const Imath::Box2i dw = file.header(grp.r.part).dataWindow();
+                w = dw.max.x - dw.min.x + 1;
+                h = dw.max.y - dw.min.y + 1;
+                r_buf = std::move(it->second[0]);
+                g_buf = std::move(it->second[1]);
+                b_buf = std::move(it->second[2]);
+                prefetched.erase(it);
+            } else try {
+                if (!ReadRgbPart(file, path, grp, w, h, r_buf, g_buf, b_buf)) {
                     skipped.push_back({grp.display_name, "read failed"});
                     continue;
                 }
@@ -776,7 +1040,15 @@ void DoScan(const std::string& input, PanelState* state,
             src.scan_path    = path;         // concrete frame opened
             src.scan_frame   = used_frame;
             src.frame_count  = frame_count;
-            src.animation    = (frame_count > 1);  // auto; user-overridable
+            // Animation ONLY when the source was named as one: a
+            // folder, or a ####/%04d token. Dropping one concrete file
+            // means that file, even when numbered siblings sit beside
+            // it — a single reference frame pulled out of a rendered
+            // sequence was being turned into a 3-frame animation, and
+            // every chase got crammed into a 3-frame loop.
+            // frame_count still reports the siblings, so the Sources
+            // tab can offer to treat it as an animation after all.
+            src.animation    = asked_for_sequence && (frame_count > 1);
             src.image_width  = img_w;
             src.image_height = img_h;
             src.layers       = std::move(layers);
@@ -911,9 +1183,15 @@ void AddSourcePath(const std::string& path, PanelState* state,
         LayerInfo info;
         info.display_name = stem;
         info.fnv1a_hash   = FNV1a32(stem);
+        // One file, one light — so the filename IS the pass name, and
+        // the same scenery list the EXR scanner applies has to apply
+        // here too. A folder of per-light .mov renders routinely
+        // contains a World.mov. Excluded rather than hidden: it stays
+        // visible in Staging with its tick cleared, because promoting
+        // a skipped layer is an EXR-only path.
+        info.included     = SkipReason(stem).empty();
         info.cx = info.cy = 0.5f;          // placeholder until analyzed
         info.cx_hot = info.cy_hot = 0.5f;
-        info.included     = true;
         src.layers.push_back(std::move(info));
 
         if (!append) {
@@ -1008,7 +1286,7 @@ bool IncludeSkippedLayer(PanelState* state, uint32_t source_id,
 
         std::vector<float> r_buf, g_buf, b_buf;
         int w = 0, h = 0;
-        if (!ReadRgbPart(file, *match, w, h, r_buf, g_buf, b_buf)) {
+        if (!ReadRgbPart(file, exr_path, *match, w, h, r_buf, g_buf, b_buf)) {
             std::lock_guard<std::mutex> lk(state->mu);
             state->last_error = "Read failed for layer: " + display_name;
             return false;

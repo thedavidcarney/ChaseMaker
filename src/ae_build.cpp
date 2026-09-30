@@ -2,6 +2,9 @@
 
 #include "panel_state.h"
 #include "hash.h"
+#include "build_math.h"     // frame/time + envelope, shared with the preview
+#include "chase_gen.h"      // RegenerateScatter
+#include "session_io.h"     // the session blob stored in the .aep
 #include "exr_scan.h"          // AnalyzeFramePixels (shared metric/thumb math)
 
 #include "AEConfig.h"
@@ -256,6 +259,10 @@ A_Err EnsureFootage(AEGP_SuiteHandler& sp,
 }
 
 // ===== Effect helpers =================================================
+//
+// EffectSuite4, not 5: Suite5 only exists from AE 24.1, and every call
+// we make has the same signature in Suite4 (AE 13.0+). Keeps early
+// AE 2024 builds working.
 
 // Find an installed effect by exact match name (e.g.
 // "tdcarney EXRDemux"). Returns AEGP_InstalledEffectKey_NONE if not
@@ -268,10 +275,10 @@ A_Err FindInstalledEffectKey(AEGP_SuiteHandler& sp,
     AEGP_InstalledEffectKey key = AEGP_InstalledEffectKey_NONE;
     while (true) {
         AEGP_InstalledEffectKey next = AEGP_InstalledEffectKey_NONE;
-        if (sp.EffectSuite5()->AEGP_GetNextInstalledEffect(key, &next)) break;
+        if (sp.EffectSuite4()->AEGP_GetNextInstalledEffect(key, &next)) break;
         if (next == AEGP_InstalledEffectKey_NONE) break;
         char mn[AEGP_MAX_EFFECT_MATCH_NAME_SIZE] = {0};
-        sp.EffectSuite5()->AEGP_GetEffectMatchName(next, mn);
+        sp.EffectSuite4()->AEGP_GetEffectMatchName(next, mn);
         if (std::strcmp(mn, match_name_utf8) == 0) {
             *out_key = next;
             return A_Err_NONE;
@@ -406,15 +413,12 @@ A_Err BakeKeyframes(AEGP_SuiteHandler& sp,
 // range for any realistic comp length.
 A_Time FramesToATime(double frames, A_Ratio fps)
 {
+    const build_math::TimeValue v = build_math::FramesToTime(
+        frames, build_math::TimeRatio{ static_cast<long>(fps.num),
+                                       static_cast<unsigned long>(fps.den) });
     A_Time t{};
-    if (fps.num <= 0) {
-        t.value = 0;
-        t.scale = 1;
-        return t;
-    }
-    constexpr A_long kSub = 1000;
-    t.value = static_cast<A_long>(frames * fps.den * kSub + 0.5);
-    t.scale = static_cast<A_u_long>(fps.num) * kSub;
+    t.value = static_cast<A_long>(v.value);
+    t.scale = static_cast<A_u_long>(v.scale);
     return t;
 }
 
@@ -424,11 +428,10 @@ A_Time FramesToATime(double frames, A_Ratio fps)
 // fractional rates and otherwise rounding to an integer/1.
 A_Ratio RatioFromFps(A_FpLong fps)
 {
-    if (fps <= 0.01) return A_Ratio{24, 1};
-    if (std::fabs(fps - 23.976) < 0.01) return A_Ratio{24000, 1001};
-    if (std::fabs(fps - 29.97)  < 0.01) return A_Ratio{30000, 1001};
-    if (std::fabs(fps - 59.94)  < 0.01) return A_Ratio{60000, 1001};
-    return A_Ratio{static_cast<A_long>(fps + 0.5), 1};
+    const build_math::TimeRatio r =
+        build_math::RatioFromFps(static_cast<double>(fps));
+    return A_Ratio{ static_cast<A_long>(r.num),
+                    static_cast<A_u_long>(r.den) };
 }
 
 // Pull the AE project's "natural" framerate. There's no direct
@@ -496,11 +499,64 @@ struct BuildContext {
     int                       layers_added = 0;
 };
 
+// ===== Comp naming ====================================================
+//
+// Delivery convention: "<prefix>_<Chase>_v<N>", e.g.
+// "USC_CatTowers_LeftToRight_v1", and with the split export
+// "USC_CatTowers_LeftToRight_Spotlights_v1". Lowercase v, no leading
+// zeros, and the underscore is the only separator — so every part of
+// the name has to lose its spaces and punctuation first.
+
+// The first free "<base>_v<N>" in the ChaseMaker folder, starting at 1.
+// Nothing is ever overwritten: a rebuild of the same chase lands on the
+// next version up.
+std::string NextVersionedName(AEGP_SuiteHandler& sp, BuildContext& ctx,
+                              const std::string& base)
+{
+    const std::string stem = base.empty() ? std::string{"Chase"} : base;
+    for (int v = 1; v < 1000; ++v) {
+        char suffix[16];
+        std::snprintf(suffix, sizeof(suffix), "_v%d", v);
+        const std::string cand = stem + suffix;
+        AEGP_ItemH ex = nullptr;
+        FindChildByName(sp, ctx.proj, ctx.chasemaker_folder,
+                        cand, AEGP_ItemType_NONE, ctx.plugin_id, &ex);
+        if (!ex) return cand;
+    }
+    return stem + "_v1000";
+}
+// One comp for `chase`, optionally covering only a SUBSET of its
+// lights and under a caller-chosen name.
+//
+//   `subset`    nullptr = every light in the chase (the normal case).
+//               Otherwise only these refs are placed — how the split
+//               export emits one comp per lightgroup without the chase
+//               itself knowing anything about the split.
+//   `base_name` the comp name WITHOUT its version suffix, already
+//               prefixed ("USC_CatTowers_LeftToRight"). Empty falls
+//               back to the chase's own name.
+//   `out_item`  receives the created comp, so an assemble comp can
+//               layer it.
 A_Err BuildOneChase(AEGP_SuiteHandler& sp,
                     const Chase& chase,
-                    BuildContext& ctx)
+                    BuildContext& ctx,
+                    const std::vector<LayerRef>* subset,
+                    const std::string& base_name,
+                    AEGP_ItemH* out_item)
 {
     A_Err err = A_Err_NONE;
+    if (out_item) *out_item = nullptr;
+
+    // Membership filter for the split export. Comparing (source_id,
+    // hash) pairs — a bare hash can collide across sources.
+    auto in_subset = [&](const LayerRef& r) {
+        if (!subset) return true;
+        for (const LayerRef& k : *subset) {
+            if (k.source_id == r.source_id && k.fnv1a_hash == r.fnv1a_hash)
+                return true;
+        }
+        return false;
+    };
 
     const double fps_d = static_cast<double>(ctx.fps.num) /
         static_cast<double>(std::max<A_long>(1, ctx.fps.den));
@@ -510,10 +566,26 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
     //    the comp loops seamlessly and stays phase-locked to the scene.
     //  - Scatter (still source): its own seamless loop_seconds.
     //  - Stage chase (still source): runs until the last release.
-    const bool loop_mode = (ctx.loop_frames > 0);
+    // A chunked chase (3 Step) loops on its OWN period even when the
+    // session has no animation source: the chunks keep firing
+    // step_duration apart, so one cycle is stages * step, and the hit
+    // outlasting the step is what makes the last tail wrap round
+    // instead of leaving a black seam. Its length therefore comes from
+    // the hit and the overlap, not from the scatter's 10s convention.
+    int loop_frames = ctx.loop_frames;
+    if (loop_frames <= 0 && chase.loops && !chase.random_scatter &&
+        !chase.stages.empty())
+    {
+        const double step = (chase.timing.step_duration > 0.05f)
+                            ? chase.timing.step_duration : 0.05;
+        const long f = std::lround(step *
+                                   static_cast<double>(chase.stages.size()));
+        loop_frames = (f < 1) ? 1 : static_cast<int>(f);
+    }
+    const bool loop_mode = (loop_frames > 0);
     float total_frames = 0.f;
     if (loop_mode) {
-        total_frames = static_cast<float>(ctx.loop_frames);
+        total_frames = static_cast<float>(loop_frames);
     } else if (chase.random_scatter) {
         const double lf = static_cast<double>(
             std::llround(chase.loop_seconds * fps_d));
@@ -534,26 +606,13 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
 
     A_Ratio pix_aspect{1, 1};
 
-    // Pick a comp name; suffix _vNN if collision.
-    std::string comp_name = chase.name.empty() ? std::string{"Chase"} : chase.name;
-    {
-        AEGP_ItemH existing = nullptr;
-        FindChildByName(sp, ctx.proj, ctx.chasemaker_folder,
-                        comp_name, AEGP_ItemType_NONE,
-                        ctx.plugin_id, &existing);
-        if (existing) {
-            for (int v = 2; v < 100; ++v) {
-                char suffix[8];
-                std::snprintf(suffix, sizeof(suffix), "_v%02d", v);
-                std::string cand = comp_name + suffix;
-                AEGP_ItemH ex = nullptr;
-                FindChildByName(sp, ctx.proj, ctx.chasemaker_folder,
-                                cand, AEGP_ItemType_NONE,
-                                ctx.plugin_id, &ex);
-                if (!ex) { comp_name = cand; break; }
-            }
-        }
-    }
+    // "<prefix>_<Chase>_v1", version bumping on collision. Lowercase v,
+    // no leading zeros — David's delivery convention.
+    std::string comp_name = NextVersionedName(
+        sp, ctx,
+        base_name.empty()
+            ? (chase.name.empty() ? std::string{"Chase"} : chase_gen::CompactExportName(chase.name))
+            : base_name);
 
     std::vector<A_UTF16Char> u16name = ToUtf16(comp_name);
     AEGP_CompH new_comp = nullptr;
@@ -670,7 +729,7 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
         if (ctx.demux_key != AEGP_InstalledEffectKey_NONE &&
             !ctx.movie_source_ids.count(source_id)) {
             AEGP_EffectRefH effect = nullptr;
-            if (!sp.EffectSuite5()->AEGP_ApplyEffect(
+            if (!sp.EffectSuite4()->AEGP_ApplyEffect(
                     ctx.plugin_id, layer, ctx.demux_key, &effect) &&
                 effect)
             {
@@ -685,13 +744,13 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
                 const double lo = static_cast<double>(h32 & 0xFFFF);
                 SetEffectFloatParam(sp, ctx.plugin_id, effect, 3, hi);
                 SetEffectFloatParam(sp, ctx.plugin_id, effect, 4, lo);
-                sp.EffectSuite5()->AEGP_DisposeEffect(effect);
+                sp.EffectSuite4()->AEGP_DisposeEffect(effect);
             }
         }
 
         if (ctx.exposure_key != AEGP_InstalledEffectKey_NONE) {
             AEGP_EffectRefH expo = nullptr;
-            if (!sp.EffectSuite5()->AEGP_ApplyEffect(
+            if (!sp.EffectSuite4()->AEGP_ApplyEffect(
                     ctx.plugin_id, layer, ctx.exposure_key, &expo) &&
                 expo)
             {
@@ -706,7 +765,7 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
                                        t2, chase.timing.gamma_baseline);
                     sp.StreamSuite6()->AEGP_DisposeStream(gamma);
                 }
-                sp.EffectSuite5()->AEGP_DisposeEffect(expo);
+                sp.EffectSuite4()->AEGP_DisposeEffect(expo);
             }
         }
     };
@@ -734,19 +793,14 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
     const double env_hold = chase.timing.hold < 0.f
         ? 0.0 : static_cast<double>(chase.timing.hold);
     const double env_total = env_d + env_hold;
-    auto env_at = [period, env_a, env_d, env_hold, env_total]
+    // Shared with the panel preview (chase_gen::ScatterHitEnvelope also
+    // delegates here) so the comp and the preview cannot drift apart —
+    // they did once, and the preview showed a cycle the comp didn't
+    // have.
+    auto env_at = [env_a, env_d, env_hold, period]
                   (double phase, double t) -> double {
-        double local = std::fmod(t - phase, period);
-        if (local < 0.0) local += period;
-        if (local >= env_total) return 0.0;
-        const double att = (env_a < 0.001)        ? 0.001
-                         : (env_a > env_d - 0.001) ? (env_d - 0.001)
-                                                   : env_a;
-        if (local < att)                return local / att;          // rising
-        if (local < att + env_hold)     return 1.0;                  // holding
-        const double fall_len = (env_d - att) < 0.001 ? 0.001
-                                                      : (env_d - att);
-        return (env_total - local) / fall_len;                       // falling
+        return build_math::WrappedEnvelope(phase, t, period,
+                                           env_a, env_d, env_hold);
     };
 
     auto place_loop_layer = [&](const std::string& display_name,
@@ -841,7 +895,7 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
         if (ctx.demux_key != AEGP_InstalledEffectKey_NONE &&
             !ctx.movie_source_ids.count(source_id)) {
             AEGP_EffectRefH effect = nullptr;
-            if (!sp.EffectSuite5()->AEGP_ApplyEffect(
+            if (!sp.EffectSuite4()->AEGP_ApplyEffect(
                     ctx.plugin_id, layer, ctx.demux_key, &effect) &&
                 effect)
             {
@@ -856,13 +910,13 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
                 const double lo = static_cast<double>(h32 & 0xFFFF);
                 SetEffectFloatParam(sp, ctx.plugin_id, effect, 3, hi);
                 SetEffectFloatParam(sp, ctx.plugin_id, effect, 4, lo);
-                sp.EffectSuite5()->AEGP_DisposeEffect(effect);
+                sp.EffectSuite4()->AEGP_DisposeEffect(effect);
             }
         }
 
         if (ctx.exposure_key != AEGP_InstalledEffectKey_NONE) {
             AEGP_EffectRefH expo = nullptr;
-            if (!sp.EffectSuite5()->AEGP_ApplyEffect(
+            if (!sp.EffectSuite4()->AEGP_ApplyEffect(
                     ctx.plugin_id, layer, ctx.exposure_key, &expo) &&
                 expo)
             {
@@ -874,7 +928,7 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
                     BakeKeyframes(sp, gamma, gm_kf);
                     sp.StreamSuite6()->AEGP_DisposeStream(gamma);
                 }
-                sp.EffectSuite5()->AEGP_DisposeEffect(expo);
+                sp.EffectSuite4()->AEGP_DisposeEffect(expo);
             }
         }
     };
@@ -913,10 +967,11 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
             Chase local = chase;
             {
                 std::lock_guard<std::mutex> lk(ctx.state->mu);
-                RegenerateScatter(local, *ctx.state,
+                chase_gen::RegenerateScatter(local, *ctx.state,
                                   static_cast<float>(fps_d));
             }
             for (const ScatterHit& hit : local.scatter) {
+                if (!in_subset(hit.ref)) continue;
                 auto nms = names_of(hit.ref);
                 if (!nms.first.empty())
                     place_loop_layer(nms.first, nms.second,
@@ -951,6 +1006,7 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
                 const double phase = static_cast<double>(si) * step
                                      + off_d;
                 for (const LayerRef& ref : chase.stages[si].members) {
+                    if (!in_subset(ref)) continue;
                     auto nms = names_of(ref);
                     place_loop_layer(nms.first, nms.second,
                                      ref.source_id, phase);
@@ -967,7 +1023,7 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
         Chase local = chase;
         {
             std::lock_guard<std::mutex> lk(ctx.state->mu);
-            RegenerateScatter(local, *ctx.state,
+            chase_gen::RegenerateScatter(local, *ctx.state,
                               static_cast<float>(fps_d));
         }
         // Every hit is a layer at its scattered offset. A hit whose
@@ -977,6 +1033,7 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
         // bookends: it's a continuous loop, not a one-shot sweep).
         const double loop_f = static_cast<double>(total_frames);
         for (const ScatterHit& hit : local.scatter) {
+            if (!in_subset(hit.ref)) continue;
             auto nms = names_of(hit.ref);
             if (nms.first.empty()) continue;
             place_layer(nms.first, nms.second, hit.ref.source_id,
@@ -992,6 +1049,7 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
                 static_cast<double>(si) * chase.timing.step_duration;
             const A_Time stage_offset = offset_at(stage_start);
             for (const LayerRef& ref : chase.stages[si].members) {
+                if (!in_subset(ref)) continue;
                 auto nms = names_of(ref);
                 place_layer(nms.first, nms.second,
                             ref.source_id, stage_offset);
@@ -999,6 +1057,168 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
         }
     }
 
+    if (out_item) *out_item = new_comp_item;
+    return A_Err_NONE;
+}
+
+// ===== Split export ===================================================
+//
+// "Split Lightgroups on Export": instead of one comp holding every
+// light, emit one comp PER LIGHTGROUP —
+// "USC_CatTowers_LeftToRight_Spotlights_v1" — and then an ASSEMBLE comp,
+// "USC_CatTowers_LeftToRight_v1", that stacks those group comps back
+// together with Lighten. The chase itself is untouched; this is a
+// delivery shape, not a different chase.
+
+// Every light the chase actually places, in stage / scatter order and
+// de-duplicated.
+std::vector<LayerRef> ChaseLightRefs(const Chase& chase, PanelState* state,
+                                     double fps_d)
+{
+    std::vector<LayerRef> refs;
+    auto add = [&](const LayerRef& r) {
+        for (const LayerRef& k : refs) {
+            if (k.source_id == r.source_id && k.fnv1a_hash == r.fnv1a_hash)
+                return;
+        }
+        refs.push_back(r);
+    };
+    if (chase.random_scatter) {
+        // chase.scatter is filled by the UI only while the scatter tab
+        // is drawn, so regenerate rather than trust it — same reason
+        // BuildOneChase does.
+        Chase local = chase;
+        {
+            std::lock_guard<std::mutex> lk(state->mu);
+            chase_gen::RegenerateScatter(local, *state,
+                                         static_cast<float>(fps_d));
+        }
+        for (const ScatterHit& h : local.scatter) add(h.ref);
+    } else {
+        for (const ChaseStage& st : chase.stages) {
+            for (const LayerRef& r : st.members) add(r);
+        }
+    }
+    return refs;
+}
+
+struct LightGroup {
+    std::string           name;      // tag name, compacted
+    std::vector<LayerRef> refs;
+};
+
+// Split the chase's lights by auto-tag. A light is placed in the FIRST
+// tag that holds it, so nothing is emitted twice when tags overlap.
+// Autotagging gives every light a tag (a shared prefix, or its own
+// single-member one), but a hand-edited session can leave one behind —
+// those go to a trailing "Untagged" group rather than being dropped.
+std::vector<LightGroup> GroupLightsByTag(const std::vector<LayerRef>& refs,
+                                         PanelState* state)
+{
+    std::vector<LightGroup> groups;
+    std::vector<LayerRef>   leftovers;
+    std::lock_guard<std::mutex> lk(state->mu);
+
+    for (const LayerRef& r : refs) {
+        const Tag* found = nullptr;
+        for (const Tag& t : state->tags) {
+            for (const LayerRef& m : t.members) {
+                if (m.source_id == r.source_id &&
+                    m.fnv1a_hash == r.fnv1a_hash) { found = &t; break; }
+            }
+            if (found) break;
+        }
+        if (!found) { leftovers.push_back(r); continue; }
+        const std::string key = chase_gen::CompactExportName(found->name);
+        LightGroup* g = nullptr;
+        for (LightGroup& c : groups) if (c.name == key) { g = &c; break; }
+        if (!g) { groups.push_back(LightGroup{ key, {} }); g = &groups.back(); }
+        g->refs.push_back(r);
+    }
+    if (!leftovers.empty()) {
+        groups.push_back(LightGroup{ "Untagged", std::move(leftovers) });
+    }
+    return groups;
+}
+
+// Build one chase as a set of per-group comps plus an assemble comp.
+A_Err BuildChaseSplit(AEGP_SuiteHandler& sp, const Chase& chase,
+                      BuildContext& ctx, const std::string& chase_base)
+{
+    const double fps_d = static_cast<double>(ctx.fps.num) /
+        static_cast<double>(std::max<A_long>(1, ctx.fps.den));
+    const std::vector<LayerRef> refs =
+        ChaseLightRefs(chase, ctx.state, fps_d);
+    if (refs.empty()) return A_Err_NONE;
+
+    const std::vector<LightGroup> groups = GroupLightsByTag(refs, ctx.state);
+    // One group is not a split — emit the plain comp and skip the
+    // pointless assemble layer over a single precomp.
+    if (groups.size() < 2) {
+        return BuildOneChase(sp, chase, ctx, nullptr, chase_base, nullptr);
+    }
+
+    std::vector<AEGP_ItemH> group_comps;
+    group_comps.reserve(groups.size());
+    for (const LightGroup& g : groups) {
+        AEGP_ItemH item = nullptr;
+        const std::string name = chase_base + "_" + g.name;
+        const A_Err e = BuildOneChase(sp, chase, ctx, &g.refs, name, &item);
+        if (e) return e;
+        if (item) group_comps.push_back(item);
+    }
+    if (group_comps.empty()) return A_Err_NONE;
+
+    // ---- The assemble comp -----------------------------------------
+    // Same size and duration as the group comps it stacks. Read the
+    // duration off the first one rather than recomputing the chase
+    // length a second way — two derivations of the same number drift.
+    A_Time dur{};
+    if (sp.ItemSuite9()->AEGP_GetItemDuration(group_comps[0], &dur)) {
+        return A_Err_GENERIC;
+    }
+    A_Ratio pix_aspect{1, 1};
+    const std::string asm_name = NextVersionedName(sp, ctx, chase_base);
+    std::vector<A_UTF16Char> u16 = ToUtf16(asm_name);
+    AEGP_CompH asm_comp = nullptr;
+    A_Err err = sp.CompSuite11()->AEGP_CreateComp(
+        ctx.chasemaker_folder, u16.data(), ctx.src_w, ctx.src_h,
+        &pix_aspect, &dur, &ctx.fps, &asm_comp);
+    if (err || !asm_comp) return err ? err : A_Err_GENERIC;
+    ++ctx.comps_created;
+
+    // Black backdrop first so the group comps stack above it, exactly
+    // as the lights do inside them.
+    if (ctx.black_solid) {
+        AEGP_LayerH bg = nullptr;
+        if (!sp.LayerSuite9()->AEGP_AddLayer(ctx.black_solid, asm_comp, &bg) &&
+            bg)
+        {
+            const A_Time zero = FramesToATime(0.0, ctx.fps);
+            sp.LayerSuite9()->AEGP_SetLayerInPointAndDuration(
+                bg, AEGP_LTimeMode_LayerTime, &zero, &dur);
+        }
+    }
+
+    for (size_t i = 0; i < group_comps.size(); ++i) {
+        AEGP_LayerH layer = nullptr;
+        if (sp.LayerSuite9()->AEGP_AddLayer(group_comps[i], asm_comp, &layer) ||
+            !layer)
+            continue;
+        ++ctx.layers_added;
+        const A_Time zero = FramesToATime(0.0, ctx.fps);
+        sp.LayerSuite9()->AEGP_SetLayerOffset(layer, &zero);
+        sp.LayerSuite9()->AEGP_SetLayerInPointAndDuration(
+            layer, AEGP_LTimeMode_LayerTime, &zero, &dur);
+        // Lighten, the same per-channel max the lights composite with
+        // inside each group comp — so assembling the groups gives the
+        // same picture as the unsplit comp.
+        AEGP_LayerTransferMode tm{};
+        tm.mode        = PF_Xfer_LIGHTEN;
+        tm.flags       = static_cast<AEGP_TransferFlags>(0);
+        tm.track_matte = AEGP_TrackMatte_NO_TRACK_MATTE;
+        sp.LayerSuite9()->AEGP_SetLayerTransferMode(layer, &tm);
+    }
     return A_Err_NONE;
 }
 
@@ -1234,6 +1454,15 @@ BuildResult DoBuild(PanelState* state, int chase_index, bool build_all)
         }
     }
 
+    // The delivery name prefix and the split choice, read once.
+    std::string prefix;
+    bool split = false;
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        prefix = state->export_prefix;
+        split  = state->export_split_groups;
+    }
+
     // Build all chases or just the one.
     auto build_idx = [&](int i) -> A_Err {
         if (i < 0 || i >= (int)state->chases.size()) return A_Err_NONE;
@@ -1243,14 +1472,27 @@ BuildResult DoBuild(PanelState* state, int chase_index, bool build_all)
             if (i >= (int)state->chases.size()) return A_Err_NONE;
             c = state->chases[i];
         }
-        return BuildOneChase(sp, c, ctx);
+        // "USC_Curtains" + "3StepChase" -> "USC_Curtains3StepChase".
+        // NO separator between the artist's prefix and the chase — the
+        // prefix already carries whatever underscores it wants. The
+        // lightgroup part below IS underscore-separated.
+        std::string base = prefix + chase_gen::CompactExportName(c.name);
+        if (split) return BuildChaseSplit(sp, c, ctx, base);
+        return BuildOneChase(sp, c, ctx, nullptr, base, nullptr);
     };
 
     if (build_all) {
         std::vector<int> indices;
         {
             std::lock_guard<std::mutex> lk(state->mu);
-            for (int i = 0; i < (int)state->chases.size(); ++i) indices.push_back(i);
+            // Chases unchecked in the Review tab stay out of the build.
+            for (int i = 0; i < (int)state->chases.size(); ++i) {
+                const uint32_t id = state->chases[i].chase_id;
+                bool unchecked = false;
+                for (uint32_t x : state->sheet_unchecked)
+                    if (x == id) { unchecked = true; break; }
+                if (!unchecked) indices.push_back(i);
+            }
         }
         for (int i : indices) build_idx(i);
     } else {
@@ -1535,6 +1777,269 @@ void RefreshProjectFps(PanelState* state)
     if (r.num > 0 && r.den > 0) {
         state->project_fps.store(
             static_cast<float>(r.num) / static_cast<float>(r.den));
+    }
+}
+
+// ===== The session, stored inside the .aep ============================
+//
+// David, 2026-09-10: "there's no other plugins that I have to load a
+// file for each time." So the AE project is now the DEFAULT store and
+// the .chasemaker.json becomes export/import.
+//
+// Mechanism: an item comment. `AEGP_SetItemComment` /
+// `AEGP_GetItemComment` put a UTF-16 string on any project item, and AE
+// saves it inside the .aep. There is no per-project blob API for an
+// AEGP plugin — an effect's arbitrary data is AE's canonical answer,
+// and that is only available to a PF effect, which this deliberately
+// isn't (see CLAUDE.md). Item comments are the documented mechanism an
+// AEGP panel actually has.
+//
+// The carrier is a folder at the project root, so it is visible and
+// deletable rather than hidden state someone can't find. Its comment is
+// the session JSON behind a one-line header, so an artist who opens the
+// Comment column sees what it is instead of a wall of braces.
+
+namespace {
+
+const char* const kSessionFolderName = "ChaseMaker Session";
+const char* const kSessionHeader =
+    "ChaseMaker session data - do not edit. ";
+
+// The folder carrying the session comment. `create` decides whether a
+// missing one is made or simply reported absent.
+A_Err FindSessionItem(AEGP_SuiteHandler& sp, AEGP_ProjectH proj,
+                      AEGP_PluginID plugin_id, bool create,
+                      AEGP_ItemH* out_item)
+{
+    *out_item = nullptr;
+    AEGP_ItemH root = nullptr;
+    if (FindTargetFolder(sp, proj, &root) || !root) return A_Err_GENERIC;
+
+    AEGP_ItemH found = nullptr;
+    FindChildByName(sp, proj, root, kSessionFolderName,
+                    AEGP_ItemType_FOLDER, plugin_id, &found);
+    if (found) { *out_item = found; return A_Err_NONE; }
+    if (!create) return A_Err_NONE;
+
+    std::vector<A_UTF16Char> u16 = ToUtf16(kSessionFolderName);
+    return sp.ItemSuite9()->AEGP_CreateNewFolder(u16.data(), root, out_item);
+}
+
+} // namespace
+
+bool SaveSessionToProject(PanelState* state, std::string* out_error)
+{
+    if (out_error) out_error->clear();
+    if (!state || !state->pica_basicP) {
+        if (out_error) *out_error = "No AEGP context.";
+        return false;
+    }
+    AEGP_SuiteHandler sp(reinterpret_cast<SPBasicSuite*>(state->pica_basicP));
+    AEGP_ProjectH proj = nullptr;
+    if (sp.ProjSuite6()->AEGP_GetProjectByIndex(0, &proj) || !proj) {
+        if (out_error) *out_error = "No AE project open.";
+        return false;
+    }
+    const AEGP_PluginID plugin_id =
+        static_cast<AEGP_PluginID>(state->aegp_plugin_id);
+
+    const std::string json = session_io::SerializeSession(state);
+    if (json.empty()) {
+        if (out_error) *out_error = "Nothing to store.";
+        return false;
+    }
+    const std::string payload = std::string(kSessionHeader) + json;
+
+    AEGP_ItemH item = nullptr;
+    if (FindSessionItem(sp, proj, plugin_id, true, &item) || !item) {
+        if (out_error) *out_error = "Could not create the session folder.";
+        return false;
+    }
+
+    // SetItemComment is undoable, so keep the whole write inside one
+    // group rather than dropping a bare step into the artist's history.
+    sp.UtilitySuite6()->AEGP_StartUndoGroup("ChaseMaker - store session");
+    std::vector<A_UTF16Char> u16 = ToUtf16(payload);
+    const A_Err err = sp.ItemSuite9()->AEGP_SetItemComment(item, u16.data());
+    sp.UtilitySuite6()->AEGP_EndUndoGroup();
+    if (err) {
+        if (out_error) *out_error = "AE rejected the session comment.";
+        return false;
+    }
+
+    // Read it straight back. The comment length limit is undocumented,
+    // and a real show session runs to ~100 KB — a silent truncation
+    // would look like a successful save and lose the work. Verify, and
+    // say so loudly if it did not survive.
+    AEGP_MemHandle back = nullptr;
+    if (sp.ItemSuite9()->AEGP_GetItemComment(item, &back) || !back) {
+        if (out_error) *out_error = "Stored, but could not be read back.";
+        return false;
+    }
+    const std::string round = MemHandleToString(sp, back);
+    if (round != payload) {
+        if (out_error) {
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                          "AE truncated the session (%zu of %zu bytes "
+                          "survived). Save a .chasemaker.json instead.",
+                          round.size(), payload.size());
+            *out_error = buf;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool ProjectHasSession(PanelState* state)
+{
+    if (!state || !state->pica_basicP) return false;
+    AEGP_SuiteHandler sp(reinterpret_cast<SPBasicSuite*>(state->pica_basicP));
+    AEGP_ProjectH proj = nullptr;
+    if (sp.ProjSuite6()->AEGP_GetProjectByIndex(0, &proj) || !proj) return false;
+    AEGP_ItemH item = nullptr;
+    if (FindSessionItem(sp, proj,
+                        static_cast<AEGP_PluginID>(state->aegp_plugin_id),
+                        false, &item) || !item) {
+        return false;
+    }
+    AEGP_MemHandle h = nullptr;
+    if (sp.ItemSuite9()->AEGP_GetItemComment(item, &h) || !h) return false;
+    const std::string text = MemHandleToString(sp, h);
+    return text.compare(0, std::strlen(kSessionHeader), kSessionHeader) == 0;
+}
+
+bool LoadSessionFromProject(PanelState* state, std::string* out_error)
+{
+    if (out_error) out_error->clear();
+    if (!state || !state->pica_basicP) {
+        if (out_error) *out_error = "No AEGP context.";
+        return false;
+    }
+    AEGP_SuiteHandler sp(reinterpret_cast<SPBasicSuite*>(state->pica_basicP));
+    AEGP_ProjectH proj = nullptr;
+    if (sp.ProjSuite6()->AEGP_GetProjectByIndex(0, &proj) || !proj) {
+        if (out_error) *out_error = "No AE project open.";
+        return false;
+    }
+    AEGP_ItemH item = nullptr;
+    if (FindSessionItem(sp, proj,
+                        static_cast<AEGP_PluginID>(state->aegp_plugin_id),
+                        false, &item) || !item) {
+        if (out_error) *out_error = "This project has no ChaseMaker session.";
+        return false;
+    }
+    AEGP_MemHandle h = nullptr;
+    if (sp.ItemSuite9()->AEGP_GetItemComment(item, &h) || !h) {
+        if (out_error) *out_error = "Could not read the session comment.";
+        return false;
+    }
+    std::string text = MemHandleToString(sp, h);
+    const size_t header_len = std::strlen(kSessionHeader);
+    if (text.compare(0, header_len, kSessionHeader) != 0) {
+        if (out_error) *out_error = "This project has no ChaseMaker session.";
+        return false;
+    }
+    text.erase(0, header_len);
+    // The comment is user-visible and user-editable, so a mangled blob
+    // is a normal outcome, not an exceptional one. LoadSessionText
+    // reports it through state.last_error and leaves the session alone.
+    return session_io::LoadSessionText(state, text, std::string());
+}
+
+void MaintainProjectSession(PanelState* state)
+{
+    if (!state || !state->pica_basicP) return;
+
+    // ---- Did AE switch projects? ------------------------------------
+    // If so the session follows: that is the whole point of storing it
+    // in the .aep. A project with no stored session leaves the current
+    // one alone rather than wiping it — the artist may be about to
+    // build this rig into that project, and auto-save will put it
+    // there.
+    std::string project;
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        project = state->ae_project_name;
+    }
+    if (project.empty()) return;
+
+    bool switched = false;
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        if (state->project_session_key != project) {
+            state->project_session_key = project;
+            switched = true;
+        }
+    }
+    if (switched) {
+        if (ProjectHasSession(state)) {
+            std::string err;
+            const bool ok = LoadSessionFromProject(state, &err);
+            std::lock_guard<std::mutex> lk(state->mu);
+            if (ok) {
+                state->project_store_status = "Loaded from " + project;
+                state->session_dirty = false;
+                state->session_dirty_ticks = 0;
+                // Whatever we just read IS what the project holds.
+                state->project_store_hash = 0;
+            } else {
+                state->project_store_status = err;
+            }
+            return;   // never load and save on the same tick
+        }
+        std::lock_guard<std::mutex> lk(state->mu);
+        state->project_store_status.clear();
+        return;
+    }
+
+    // ---- Debounced write --------------------------------------------
+    // Every write is an AE undo step, so this waits for the edits to
+    // stop and then only writes if the bytes actually changed. A slider
+    // drag must not push a stack of steps into the artist's history.
+    if (!state->session_dirty.load()) return;
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        if (++state->session_dirty_ticks < 2) return;   // this hook is ~3 s
+        state->session_dirty_ticks = 0;
+    }
+
+    // Nothing worth storing yet — do not create a session folder in
+    // every project the artist merely opens.
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        if (state->sources.empty() && state->chases.empty()) {
+            state->session_dirty = false;
+            return;
+        }
+    }
+
+    const std::string json = session_io::SerializeSession(state);
+    uint64_t h = 1469598103934665603ull;
+    for (char c : json) {
+        h ^= static_cast<uint8_t>(c);
+        h *= 1099511628211ull;
+    }
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        if (h == state->project_store_hash) {
+            state->session_dirty = false;
+            return;
+        }
+    }
+
+    std::string err;
+    const bool ok = SaveSessionToProject(state, &err);
+    std::lock_guard<std::mutex> lk(state->mu);
+    state->session_dirty = false;
+    if (ok) {
+        state->project_store_hash = h;
+        state->project_store_status = "Stored in " + project;
+    } else {
+        // Leave the hash alone so the next tick tries again, and say
+        // what went wrong — a truncated comment must not look like a
+        // successful save.
+        state->project_store_status = err;
     }
 }
 

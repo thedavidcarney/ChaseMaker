@@ -24,6 +24,7 @@
 
 #include "panel_renderer.h"
 #include "panel_state.h"
+#include "session_io.h"
 #include "ae_build.h"
 #include "chase_maker_build_stamp.h"   // CM_BUILD_STAMP
 #include "diag_log.h"                  // CM_DIAG_LOG load-path tracing
@@ -83,6 +84,12 @@ public:
         // routing back through the plugin object.
         i_panel_state.pica_basicP    = pica_basicP;
         i_panel_state.aegp_plugin_id = static_cast<int>(plugin_id);
+
+        // Per-user UI preferences (contact-sheet zoom, so far). These
+        // belong to the person, not to a scene, so they load once at
+        // plugin start rather than with a session — importing a fresh
+        // scene must not put the zoom back to a default.
+        session_io::LoadPrefs(&i_panel_state);
 
         // Acquire the panel suite (AEGP_PanelSuite1, frozen in AE 8.0).
         // AcquireSuite is a C function pointer — no implicit `this`.
@@ -213,6 +220,26 @@ private:
             ae_build::BuildAllChases(&self->i_panel_state);
             did_build = true;
         }
+        // "Build checked" from the Review tab: one chase per tick so a
+        // long queue never blocks AE's UI thread in a single callback.
+        if (!did_build && self->i_panel_state.want_build_queue.load()) {
+            int next = -1;
+            {
+                std::lock_guard<std::mutex> lk(self->i_panel_state.mu);
+                if (!self->i_panel_state.build_queue.empty()) {
+                    next = self->i_panel_state.build_queue.front();
+                    self->i_panel_state.build_queue.erase(
+                        self->i_panel_state.build_queue.begin());
+                }
+                if (self->i_panel_state.build_queue.empty()) {
+                    self->i_panel_state.want_build_queue = false;
+                }
+            }
+            if (next >= 0) {
+                ae_build::BuildChase(&self->i_panel_state, next);
+                did_build = true;
+            }
+        }
         // Drain movie-source analysis (AE renders one frame per queued
         // clip to compute its centroid/thumbnail). One clip per tick;
         // treat like a build so the fps poll below is skipped while AE
@@ -240,6 +267,10 @@ private:
             CM_DIAG_LOG("idle: RefreshProjectFps begin");
             ae_build::RefreshProjectFps(&self->i_panel_state);
             ae_build::RefreshAEProjectName(&self->i_panel_state);
+            // Same throttle deliberately: this reads and writes project
+            // items, which is exactly the polling that destabilised AE
+            // when it ran every tick.
+            ae_build::MaintainProjectSession(&self->i_panel_state);
             CM_DIAG_LOG("idle: RefreshProjectFps end");
         }
         // max_sleep is in 60ths of a second. Asking AE to wake us at

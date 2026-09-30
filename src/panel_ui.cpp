@@ -2,6 +2,8 @@
 
 #include "panel_state.h"
 #include "exr_scan.h"   // IncludeSkippedLayer for the Skipped section
+#include "chase_gen.h"
+#include "session_io.h"
 
 #include <algorithm>
 #include <cctype>
@@ -22,6 +24,40 @@
 namespace panel_ui {
 
 namespace {
+
+using namespace chase_gen;
+
+// ===== Preview frame-rate badge =======================================
+
+// A preview that plays under rate lies about the chase: the timing is
+// still right (the playhead advances on real elapsed time) but the
+// motion you judge it by is not what the comp will do. So say so, over
+// the top-left of the picture, with the rate it is actually managing.
+//
+// Silent while the panel is keeping up — a badge that is always lit is
+// not a warning. The measure is this ImGui context's own frame rate
+// (a rolling average), i.e. how often this panel actually redraws.
+void DrawFpsBadge(ImVec2 top_left, float session_fps)
+{
+    const float measured = ImGui::GetIO().Framerate;
+    if (session_fps < 1.f || measured <= 0.f) return;
+    // A little grace, because the redraw timer sits only just above 30
+    // and an exact compare would blink the badge on and off every
+    // second or two at the boundary.
+    if (measured >= session_fps * 0.92f) return;
+
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.0f / %.0f fps", measured, session_fps);
+    const ImVec2 sz = ImGui::CalcTextSize(buf);
+    const ImVec2 pad(5.f, 3.f);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(top_left.x + 4.f, top_left.y + 4.f),
+                      ImVec2(top_left.x + 4.f + sz.x + pad.x * 2.f,
+                             top_left.y + 4.f + sz.y + pad.y * 2.f),
+                      IM_COL32(140, 30, 20, 210), 3.f);
+    dl->AddText(ImVec2(top_left.x + 4.f + pad.x, top_left.y + 4.f + pad.y),
+                IM_COL32(255, 225, 215, 255), buf);
+}
 
 // ===== String / inclusion helpers =====================================
 
@@ -145,6 +181,11 @@ struct FrameSnapshot {
     bool                           chase_in_wizard = false;
     bool                           hide_unchecked = false;
     std::string                    session_save_path;
+    // AE's project filename, the natural default for the export prefix.
+    std::string                    ae_project_name;
+    // What the .aep store last did — "Stored in USC_CatTowers", or the
+    // reason it could not.
+    std::string                    project_store_status;
     // Status fields
     std::string                    last_error;
     std::string                    last_status;
@@ -235,6 +276,8 @@ FrameSnapshot TakeSnapshot(PanelState* state)
         ss.is_active     = (src.source_id == s.active_source_id);
         s.source_summaries.push_back(std::move(ss));
     }
+    s.ae_project_name    = state->ae_project_name;
+    s.project_store_status = state->project_store_status;
     s.binds              = state->binds;
     s.tags               = state->tags;
     s.position_overrides = state->position_overrides;
@@ -707,6 +750,8 @@ float SortPosition(const LayerInfo& L, SortMode mode, double max_brightness)
     case SortMode::CentroidY:  return L.cy;
     case SortMode::HotspotX:   return L.cx_hot;
     case SortMode::HotspotY:   return L.cy_hot;
+    case SortMode::PeakX:      return L.peak_x;
+    case SortMode::PeakY:      return L.peak_y;
     case SortMode::Brightness:
         return max_brightness > 0.0
             ? static_cast<float>(L.total / max_brightness)
@@ -1059,8 +1104,126 @@ void DrawSkippedSection(PanelState* state, uint32_t /*active_src*/,
 
 // ===== Sources tab ====================================================
 
-void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
+void DrawGeneratePack(PanelState* state, const FrameSnapshot& snap);
+
+// The four things that have to be right before generating chases —
+// how many lights are actually staged, what got left out, the project
+// frame rate, and the loop length. Everything here is a read of state
+// the Sources tab already owns; it is gathered in one place so the
+// answer to "is this scene set up correctly" is one glance rather than
+// a hunt across the panel.
+void DrawQuickStart(PanelState* state, FrameSnapshot& snap)
 {
+    if (snap.layers.empty() && snap.source_summaries.empty()) return;
+
+    int lights = 0, excluded = 0;
+    std::string excluded_names, hint_names;
+    int hint_count = 0;
+    for (const auto& L : snap.layers) {
+        if (L.included) { ++lights; continue; }
+        ++excluded;
+        if (excluded <= 3) {
+            if (!excluded_names.empty()) excluded_names += ", ";
+            excluded_names += L.display_name;
+        }
+    }
+    for (const auto& L : snap.layers) {
+        if (!L.included) continue;
+        if (exr_scan::EnvironmentHint(L.display_name).empty()) continue;
+        ++hint_count;
+        if (hint_count <= 3) {
+            if (!hint_names.empty()) hint_names += ", ";
+            hint_names += L.display_name;
+        }
+    }
+
+    ImGui::SeparatorText("Quick start");
+
+    ImGui::Text("%d light%s ready", lights, lights == 1 ? "" : "s");
+    if (excluded > 0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("\xE2\x80\xA2  %d excluded (%s%s)", excluded,
+                            excluded_names.c_str(),
+                            excluded > 3 ? ", ..." : "");
+    }
+
+    // Scenery-looking names are a suggestion, never an automatic
+    // exclusion — pass names are arbitrary and "Ambient Wash" may well
+    // be a real fixture. One click acts on it.
+    if (hint_count > 0) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.62f, 0.18f, 1.f));
+        ImGui::Text("%d name%s look%s like scenery: %s%s", hint_count,
+                    hint_count == 1 ? "" : "s",
+                    hint_count == 1 ? "s" : "", hint_names.c_str(),
+                    hint_count > 3 ? ", ..." : "");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Exclude them")) {
+            // Write to the WORKING COPY, not straight to state. The
+            // frame ends with PublishInclusionChanges(state,
+            // snap.layers), which copies this snapshot's flags over
+            // whatever state holds — so writing to state here was
+            // undone by the same frame that did it, and the button
+            // looked dead.
+            for (auto& L : snap.layers) {
+                if (!L.included) continue;
+                if (!exr_scan::EnvironmentHint(L.display_name).empty()) {
+                    L.included = false;
+                }
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Untick every light whose name looks like a\n"
+                              "world / ambient / HDRI pass. Reversible in\n"
+                              "the Staging tab.");
+        }
+    }
+
+    const float fps = state->project_fps.load();
+    ImGui::Text("%.2f fps", fps);
+    ImGui::SameLine();
+    ImGui::TextDisabled(state->project_fps_user ? "(pinned)"
+                                                : "(from the active comp)");
+    ImGui::SameLine(0.f, 20.f);
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        if (SessionAnimates(*state)) {
+            const Chase probe;
+            const int loop = ChaseLoopFrames(probe, *state, fps);
+            ImGui::Text("Loop: %d frames (%.1f s)", loop,
+                        fps > 0.f ? loop / fps : 0.f);
+            // A loop shorter than the light count can't give each light
+            // even one frame of its own — every light changes every
+            // frame and the chase reads as noise. Usually this means a
+            // still was picked up as a short sequence (dropping
+            // shot_0001.exr finds _0002 and _0003 beside it), so say
+            // what to do about it.
+            if (lights > 1 && loop > 0 && loop < lights) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      ImVec4(1.f, 0.42f, 0.35f, 1.f));
+                ImGui::TextWrapped(
+                    "This loop is %d frame%s for %d lights — %.2f frames "
+                    "each, so every light changes every frame. If these "
+                    "are reference stills rather than an animation, untick "
+                    "Animation for the source below.",
+                    loop, loop == 1 ? "" : "s", lights,
+                    (float)loop / (float)lights);
+                ImGui::PopStyleColor();
+            }
+        } else {
+            ImGui::TextDisabled("Stills \xE2\x80\x94 no loop; chases sweep "
+                                "once");
+        }
+    }
+
+    DrawGeneratePack(state, snap);
+    ImGui::Separator();
+    ImGui::Spacing();
+}
+
+void DrawSourcesTab(PanelState* state, FrameSnapshot& snap)
+{
+    DrawQuickStart(state, snap);
     ImGui::TextWrapped("Drag EXR, PNG, movie (.mov/.mp4), or still-image "
                        "files (from Explorer/Finder) onto this panel to add "
                        "sources. Each movie or still becomes one light; a "
@@ -1218,7 +1381,9 @@ void DrawSourcesTab(PanelState* state, const FrameSnapshot& snap)
         ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed, 92.f);
         ImGui::TableSetupColumn("Layers",  ImGuiTableColumnFlags_WidthFixed, 60.f);
         ImGui::TableSetupColumn("Scan frame", ImGuiTableColumnFlags_WidthFixed, 116.f);
-        ImGui::TableSetupColumn("Loop",    ImGuiTableColumnFlags_WidthFixed, 52.f);
+        // "Animation", not "Loop": the checkbox says what the source
+        // IS, not what the chase does with it.
+        ImGui::TableSetupColumn("Animation", ImGuiTableColumnFlags_WidthFixed, 74.f);
         // Wide enough for "Rescan" + "Remove" so the last button
         // doesn't spill past the panel's right edge.
         ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 150.f);
@@ -1418,6 +1583,8 @@ void DrawStagingTab(PanelState* state, FrameSnapshot& snap, float w, float h)
         "Tag name (A \xE2\x86\x92 Z)",
         "Effective X (override-aware)",
         "Effective Y (override-aware)",
+        "Peak pixel (Left to Right)",
+        "Peak pixel (Top to Bottom)",
     };
     int sort_choice = static_cast<int>(state->sort_mode);
     ImGui::SetNextItemWidth(260.f);
@@ -1443,11 +1610,11 @@ void DrawStagingTab(PanelState* state, FrameSnapshot& snap, float w, float h)
     }
     if (resort_now) {
         std::lock_guard<std::mutex> lk(state->mu);
-        if (Source* src = ActiveSource(*state)) {
-            SortLayers(src->layers, state->sort_mode,
-                       state->sort_reverse, state->random_seed,
-                       state, src->source_id);
-        }
+        // Across every source, not just the active one: a show
+        // rendered one clip per light has 138 sources of one layer
+        // each, and sorting each of those on its own is a no-op.
+        SortAllSources(*state, state->sort_mode, state->sort_reverse,
+                       state->random_seed);
     }
 
     // Preview controls
@@ -1534,11 +1701,11 @@ void DrawStagingTab(PanelState* state, FrameSnapshot& snap, float w, float h)
             state->sort_reverse = false;
         }
         std::lock_guard<std::mutex> lk(state->mu);
-        if (Source* src = ActiveSource(*state)) {
-            SortLayers(src->layers, state->sort_mode,
-                       state->sort_reverse, state->random_seed,
-                       state, src->source_id);
-        }
+        // Across every source, not just the active one: a show
+        // rendered one clip per light has 138 sources of one layer
+        // each, and sorting each of those on its own is a no-op.
+        SortAllSources(*state, state->sort_mode, state->sort_reverse,
+                       state->random_seed);
     }
     // Column header clicks for On / Tags / X / Y — toggle direction
     // on re-click of the same column, else set new mode.
@@ -1546,11 +1713,11 @@ void DrawStagingTab(PanelState* state, FrameSnapshot& snap, float w, float h)
         if (state->sort_mode == m) state->sort_reverse = !state->sort_reverse;
         else { state->sort_mode = m; state->sort_reverse = false; }
         std::lock_guard<std::mutex> lk(state->mu);
-        if (Source* src = ActiveSource(*state)) {
-            SortLayers(src->layers, state->sort_mode,
-                       state->sort_reverse, state->random_seed,
-                       state, src->source_id);
-        }
+        // Across every source, not just the active one: a show
+        // rendered one clip per light has 138 sources of one layer
+        // each, and sorting each of those on its own is a no-op.
+        SortAllSources(*state, state->sort_mode, state->sort_reverse,
+                       state->random_seed);
     };
     if (ti.header_clicked_col == TableCol::On)   column_header_click(SortMode::IncludedFirst);
     if (ti.header_clicked_col == TableCol::Tags) column_header_click(SortMode::TagName);
@@ -2097,6 +2264,83 @@ inline bool FrameSlider(const char* label, float& value,
     return changed;
 }
 
+// FrameSlider's interaction in a compact form, for the Review cells:
+// no label of its own (the format string carries the meaning, e.g.
+// "next after 10 f"), and it fits a given total width. Same three ways
+// in as everywhere else — drag it, step it with -/+, or double-click to
+// type an exact number. Right-click resets to `def`.
+//
+// `step` is what one press of -/+ moves; `fmt` is the slider's own
+// display format, while typing always shows a plain number so the unit
+// words don't have to be retyped.
+inline bool CellSlider(const char* id, float& value, float lo, float hi,
+                       const char* fmt, float step, float def,
+                       float total_w)
+{
+    if (hi < lo) hi = lo;
+    float v = value;
+    if (v < lo) v = lo; else if (v > hi) v = hi;
+    bool changed = false;
+
+    ImGui::PushID(id);
+    const ImGuiStyle& sty = ImGui::GetStyle();
+    const float btn_w = ImGui::CalcTextSize("-").x + sty.FramePadding.x * 2.f;
+    float sld_w = total_w - 2.f * (btn_w + sty.ItemSpacing.x);
+    if (sld_w < 40.f) sld_w = 40.f;
+
+    if (ImGui::SmallButton("-")) {
+        v -= step;
+        changed = true;
+    }
+    ImGui::SameLine();
+
+    ImGuiStorage* st = ImGui::GetStateStorage();
+    const ImGuiID kEdit  = ImGui::GetID("##edit");
+    const ImGuiID kFocus = ImGui::GetID("##focus");
+    const bool editing = st->GetBool(kEdit, false);
+
+    ImGui::SetNextItemWidth(sld_w);
+    if (editing) {
+        if (st->GetBool(kFocus, false)) {
+            ImGui::SetKeyboardFocusHere();
+            st->SetBool(kFocus, false);
+        }
+        float fv = v;
+        const bool entered = ImGui::InputFloat(
+            "##typ", &fv, 0.f, 0.f, "%.2f",
+            ImGuiInputTextFlags_EnterReturnsTrue |
+            ImGuiInputTextFlags_AutoSelectAll);
+        if (entered || ImGui::IsItemDeactivated()) {
+            v = fv; changed = true;
+            st->SetBool(kEdit, false);
+        }
+    } else {
+        if (ImGui::SliderFloat("##sld", &v, lo, hi, fmt)) changed = true;
+        if (ImGui::IsItemHovered()) {
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                st->SetBool(kEdit, true);
+                st->SetBool(kFocus, true);
+            } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) ||
+                       ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
+                v = def; changed = true;
+            }
+        }
+    }
+
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+")) {
+        v += step;
+        changed = true;
+    }
+    ImGui::PopID();
+
+    if (changed) {
+        if (v < lo) v = lo; else if (v > hi) v = hi;
+        value = v;
+    }
+    return changed;
+}
+
 // Same widget for an int& (loop multiple / clumps / etc.).
 inline bool IntSlider(const char* label, int& value,
                       int lo, int hi, int def)
@@ -2108,643 +2352,15 @@ inline bool IntSlider(const char* label, int& value,
     }
     return false;
 }
-// ===== Chase preview compositing ======================================
 
-// Defined later; the wrapped (seamless-loop) triangle envelope.
-float ScatterHitEnvelope(float playhead, float start, float loop_frames,
-                         const ChaseTiming& t);
 
-// Envelope value (0..1) for a stage at the given playhead frame.
-// Shape: linear ramp up over `attack` frames, hold at peak for
-// `hold` frames, linear ramp down for `duration - attack` frames.
-// Total hit length = duration + hold. Returns 0 outside the hit.
-float StageEnvelope(int stage_idx, float playhead, const ChaseTiming& t)
-{
-    const float hold = std::max(0.f, t.hold);
-    const float total = t.duration + hold;
-    const float stage_start = stage_idx * t.step_duration;
-    const float local_t = playhead - stage_start;
-    if (local_t < 0.f || local_t >= total) return 0.f;
-    const float att = std::max(0.001f, std::min(t.attack, t.duration - 0.001f));
-    if (local_t < att) return local_t / att;                 // rising
-    if (local_t < att + hold) return 1.f;                    // holding
-    const float fall_len = std::max(0.001f, t.duration - att);
-    return (total - local_t) / fall_len;                     // falling
-}
 
-// Total chase duration in frames: when the last stage's release ends.
-float ChaseTotalDuration(const Chase& chase)
-{
-    if (chase.stages.empty()) return 0.f;
-    return (chase.stages.size() - 1) * chase.timing.step_duration + chase.timing.duration;
-}
 
-// Per-stage envelope honoring loop-mode. In loop-mode (animation
-// source) stages are evenly spaced across the seamless loop and the
-// envelope wraps — no from-black ramp at t=0. `loop_frames <= 0`
-// falls back to the legacy shift-in-time triangle (still images).
-float ChaseStageEnvelopeAt(const Chase& chase, size_t si, float playhead,
-                           int loop_frames)
-{
-    const size_t n = chase.stages.size();
-    if (loop_frames > 0 && n > 0) {
-        // `loop_cycles` repeats the chase pattern INSIDE the comp
-        // loop (the inverse of loop_multiple, which makes the comp
-        // longer). Cycles=2 = chase sweeps twice per loop. We
-        // implement it by wrapping the envelope with a shorter
-        // period = loop_frames / cycles — the triangle then tiles
-        // `cycles` times automatically across [0, loop_frames).
-        const int cy = chase.loop_cycles < 1 ? 1 : chase.loop_cycles;
-        // FRACTIONAL period — must match the builder's
-        // `loopL / cycles` (double) exactly. Integer truncation here
-        // (e.g. 179/8 = 22 instead of 22.375) would make the envelope
-        // wrap on a SHORTER period than the actual loop, causing the
-        // preview to visibly start a new cycle a few frames before
-        // the loop boundary (the "chase starts from left at frame
-        // 176-177 then black at 178" jitter).
-        const float period = static_cast<float>(loop_frames) /
-                             static_cast<float>(cy);
-        // Master offset shifts every stage's start time by the same
-        // amount inside the period. Wrap is handled by
-        // ScatterHitEnvelope's fmod, so order + cycle behavior is
-        // preserved automatically.
-        float off = static_cast<float>(chase.loop_offset);
-        if (period > 0.f) {
-            off = std::fmod(off, period);
-            if (off < 0.f) off += period;
-        } else {
-            off = 0.f;
-        }
-        // Stages evenly spaced across the FULL cycle period.
-        // step = period / n = loop_frames / (n * cycles) — the
-        // distance between consecutive hits anywhere in the loop.
-        // With env_d <= step the chase has "no tail" (each hit ends
-        // before the next starts); with env_d > step hits overlap.
-        // Either is a valid user choice — we just expose evenly-
-        // spaced phases and let env_d control hit shape.
-        //
-        // Seamless loop is GUARANTEED by env_at's periodicity (with
-        // period * cycles == loop_frames exactly), so frame
-        // loop_frames-1 naturally flows into frame 0 of the next
-        // iteration just like any other 1-frame transition. We
-        // explicitly do NOT pin frame loop_frames-1 to env(0): that
-        // would make AE play two consecutive frames with the same
-        // value — a 2-frame freeze every loop iteration. The
-        // natural-period sampling IS the seamless behavior.
-        const float step = period / static_cast<float>(n);
-        const float phase = static_cast<float>(si) * step + off;
-        return ScatterHitEnvelope(playhead, phase, period, chase.timing);
-    }
-    return StageEnvelope(static_cast<int>(si), playhead, chase.timing);
-}
 
-// Loop-mode-aware total preview length in frames.
-float ChaseTotalFrames(const Chase& chase, const PanelState& state, float fps)
-{
-    if (chase.random_scatter || ChaseLoopMode(state))
-        return static_cast<float>(ChaseLoopFrames(chase, state, fps));
-    return ChaseTotalDuration(chase);
-}
 
-// One weighted layer going into a composite. `k` is the envelope
-// multiplier (opacity * gamma_at_t), applied linearly.
-struct CompositeContribution { const LayerInfo* L; float k; };
-
-// Lighten-composite weighted contributions, matching the AE build
-// (black solid + Lighten — per-channel max, NOT additive). Thumbnails
-// are normalized to each layer's OWN peak so weak lights stay visible
-// in the layer table; that lies about relative brightness, so here we
-// undo it via thumb_peak and renormalize against `shared_peak` (the
-// brightest participating layer). Result: overlapping lights no
-// longer stack to white, and a dim fill reads dimmer than the key —
-// as it will in the AE comp. Still an approximation (the real
-// Exposure effect is a per-channel pow, not a linear scale), but
-// close and ~free.
-bool LightenComposite(const std::vector<CompositeContribution>& contribs,
-                      int out_w, int out_h, float shared_peak,
-                      std::vector<uint8_t>& out_rgba)
-{
-    if (out_w <= 0 || out_h <= 0) return false;
-    const size_t n = static_cast<size_t>(out_w) * out_h;
-    std::vector<float> acc(n * 3, 0.f);            // linear, Lighten max
-    const float sp = shared_peak > 1e-6f ? shared_peak : 1.f;
-
-    for (const auto& c : contribs) {
-        const LayerInfo* L = c.L;
-        if (!L || L->thumb_rgba.empty()) continue;
-        if (L->thumb_w <= 0 || L->thumb_h <= 0) continue;
-        if (c.k <= 0.f) continue;
-        // thumb byte = sqrt(linear / thumb_peak) * 255, so
-        // linear / shared_peak = (byte/255)^2 * thumb_peak/shared_peak.
-        const float lp = L->thumb_peak > 0.f ? L->thumb_peak : 1.f;
-        const float scale = (lp / sp) * c.k;
-        const uint8_t* s = L->thumb_rgba.data();
-        // Same-size fast path; otherwise nearest-neighbour resample
-        // into the output canvas. Layers from different sources may
-        // disagree on thumb_w/thumb_h (different scan-time
-        // thumb_max_width, or different EXR aspect ratios). Dropping
-        // those silently was hiding one half of e.g. Center Out
-        // symmetric pairs whose partners lived in another source.
-        // Nearest-neighbor is good enough — these are preview
-        // thumbnails (~256 px), and centroids are normalized so the
-        // sources cover the same image region in [0,1].
-        if (L->thumb_w == out_w && L->thumb_h == out_h) {
-            for (size_t i = 0; i < n; ++i) {
-                for (int ch = 0; ch < 3; ++ch) {
-                    const float u = s[i * 4 + ch] * (1.f / 255.f);
-                    const float lin = u * u * scale;
-                    float& a = acc[i * 3 + ch];
-                    if (lin > a) a = lin;          // Lighten
-                }
-            }
-        } else {
-            const int sw = L->thumb_w;
-            const int sh = L->thumb_h;
-            for (int y = 0; y < out_h; ++y) {
-                const int sy = (y * sh) / out_h;
-                for (int x = 0; x < out_w; ++x) {
-                    const int sx = (x * sw) / out_w;
-                    const uint8_t* p = s + (sy * sw + sx) * 4;
-                    const size_t di = static_cast<size_t>(y) * out_w + x;
-                    for (int ch = 0; ch < 3; ++ch) {
-                        const float u = p[ch] * (1.f / 255.f);
-                        const float lin = u * u * scale;
-                        float& a = acc[di * 3 + ch];
-                        if (lin > a) a = lin;      // Lighten
-                    }
-                }
-            }
-        }
-    }
-
-    out_rgba.assign(n * 4, 0);
-    for (size_t i = 0; i < n; ++i) {
-        for (int ch = 0; ch < 3; ++ch) {
-            float v = acc[i * 3 + ch];
-            if (v < 0.f) v = 0.f; else if (v > 1.f) v = 1.f;
-            int q = static_cast<int>(std::sqrt(v) * 255.f + 0.5f);
-            out_rgba[i * 4 + ch] =
-                static_cast<uint8_t>(q < 0 ? 0 : (q > 255 ? 255 : q));
-        }
-        out_rgba[i * 4 + 3] = 255;
-    }
-    return true;
-}
-
-// Build the composite RGBA8 buffer for the chase at the current
-// playhead. Sized to match the first usable thumbnail; ignores
-// thumbs whose dimensions don't match (mixed-source case; not yet
-// implemented). Returns true on success.
-bool BuildChaseComposite(const Chase& chase, const PanelState& state,
-                         float playhead,
-                         std::vector<uint8_t>& out_rgba,
-                         int& out_w, int& out_h)
-{
-    out_w = 0; out_h = 0;
-    // Shared peak over ALL referenced layers (not just active ones)
-    // so brightness doesn't flicker as stages turn on/off.
-    float shared_peak = 0.f;
-    for (const auto& stage : chase.stages) {
-        for (const auto& ref : stage.members) {
-            const LayerInfo* L = FindLayerByRef(state, ref);
-            if (!L) continue;
-            if (out_w == 0 && L->thumb_w > 0 && L->thumb_h > 0) {
-                out_w = L->thumb_w; out_h = L->thumb_h;
-            }
-            if (L->thumb_peak > shared_peak) shared_peak = L->thumb_peak;
-        }
-    }
-    if (out_w == 0 || out_h == 0) return false;
-
-    const int loop_frames = ChaseLoopMode(state)
-        ? ChaseLoopFrames(chase, state, 0.f) : 0;
-    std::vector<CompositeContribution> contribs;
-    for (size_t si = 0; si < chase.stages.size(); ++si) {
-        float env = ChaseStageEnvelopeAt(chase, si, playhead, loop_frames);
-        float op_pk = chase.timing.opacity_peak;
-        float op_fl = chase.timing.opacity_floor;
-        if (op_fl < 0.f) op_fl = 0.f;
-        if (op_fl > op_pk) op_fl = op_pk;
-        // With a floor, a light at env=0 still sits at the floor, so we
-        // can't skip inactive stages. Keep the fast path when floor=0.
-        if (env <= 0.f && op_fl <= 0.f) continue;
-        const float opacity = (op_fl + (op_pk - op_fl) * env) / 100.f;
-        const float gamma_t = chase.timing.gamma_baseline +
-            (chase.timing.gamma_peak - chase.timing.gamma_baseline) * env;
-        const float k = opacity * gamma_t;
-        if (k <= 0.f) continue;
-        for (const auto& ref : chase.stages[si].members) {
-            contribs.push_back({ FindLayerByRef(state, ref), k });
-        }
-    }
-    return LightenComposite(contribs, out_w, out_h, shared_peak, out_rgba);
-}
-
-// Composite an explicit set of layer refs at full strength (no
-// envelope). Used by the chase preview's click-to-pin: clicking a
-// layer freezes the preview on just that light (or, if it sits in a
-// multi-light stage, that whole stage). Same accumulation as
-// BuildChaseComposite with k = 1.
-bool BuildRefsComposite(const std::vector<LayerRef>& refs,
-                        const PanelState& state,
-                        std::vector<uint8_t>& out_rgba,
-                        int& out_w, int& out_h)
-{
-    out_w = 0; out_h = 0;
-    float shared_peak = 0.f;
-    std::vector<CompositeContribution> contribs;
-    for (const auto& ref : refs) {
-        const LayerInfo* L = FindLayerByRef(state, ref);
-        if (!L) continue;
-        if (out_w == 0 && L->thumb_w > 0 && L->thumb_h > 0) {
-            out_w = L->thumb_w; out_h = L->thumb_h;
-        }
-        if (L->thumb_peak > shared_peak) shared_peak = L->thumb_peak;
-        contribs.push_back({ L, 1.f });
-    }
-    if (out_w == 0 || out_h == 0) return false;
-    return LightenComposite(contribs, out_w, out_h, shared_peak, out_rgba);
-}
-
-// ===== Chase JSON exporter ============================================
-
-std::string JsonEscapeForChase(const std::string& s)
-{
-    std::string out;
-    out.reserve(s.size() + 2);
-    for (unsigned char c : s) {
-        switch (c) {
-        case '"':  out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n";  break;
-        case '\r': out += "\\r";  break;
-        case '\t': out += "\\t";  break;
-        default:
-            if (c < 0x20) {
-                char buf[8];
-                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                out += buf;
-            } else {
-                out += static_cast<char>(c);
-            }
-        }
-    }
-    return out;
-}
-
-// Recompute the chase's stages from its sort + tag filter + the
-// session's staged layers. Called once each frame from the chase
-// editor so stages always reflect current state.
-void RegenerateChaseStages(Chase& chase, const PanelState& state,
-                           int stages_count_hint)
-{
-    // Random-scatter chases don't use the stage sequence at all —
-    // they own `scatter` instead (see RegenerateScatter).
-    if (chase.random_scatter) return;
-    // Manual arrangement: the user owns `stages` (drag-reorder, weld,
-    // split in the editor). Don't recompute — leave it as authored so
-    // it survives the per-frame refresh and session round-trips.
-    if (chase.manual_stages) return;
-    chase.stages.clear();
-    if (state.sources.empty()) return;
-    // Gather candidates from EVERY source (multi-source chases pull
-    // from the whole session). Tag filter is session-wide and
-    // already keyed by (source_id, hash), so it works unchanged.
-    const auto dedupe_keep = BuildDedupeKeepSet(state);
-    const bool dedupe_on   = state.dedupe_by_name;
-    std::vector<LayerRef> candidates;
-    for (const Source& src : state.sources) {
-        for (const auto& L : src.layers) {
-            if (!L.included) continue;
-            if (!DedupeKeeps(dedupe_keep, dedupe_on,
-                             src.source_id, L.fnv1a_hash)) continue;
-            LayerRef ref{ src.source_id, L.fnv1a_hash };
-            if (!chase.tag_filter.empty()) {
-                bool in_any = false;
-                for (uint32_t tid : chase.tag_filter) {
-                    if (const Tag* t = FindTagById(state, tid)) {
-                        for (const auto& m : t->members) {
-                            if (m == ref) { in_any = true; break; }
-                        }
-                        if (in_any) break;
-                    }
-                }
-                if (!in_any) continue;
-            }
-            candidates.push_back(ref);
-        }
-    }
-    // Sort candidates per chase.sort_mode. Done over the LayerInfo
-    // lookups, not a copy of LayerInfo, for clarity.
-    auto less_by_mode = [&](const LayerRef& a, const LayerRef& b) {
-        const LayerInfo* la = FindLayerByRef(state, a);
-        const LayerInfo* lb = FindLayerByRef(state, b);
-        if (!la || !lb) return false;
-        switch (chase.sort_mode) {
-        case SortMode::CentroidX:        return la->cx     < lb->cx;
-        case SortMode::CentroidY:        return la->cy     < lb->cy;
-        case SortMode::HotspotX:         return la->cx_hot < lb->cx_hot;
-        case SortMode::HotspotY:         return la->cy_hot < lb->cy_hot;
-        case SortMode::Brightness:       return la->total  > lb->total;
-        case SortMode::RadialSweep: {
-            float angA = std::atan2(la->cy - 0.5f, la->cx - 0.5f);
-            float angB = std::atan2(lb->cy - 0.5f, lb->cx - 0.5f);
-            return angA < angB;
-        }
-        case SortMode::DistanceFromCenter: {
-            float da = (la->cx - 0.5f) * (la->cx - 0.5f) + (la->cy - 0.5f) * (la->cy - 0.5f);
-            float db = (lb->cx - 0.5f) * (lb->cx - 0.5f) + (lb->cy - 0.5f) * (lb->cy - 0.5f);
-            return da < db;
-        }
-        case SortMode::Random: {
-            uint32_t ka = la->fnv1a_hash * 2654435761u + chase.random_seed;
-            uint32_t kb = lb->fnv1a_hash * 2654435761u + chase.random_seed;
-            return ka < kb;
-        }
-        case SortMode::Alphabetical:
-            return la->display_name < lb->display_name;
-        case SortMode::IncludedFirst:
-            if (la->included != lb->included) return la->included > lb->included;
-            return la->display_name < lb->display_name;
-        case SortMode::TagName:
-        case SortMode::EffectiveX:
-        case SortMode::EffectiveY:
-            // Chase regen uses the layer's intrinsic centroid for
-            // these — they're staging-tab-only sort modes in practice.
-            return la->display_name < lb->display_name;
-        }
-        return false;
-    };
-    std::sort(candidates.begin(), candidates.end(), less_by_mode);
-    if (chase.sort_reverse) std::reverse(candidates.begin(), candidates.end());
-
-    // Coalesce bind members into one "logical light" — each bind
-    // appears once in the ordering, sorted by where its first member
-    // landed. The bind expands into the stage as N LayerRefs (one
-    // per member) so the chase comp fires all the bound lights
-    // together with the same envelope.
-    struct Lead {
-        LayerRef              repr;
-        std::vector<LayerRef> members;
-    };
-    std::vector<Lead> leads;
-    std::unordered_set<uint32_t> bind_id_seen;
-    leads.reserve(candidates.size());
-    for (const auto& ref : candidates) {
-        const Bind* b = BindOfLayer(state, ref);
-        if (b) {
-            if (bind_id_seen.insert(b->bind_id).second) {
-                Lead L;
-                L.repr = ref;
-                L.members = b->members;
-                leads.push_back(std::move(L));
-            }
-            // Else: this bind already represented; skip the dup.
-        } else {
-            Lead L;
-            L.repr = ref;
-            L.members.push_back(ref);
-            leads.push_back(std::move(L));
-        }
-    }
-
-    // Symmetric center-out: order is already set by sort_mode (the
-    // "Center Out" template uses CentroidX = left->right). Build
-    // stages from the middle outward — the center light(s) fire
-    // alone, then each mirrored pair welds into one stage. For an
-    // even count the two innermost lights share the first stage.
-    // Lights 1..5 (L->R) => [3], [2,4], [1,5]. Ignores
-    // desired_stage_count by design.
-    if (chase.symmetric_pairs) {
-        const int n = static_cast<int>(leads.size());
-        const int lo = (n - 1) / 2;
-        const int hi = n / 2;
-        for (int k = 0; ; ++k) {
-            const int i = lo - k;
-            const int j = hi + k;
-            if (i < 0 || j >= n) break;
-            ChaseStage st;
-            for (const auto& m : leads[i].members) st.members.push_back(m);
-            if (j != i) {
-                for (const auto& m : leads[j].members) st.members.push_back(m);
-            }
-            chase.stages.push_back(std::move(st));
-        }
-        return;
-    }
-
-    // CHUNKS model: split the leads into exactly `D` contiguous
-    // groups, sizes as equal as possible (differ by at most one
-    // light; the first `rem` groups get the extra). No remainder /
-    // straggler, fully linear: D=3 over 31 lights -> [11][10][10].
-    // stages_count_hint is the chunk COUNT; <=0 or >=n means one
-    // light per stage (the default; auto-tracks N as lights change).
-    const int n = static_cast<int>(leads.size());
-    if (n <= 0) return;
-    int D = stages_count_hint;
-    if (D <= 0 || D >= n) {
-        for (const auto& L : leads) {
-            ChaseStage s;
-            for (const auto& m : L.members) s.members.push_back(m);
-            chase.stages.push_back(std::move(s));
-        }
-        return;
-    }
-    const int base = n / D;
-    const int rem  = n % D;          // first `rem` chunks get base+1
-    int idx = 0;
-    for (int g = 0; g < D; ++g) {
-        const int sz = base + (g < rem ? 1 : 0);
-        ChaseStage cur;
-        for (int k = 0; k < sz && idx < n; ++k, ++idx)
-            for (const auto& m : leads[idx].members)
-                cur.members.push_back(m);
-        if (!cur.members.empty()) chase.stages.push_back(std::move(cur));
-    }
-}
-
-// ===== Random-scatter preview ========================================
-// ScatterLoopFrames + RegenerateScatter are shared inlines in
-// panel_state.h (the AE builder regenerates too — see note there).
-
-// Envelope (0..1) of a scattered hit at `playhead`, seamless-wrapped:
-// a hit whose tail crosses the loop end re-enters at the start.
-float ScatterHitEnvelope(float playhead, float start, float loop_frames,
-                         const ChaseTiming& t)
-{
-    if (loop_frames <= 0.f) return 0.f;
-    const float hold  = std::max(0.f, t.hold);
-    const float total = t.duration + hold;
-    float local = std::fmod(playhead - start, loop_frames);
-    if (local < 0.f) local += loop_frames;
-    if (local >= total) return 0.f;
-    const float att = std::max(0.001f, std::min(t.attack, t.duration - 0.001f));
-    if (local < att) return local / att;                     // rising
-    if (local < att + hold) return 1.f;                      // holding
-    const float fall_len = std::max(0.001f, t.duration - att);
-    return (total - local) / fall_len;                       // falling
-}
-
-// Composite a scatter chase at `playhead` (loop-relative frames).
-// Same accumulation as BuildChaseComposite; per-hit wrapped envelope.
-bool BuildScatterComposite(const Chase& chase, const PanelState& state,
-                           float playhead, float fps,
-                           std::vector<uint8_t>& out_rgba,
-                           int& out_w, int& out_h)
-{
-    out_w = 0; out_h = 0;
-    const int loop_frames = ChaseLoopFrames(chase, state, fps);
-    float shared_peak = 0.f;
-    for (const auto& hit : chase.scatter) {
-        const LayerInfo* L = FindLayerByRef(state, hit.ref);
-        if (!L) continue;
-        if (out_w == 0 && L->thumb_w > 0 && L->thumb_h > 0) {
-            out_w = L->thumb_w; out_h = L->thumb_h;
-        }
-        if (L->thumb_peak > shared_peak) shared_peak = L->thumb_peak;
-    }
-    if (out_w == 0 || out_h == 0) return false;
-
-    std::vector<CompositeContribution> contribs;
-    for (const auto& hit : chase.scatter) {
-        const float env = ScatterHitEnvelope(playhead, hit.start_frame,
-                                              loop_frames, chase.timing);
-        float op_pk = chase.timing.opacity_peak;
-        float op_fl = chase.timing.opacity_floor;
-        if (op_fl < 0.f) op_fl = 0.f;
-        if (op_fl > op_pk) op_fl = op_pk;
-        // With a floor every hit holds the light at >= floor, so don't
-        // skip troughs; Lighten max-combines duplicate floor contribs.
-        if (env <= 0.f && op_fl <= 0.f) continue;
-        const float opacity = (op_fl + (op_pk - op_fl) * env) / 100.f;
-        const float gamma_t = chase.timing.gamma_baseline +
-            (chase.timing.gamma_peak - chase.timing.gamma_baseline) * env;
-        const float k = opacity * gamma_t;
-        if (k <= 0.f) continue;
-        contribs.push_back({ FindLayerByRef(state, hit.ref), k });
-    }
-    return LightenComposite(contribs, out_w, out_h, shared_peak, out_rgba);
-}
-
-// Build a JSON string describing a chase. The companion JSX executor
-// will read this and build the AE comp. Format is intentionally
-// human-readable.
-std::string BuildChaseExportJson(const Chase& chase, const PanelState& state)
-{
-    std::string out;
-    auto append = [&](const char* s) { out += s; };
-    append("{\n");
-    out += "  \"version\": 1,\n";
-    out += "  \"name\": \"" + JsonEscapeForChase(chase.name) + "\",\n";
-    out += "  \"sort_mode\": " + std::to_string((int)chase.sort_mode) + ",\n";
-    out += "  \"sort_reverse\": ";
-    out += chase.sort_reverse ? "true" : "false";
-    out += ",\n";
-    out += "  \"timing\": {\n";
-    char tbuf[256];
-    std::snprintf(tbuf, sizeof(tbuf),
-        "    \"duration\": %.3f,\n"
-        "    \"attack\": %.3f,\n"
-        "    \"step_duration\": %.3f,\n"
-        "    \"opacity_peak\": %.3f,\n"
-        "    \"gamma_peak\": %.3f,\n"
-        "    \"gamma_baseline\": %.3f\n",
-        chase.timing.duration, chase.timing.attack,
-        chase.timing.step_duration, chase.timing.opacity_peak,
-        chase.timing.gamma_peak, chase.timing.gamma_baseline);
-    out += tbuf;
-    out += "  },\n";
-    out += "  \"stages\": [\n";
-    for (size_t si = 0; si < chase.stages.size(); ++si) {
-        out += "    [\n";
-        const auto& stage = chase.stages[si];
-        for (size_t mi = 0; mi < stage.members.size(); ++mi) {
-            const LayerRef& m = stage.members[mi];
-            const LayerInfo* L = FindLayerByRef(state, m);
-            const Source* src = FindSourceById(state, m.source_id);
-            std::snprintf(tbuf, sizeof(tbuf),
-                "      {\"source_id\": %u, \"layer_hash\": %u, "
-                "\"source\": \"%s\", \"layer\": \"%s\"}%s\n",
-                m.source_id, m.fnv1a_hash,
-                src ? JsonEscapeForChase(Basename(src->path)).c_str() : "",
-                L ? JsonEscapeForChase(L->display_name).c_str() : "",
-                (mi + 1 < stage.members.size()) ? "," : "");
-            out += tbuf;
-        }
-        out += (si + 1 < chase.stages.size()) ? "    ],\n" : "    ]\n";
-    }
-    out += "  ]\n";
-    out += "}\n";
-    return out;
-}
 
 // ===== Chase tab + wizard =============================================
-const char* kChaseTemplateNames[] = {
-    "Left to Right",
-    "Top to Bottom",
-    "Center Out",
-    "3 Step Chase",
-    "Random",
-    "Hit",
-    "Custom",
-};
 
-void ApplyTemplateToChase(Chase& c, int template_idx)
-{
-    // Defaults: 0 chunks = one light per stage (auto), auto sort
-    // (template re-derives stages from scratch, so any prior manual
-    // arrangement is intentionally dropped). 3 Step (= 3 chunks) /
-    // Center Out override below.
-    c.desired_stage_count = 0;   // 0 = one light per stage (auto)
-    c.symmetric_pairs = false;
-    c.manual_stages = false;
-    c.random_scatter = false;
-    switch (template_idx) {
-    // Left→Right: Hotspot X (bright concentrated source, spill
-    // ignored) is the default ordering basis for chases.
-    case 0: c.sort_mode = SortMode::HotspotX;           c.sort_reverse = false; break;
-    case 1: c.sort_mode = SortMode::CentroidY;          c.sort_reverse = false; break;
-    case 2:
-        // Center Out: order by HOTSPOT x (the bright concentrated
-        // source, not the spill-influenced whole-layer centroid) so
-        // the mirrored pairing is spatially symmetric, then weld
-        // pairs outward from the middle. Even light counts pair the
-        // two centermost together as stage 1 (see RegenerateChase
-        // Stages' symmetric_pairs branch: lo=(n-1)/2, hi=n/2).
-        c.sort_mode = SortMode::HotspotX;
-        c.sort_reverse = false;
-        c.symmetric_pairs = true;
-        break;
-    case 3:
-        c.sort_mode = SortMode::HotspotX;
-        c.sort_reverse = false;
-        c.desired_stage_count = 3;
-        break;
-    case 4: {
-        // Random = the stratified scatter generator (not a sort).
-        c.random_scatter  = true;
-        c.loop_seconds    = (c.loop_seconds > 0.f) ? c.loop_seconds : 10.0f;
-        c.scatter_density = (c.scatter_density > 0) ? c.scatter_density : 5;
-        std::random_device rd;
-        c.random_seed = rd();
-        break;
-    }
-    case 5:
-        // Hit: one stage with ALL lights firing together exactly
-        // once. In loop-mode the envelope sits at phase 0 and the
-        // wrapped triangle is 0 outside [0, hit_duration), so it
-        // plays once at the start then stays black for the rest of
-        // the loop — "black to black", no looping/wrapping in the
-        // animation. Cycles forced to 1 so a cycle setting carried
-        // over from another template doesn't repeat the hit.
-        c.sort_mode = SortMode::HotspotX;
-        c.sort_reverse = false;
-        c.desired_stage_count = 1;     // 1 chunk = all lights in one stage
-        c.loop_cycles = 1;             // exactly one hit per loop
-        break;
-    case 6: default: break; // custom — leave as-is
-    }
-}
 
 void DrawWizardForChaseTab(PanelState* state, FrameSnapshot& snap, int chase_index)
 {
@@ -2927,7 +2543,7 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     }
     ImGui::SameLine();
     if (ImGui::Button("Build in AE")) {
-        state->want_build_chase_index = chase_index;
+        state->export_pending_index = chase_index;
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
@@ -3034,7 +2650,7 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     if (FrameSlider("Hit Hold", t.hold, 0, 600, 0)) t_changed = true;
     ImGui::SameLine();
     ImGui::SetNextItemWidth(slider_w);
-    const bool loop_mode = ChaseLoopMode(*state);
+    const bool loop_mode = SessionAnimates(*state);
     if (loop_mode) {
         // Animation source: loop length is locked to WHOLE source
         // durations (integer ×N only — never a free length, so it
@@ -3243,7 +2859,7 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
     std::vector<float> stage_envelopes(cs.stages.size(), 0.f);
     int   active_stage_top = -1;
     float active_top_env = 0.f;
-    const int hl_loop_frames = ChaseLoopMode(*state)
+    const int hl_loop_frames = SessionAnimates(*state)
         ? ChaseLoopFrames(cs, *state, fps) : 0;
     for (size_t si = 0; si < cs.stages.size(); ++si) {
         stage_envelopes[si] = ChaseStageEnvelopeAt(
@@ -3576,8 +3192,10 @@ void DrawChaseEditor(PanelState* state, FrameSnapshot& snap, int chase_index,
         float w = static_cast<float>(state->thumb_max_width);
         if (w < 64.f) w = 64.f; else if (w > 2048.f) w = 2048.f;
         float h = w * aspect;
+        const ImVec2 img_at = ImGui::GetCursorScreenPos();
         ImGui::Image((ImTextureID)state->chase_composite_texture_id,
                      ImVec2(w, h));
+        DrawFpsBadge(img_at, std::max(1.f, state->project_fps.load()));
     } else {
         ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, 60.f));
         ImGui::TextDisabled("(no composite — add layers or wait for thumbs)");
@@ -3658,7 +3276,7 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
             state->chases[chase_index].name = name_buf;
     }
     ImGui::SameLine();
-    if (ImGui::Button("Build in AE")) state->want_build_chase_index = chase_index;
+    if (ImGui::Button("Build in AE")) state->export_pending_index = chase_index;
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
             "Build a seamless looping comp: every eligible light gets\n"
@@ -3667,16 +3285,16 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
     }
 
     ImGui::TextColored(ImVec4(0.55f, 0.75f, 1.f, 1.f),
-        "Random scatter \xE2\x80\x94 stratified (every light used; copies "
-        "spread evenly, never self-stacking).");
+        "Random scatter \xE2\x80\x94 every light used, hits spread evenly, "
+        "bright lights kept apart, never self-stacking.");
 
     // ---- Scatter params ----
     bool changed = false;
     float loop_s = cs.loop_seconds;
     int   loop_mult = cs.loop_multiple < 1 ? 1 : cs.loop_multiple;
-    int   dens   = cs.scatter_density;
+    float dens   = cs.scatter_density;
     int   seed_i = static_cast<int>(cs.random_seed);
-    const bool loopmode = ChaseLoopMode(*state);
+    const bool loopmode = SessionAnimates(*state);
     if (loopmode) {
         // Animation source: the loop is locked to WHOLE source
         // durations — never a free-form length. Only an integer
@@ -3699,9 +3317,59 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
     ImGui::TextUnformatted("Density");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(150.f);
-    if (ImGui::SliderInt("##dens", &dens, 1, 25, "%d /light")) changed = true;
+    if (ImGui::SliderFloat("##dens", &dens, 0.05f, 25.f, "%.2f /light"))
+        changed = true;
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Copies of each light spread across the loop.");
+        ImGui::SetTooltip("Copies of each light spread across the loop.\n"
+                          "Below 1.00 there are fewer slots than lights,\n"
+                          "so some sit the loop out - that is how a big\n"
+                          "rig with a long hit gets sparse.");
+    // Retune the hit length to a concurrency target. Same control as
+    // the pack generator: hit duration over step IS the average number
+    // of lights lit, so asking for "about 4 lit" is a timing change,
+    // not a re-scatter — the hits themselves stay put.
+    {
+        const int loop_now = ChaseLoopFrames(cs, *state, fps);
+        const int n_lights = CountEligibleLights(*state, cs.tag_filter);
+        float want = ScatterLightsOn(cs.scatter_density, n_lights, loop_now,
+                                     cs.timing.duration);
+        if (want < 0.5f) want = 0.5f;
+        ImGui::TextUnformatted("Lights on");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(150.f);
+        if (ImGui::SliderFloat("##lightson", &want, 0.5f, 24.f,
+                               "%.1f at a time")) {
+            std::lock_guard<std::mutex> lk(state->mu);
+            if (chase_index < (int)state->chases.size()) {
+                Chase& real = state->chases[chase_index];
+                real.scatter_density =
+                    DensityForLightsOn(want, n_lights, loop_now,
+                                       real.timing.duration);
+                RegenerateScatter(real, *state, fps);
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "How many lights are lit at any instant. Sets how\n"
+                "many copies of each light get scattered across the\n"
+                "loop — the arithmetic you would otherwise do by\n"
+                "hand, differently for every scene size.");
+        }
+        {
+            // Every light fires at least once, so a big rig with long
+            // hits cannot go as sparse as asked. Report the truth.
+            const float got = ScatterLightsOn(
+                DensityForLightsOn(want, n_lights, loop_now,
+                                   cs.timing.duration),
+                n_lights, loop_now, cs.timing.duration);
+            if (got > want + 0.5f) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(~%.0f — every light fires once)",
+                                    got);
+            }
+        }
+    }
+
     ImGui::TextUnformatted("Seed");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(150.f);
@@ -3713,9 +3381,10 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
         changed = true;
     }
     ImGui::SameLine();
+    // Hits-per-light is fractional now, so report the light COUNT that
+    // actually fires rather than dividing by a whole density.
     ImGui::TextDisabled("%d lights \xC2\xB7 %zu hits \xC2\xB7 %d frames",
-        (cs.scatter.empty() || dens <= 0)
-            ? 0 : (int)(cs.scatter.size() / std::max(1, dens)),
+        (int)CountEligibleLights(*state, cs.tag_filter),
         cs.scatter.size(), ChaseLoopFrames(cs, *state, fps));
 
     // ---- Hit envelope (shared ChaseTiming; no step in scatter) ----
@@ -3762,7 +3431,7 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
             Chase& real = state->chases[chase_index];
             real.loop_seconds   = std::max(0.1f, loop_s);
             real.loop_multiple  = loop_mult < 1 ? 1 : loop_mult;
-            real.scatter_density = std::max(1, dens);
+            real.scatter_density = (dens > 0.f) ? dens : 0.01f;
             real.random_seed    = static_cast<uint32_t>(seed_i);
             real.timing         = t;
             state->default_timing = t;
@@ -3932,8 +3601,10 @@ void DrawScatterEditor(PanelState* state, FrameSnapshot& snap,
         float w = static_cast<float>(state->thumb_max_width);
         if (w < 64.f) w = 64.f; else if (w > 2048.f) w = 2048.f;
         float h = w * aspect;
+        const ImVec2 img_at = ImGui::GetCursorScreenPos();
         ImGui::Image((ImTextureID)state->chase_composite_texture_id,
                      ImVec2(w, h));
+        DrawFpsBadge(img_at, std::max(1.f, state->project_fps.load()));
     } else {
         ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, 60.f));
         ImGui::TextDisabled("(no composite — wait for thumbs)");
@@ -3980,29 +3651,1039 @@ void DrawChaseTab(PanelState* state, FrameSnapshot& snap, int chase_index,
 
 // ===== Session toolbar ================================================
 
-void DrawSessionToolbar(PanelState* state, const FrameSnapshot& snap)
+// One-click generation of the standard chase family — scene-wide
+// and/or one family per checked tag (the per-fixture-group sets that
+// used to be built a chase at a time through the wizard). Timing is
+// fitted to the real light count and loop length by AutoFitTiming, so
+// the result is previewable without touching a slider first.
+// CountEligibleLights runs the real stage generator, so it is far too
+// heavy to call every frame across a session with many tags. Both
+// entry points refresh once, as their window opens.
+void RefreshPackScopeCounts(PanelState* state)
 {
-    if (ImGui::Button("Save session")) state->want_save_session = true;
+    std::lock_guard<std::mutex> lk(state->mu);
+    state->pack_scope_counts.clear();
+    state->pack_scope_counts.emplace_back(
+        0u, CountEligibleLights(*state, {}));
+    for (const auto& t : state->tags) {
+        state->pack_scope_counts.emplace_back(
+            t.tag_id, CountEligibleLights(*state, { t.tag_id }));
+    }
+}
+
+// The scope picker, shared by the Sources tab button and the Review
+// tab's Include/Exclude. `show_replace` is false in Review, where
+// replacing the current set is the whole reason the window is open
+// and a checkbox asking about it is a question with one answer.
+void DrawPackScopeBody(PanelState* state, const FrameSnapshot& snap,
+                       bool show_replace)
+{
+    auto scope_count = [&](uint32_t id) {
+        for (const auto& kv : state->pack_scope_counts) {
+            if (kv.first == id) return kv.second;
+        }
+        return 0;
+    };
+
+    ImGui::TextDisabled("Five chases: Left to Right, Bottom to Top,\n"
+                        "Center Out, 3 Step Chase, Random.");
+    ImGui::Separator();
+    // The tags choose WHICH LIGHTS the five chases are built from. They
+    // are not a multiplier — ticking six of them gives five chases out
+    // of those six families, not thirty chases.
+    ImGui::Checkbox("Whole scene", &state->pack_scope_all);
     ImGui::SameLine();
-    if (ImGui::Button("Load session")) state->want_load_session = true;
+    ImGui::TextDisabled("(%d lights)", scope_count(0));
+
+    if (!snap.tags.empty()) {
+        ImGui::BeginDisabled(state->pack_scope_all);
+        ImGui::TextDisabled("Or just these groups:");
+        ImGui::SameLine();
+        // A scene with dozens of tags is a lot of ticking either way
+        // round, so both directions get a button.
+        if (ImGui::SmallButton("All")) {
+            state->pack_scope_tags.clear();
+            for (const auto& t : snap.tags) {
+                // Empty tags drive nothing and are disabled below;
+                // checking them would only make empty chases.
+                if (scope_count(t.tag_id) > 0) {
+                    state->pack_scope_tags.push_back(t.tag_id);
+                }
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("None")) state->pack_scope_tags.clear();
+        const float rowH = ImGui::GetFrameHeightWithSpacing();
+        const int   rows = (int)snap.tags.size() < 8 ? (int)snap.tags.size() : 8;
+        ImGui::BeginChild("pack_tags", ImVec2(260.f, rows * rowH + 8.f), true);
+        for (const auto& t : snap.tags) {
+            bool sel = false;
+            for (uint32_t x : state->pack_scope_tags) {
+                if (x == t.tag_id) { sel = true; break; }
+            }
+            const int live = scope_count(t.tag_id);
+            ImGui::PushID((int)t.tag_id);
+            // A tag can hold members whose source is gone (removed and
+            // re-added mints a new id); those drive nothing, so an
+            // empty tag is shown greyed rather than silently making
+            // five empty chases.
+            ImGui::BeginDisabled(live == 0);
+            char tag_label[160];
+            std::snprintf(tag_label, sizeof(tag_label), "%s (%d)",
+                          t.name.c_str(), live);
+            if (ImGui::Checkbox(tag_label, &sel)) {
+                if (sel) {
+                    state->pack_scope_tags.push_back(t.tag_id);
+                } else {
+                    for (auto it = state->pack_scope_tags.begin();
+                         it != state->pack_scope_tags.end(); ++it) {
+                        if (*it == t.tag_id) {
+                            state->pack_scope_tags.erase(it);
+                            break;
+                        }
+                    }
+                }
+            }
+            ImGui::EndDisabled();
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::EndDisabled();
+    }
+
+    // How many lights the five chases will actually be built from.
+    // CountEligibleLights runs the real stage generator, so it is only
+    // recomputed when the selection changes, not every frame.
+    const bool whole = state->pack_scope_all;
+    uint64_t sel_sig = whole ? 1ull : 2ull;
+    for (uint32_t id : state->pack_scope_tags) {
+        sel_sig = sel_sig * 1099511628211ull + id;
+    }
+    if (sel_sig != state->pack_sel_sig) {
+        std::lock_guard<std::mutex> lk(state->mu);
+        state->pack_sel_sig = sel_sig;
+        state->pack_sel_count = whole
+            ? CountEligibleLights(*state, {})
+            : CountEligibleLights(*state, state->pack_scope_tags);
+    }
+    const int in_scope = state->pack_sel_count;
+
+    ImGui::Separator();
+    ImGui::Text("5 chases from %d light%s", in_scope,
+                in_scope == 1 ? "" : "s");
+
+    if (show_replace && !snap.chases.empty()) {
+        char rep[120];
+        std::snprintf(rep, sizeof(rep), "Replace the %d chase%s I have",
+                      (int)snap.chases.size(),
+                      snap.chases.size() == 1 ? "" : "s");
+        ImGui::Checkbox(rep, &state->pack_replace);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "On: start over with just the new set - what you want\n"
+                "after trimming which lights are included.\n"
+                "Off: add these alongside the ones you have.\n"
+                "Either way Ctrl+Z gets the old set back.");
+        }
+    } else if (!show_replace && !snap.chases.empty()) {
+        // Opened from Review: replacing this set is the reason you are
+        // here, so it is stated rather than asked.
+        ImGui::TextDisabled("Replaces the %d chase%s you have, keeping "
+                            "their timing.",
+                            (int)snap.chases.size(),
+                            snap.chases.size() == 1 ? "" : "s");
+    }
+
+    ImGui::Spacing();
+    ImGui::BeginDisabled(in_scope < 1);
+    if (ImGui::Button("Generate", ImVec2(140.f, 0.f))) {
+        int made = 0;
+        {
+            std::lock_guard<std::mutex> lk(state->mu);
+            const float fps = state->project_fps.load();
+            // Replacing keeps the TUNING and throws away only the
+            // membership: the whole point of the second pass is that a
+            // light shouldn't have been in the set, not that the hits
+            // and lengths were wrong. Held by name, since a replaced
+            // pack regenerates the same names for the same scopes.
+            std::vector<Chase> previous;
+            std::vector<std::string> was_unchecked;
+            std::vector<std::pair<std::string, float>> was_playhead;
+            std::vector<std::string> was_paused;
+            if (state->pack_replace) {
+                previous = state->chases;
+                for (const Chase& c : previous) {
+                    for (uint32_t x : state->sheet_unchecked)
+                        if (x == c.chase_id) was_unchecked.push_back(c.name);
+                    for (uint32_t x : state->sheet_paused_ids)
+                        if (x == c.chase_id) was_paused.push_back(c.name);
+                    for (const auto& kv : state->sheet_playheads)
+                        if (kv.first == c.chase_id)
+                            was_playhead.emplace_back(c.name, kv.second);
+                }
+                state->chases.clear();
+                state->active_chase_index = -1;
+                state->sheet_playheads.clear();
+                state->sheet_paused_ids.clear();
+                state->sheet_unchecked.clear();
+            }
+            const int first = (int)state->chases.size();
+            // ONE pack, scoped. The ticked groups say which lights are
+            // in it, not how many packs to build.
+            const std::vector<uint32_t> scope =
+                state->pack_scope_all ? std::vector<uint32_t>{}
+                                      : state->pack_scope_tags;
+            made = GenerateStandardPack(*state, scope, fps,
+                                        state->pack_lights_on);
+            int kept = 0;
+            if (made > 0 && !previous.empty()) {
+                kept = CarryOverChaseTweaks(*state, previous, fps);
+                // The per-cell review state rides along on the same
+                // name match, so a scrubbed cell stays where it was and
+                // an unticked chase stays unticked.
+                for (const Chase& c : state->chases) {
+                    for (const auto& n : was_unchecked)
+                        if (n == c.name) state->sheet_unchecked.push_back(c.chase_id);
+                    for (const auto& n : was_paused)
+                        if (n == c.name) state->sheet_paused_ids.push_back(c.chase_id);
+                    for (const auto& kv : was_playhead)
+                        if (kv.first == c.name)
+                            state->sheet_playheads.emplace_back(c.chase_id,
+                                                                kv.second);
+                }
+            }
+            if (made > 0) {
+                state->active_chase_index = first;
+                // Straight to the contact sheet. Without this the tab
+                // bar's AutoSelectNewTabs drops you on the last new
+                // chase's own tab, which is not what you asked to look
+                // at — and it closes the Include/Exclude round trip.
+                state->want_tab = (int)PanelTab::Review;
+                char buf[128];
+                if (kept > 0) {
+                    std::snprintf(buf, sizeof(buf),
+                                  "Generated %d chase%s, keeping the timing "
+                                  "on %d.", made, made == 1 ? "" : "s", kept);
+                } else {
+                    std::snprintf(buf, sizeof(buf),
+                                  "Generated %d chase%s.", made,
+                                  made == 1 ? "" : "s");
+                }
+                state->last_status = buf;
+            } else {
+                state->last_status =
+                    "No eligible lights — nothing generated.";
+            }
+        }
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
     ImGui::SameLine();
-    if (!snap.session_save_path.empty()) {
-        ImGui::TextDisabled("Session: %s", Basename(snap.session_save_path).c_str());
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", snap.session_save_path.c_str());
-    } else {
-        ImGui::TextDisabled("Session: (unsaved)");
+    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+}
+
+void DrawGeneratePack(PanelState* state, const FrameSnapshot& snap)
+{
+    ImGui::BeginDisabled(snap.layers.empty());
+    // The main action on the setup screen, sized and coloured to say
+    // so: everything else on this tab is preparation for it.
+    ImGui::PushStyleColor(ImGuiCol_Button,        IM_COL32( 46, 125,  50, 255));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32( 60, 160,  65, 255));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  IM_COL32( 36, 100,  40, 255));
+    const float gen_h = ImGui::GetFrameHeight() * 2.f;
+    const bool gen_clicked =
+        ImGui::Button("Generate chases", ImVec2(240.f, gen_h));
+    ImGui::PopStyleColor(3);
+    if (gen_clicked) {
+        RefreshPackScopeCounts(state);
+        ImGui::OpenPopup("gen_pack");
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Create Left to Right, Bottom to Top, Center Out,"
+                          " 3 Step and Random in one go, with timing"
+                          " fitted to this scene.");
+    }
+    if (!ImGui::BeginPopup("gen_pack")) return;
+    DrawPackScopeBody(state, snap, true);
+    ImGui::EndPopup();
+}
+
+
+// Every chase previewing at once, on one transport. The whole grid is
+// composited into a single buffer (chase_gen::BuildContactSheet) and
+// drawn as sub-rectangles of the one composite texture, so nothing here
+// touches the renderers' texture lifecycle.
+void DrawReviewTab(PanelState* state, const FrameSnapshot& snap,
+                   float panel_w)
+{
+    if (snap.chases.empty()) {
+        ImGui::TextDisabled("No chases yet. Generate a set from the Sources "
+                            "tab, or add one with the + tab.");
+        return;
+    }
+
+    auto is_checked = [&](uint32_t id) {
+        for (uint32_t x : state->sheet_unchecked) if (x == id) return false;
+        return true;
+    };
+
+    // ---- Transport ----
+    const float fps = std::max(1.f, state->project_fps.load());
+
+    // Per-cell transport helpers. Each chase runs on its own clock —
+    // a set holds chases of very different lengths, so one shared
+    // position is arbitrary for all but one of them.
+    auto playhead_of = [&](uint32_t id) -> float& {
+        for (auto& kv : state->sheet_playheads) {
+            if (kv.first == id) return kv.second;
+        }
+        state->sheet_playheads.emplace_back(id, 0.f);
+        return state->sheet_playheads.back().second;
+    };
+    // Playing is the default; only pauses are recorded.
+    auto is_playing = [&](uint32_t id) {
+        for (uint32_t x : state->sheet_paused_ids) if (x == id) return false;
+        return true;
+    };
+    auto set_playing = [&](uint32_t id, bool on) {
+        for (auto it = state->sheet_paused_ids.begin();
+             it != state->sheet_paused_ids.end(); ++it) {
+            if (*it == id) {
+                if (on) state->sheet_paused_ids.erase(it);
+                return;
+            }
+        }
+        if (!on) state->sheet_paused_ids.push_back(id);
+    };
+
+    // Play-all / pause-all is a convenience over the per-cell state,
+    // not a transport of its own.
+    if (ImGui::Button(state->sheet_all_paused ? "Play all" : "Pause all",
+                      ImVec2(90.f, 0.f))) {
+        state->sheet_all_paused = !state->sheet_all_paused;
+        state->sheet_paused_ids.clear();
+        if (state->sheet_all_paused) {
+            for (const auto& c : snap.chases) {
+                state->sheet_paused_ids.push_back(c.chase_id);
+            }
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Previews run on their own; stop them here\n"
+                          "if they are distracting.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset all")) {
+        for (auto& kv : state->sheet_playheads) kv.second = 0.f;
     }
     ImGui::SameLine(0.f, 20.f);
+    // The second pass: previews reveal a light that shouldn't be in
+    // the set, so go back to where lights are included or excluded and
+    // generate again. Without this the route is "find the right tab
+    // yourself", which is the friction this tab exists to remove.
+    // The second pass, without leaving the contact sheet: reopen the
+    // scope picker over it, change what is in, regenerate in place.
+    if (ImGui::Button("Include/Exclude")) {
+        RefreshPackScopeCounts(state);
+        state->pack_replace = true;
+        ImGui::OpenPopup("review_gen_pack");
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Change which lights and tags are in the set,\n"
+                          "then regenerate right here. Your hits and\n"
+                          "lengths carry over.");
+    }
+    if (ImGui::BeginPopup("review_gen_pack")) {
+        DrawPackScopeBody(state, snap, false);
+        ImGui::EndPopup();
+    }
+    ImGui::SameLine(0.f, 20.f);
+    ImGui::SetNextItemWidth(110.f);
+    // Users read this as zoom, so call it that: more zoom, fewer and
+    // bigger cells.
+    int zoom = 7 - state->sheet_cols;
+    if (IntSlider("Zoom", zoom, 1, 6, 4)) {
+        state->sheet_cols = 7 - zoom;
+        // A per-person preference, not a per-scene one: importing a
+        // new scene to test with must not put it back to a default.
+        session_io::SavePrefs(state);
+    }
+
+    // Advance whatever is playing, each on its own length.
+    {
+        const float dt = ImGui::GetIO().DeltaTime * fps;
+        std::lock_guard<std::mutex> lk(state->mu);
+        for (const auto& c : state->chases) {
+            if (!is_playing(c.chase_id)) continue;
+            float total = ChaseTotalFrames(c, *state, fps);
+            if (total <= 1.f) total = 1.f;
+            float& t = playhead_of(c.chase_id);
+            t += dt;
+            if (t >= total) t = std::fmod(t, total);
+        }
+    }
+
+    // ---- Composite the grid ----
+    const float avail_w = ImGui::GetContentRegionAvail().x;
+    int cols = state->sheet_cols < 1 ? 1 : state->sheet_cols;
+    // Cell resolution follows the drawn size, capped so a wide panel
+    // doesn't ask for a needlessly large buffer.
+    int cell_px = static_cast<int>(avail_w / static_cast<float>(cols)) - 8;
+    if (cell_px < 64)  cell_px = 64;
+    // Capped deliberately: this is a contact sheet, and cost scales
+    // with cell pixels times lit lights. The crisp full-size view is
+    // one click away in the chase's own tab.
+    if (cell_px > 256) cell_px = 256;
+
+    // Recompositing every frame is wasted work while the transport is
+    // parked, and on a saturated rig it is not cheap. Rebuild only when
+    // something that changes the picture has changed.
+    uint64_t sig = static_cast<uint64_t>(cols) * 1315423911u +
+                   static_cast<uint64_t>(cell_px) * 2654435761u;
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        for (const auto& c : state->chases) {
+            sig = sig * 1099511628211ull + c.chase_id;
+            sig ^= static_cast<uint64_t>(c.stages.size()) * 31u +
+                   static_cast<uint64_t>(c.scatter.size()) * 131u;
+            sig += static_cast<uint64_t>(c.timing.duration * 16.f) +
+                   static_cast<uint64_t>(c.timing.step_duration * 16.f) * 7u +
+                   static_cast<uint64_t>(c.timing.hold * 16.f) * 13u +
+                   static_cast<uint64_t>(c.loop_cycles) * 1021u;
+        }
+    }
+    // Every cell's own playhead, in chase order, plus a key over all of
+    // them so a scrub or a playing cell triggers a recomposite.
+    std::vector<float> playheads;
+    int t_key = 0;
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        playheads.reserve(state->chases.size());
+        for (const auto& c : state->chases) {
+            const float t = playhead_of(c.chase_id);
+            playheads.push_back(t);
+            t_key = t_key * 31 + static_cast<int>(t * 64.f);
+        }
+    }
+    const bool restale = (sig != state->sheet_sig) ||
+                         (t_key != state->sheet_t_key);
+
+    if (restale) {
+        std::lock_guard<std::mutex> lk(state->mu);
+        std::vector<uint8_t> rgba;
+        const ContactSheetLayout fresh =
+            BuildContactSheet(state->chases, *state, playheads,
+                              fps, cell_px, cols, rgba);
+        if (fresh.count > 0 && !rgba.empty()) {
+            state->chase_composite_rgba = std::move(rgba);
+            state->chase_composite_w = fresh.sheet_w;
+            state->chase_composite_h = fresh.sheet_h;
+            state->chase_composite_dirty = true;
+        }
+        state->sheet_count     = fresh.count;
+        state->sheet_grid_cols = fresh.cols;
+        state->sheet_grid_rows = fresh.rows;
+        state->sheet_cell_w    = fresh.cell_w;
+        state->sheet_cell_h    = fresh.cell_h;
+        state->sheet_px_w      = fresh.sheet_w;
+        state->sheet_px_h      = fresh.sheet_h;
+        state->sheet_sig       = sig;
+        state->sheet_t_key     = t_key;
+    }
+    ContactSheetLayout lay;
+    lay.count   = state->sheet_count;
+    // The toolbar (Generate chases) draws BEFORE this tab, so a click
+    // there appends to state->chases mid-frame while `snap` still holds
+    // the list this tab indexes. The sheet is built from state->chases,
+    // so its cell count can be larger than the snapshot — and the cell
+    // loop below reads snap.chases[k]. That overran the vector and took
+    // AE down with it. The extra chases simply get their cells on the
+    // next frame, when the snapshot has caught up.
+    if (lay.count > (int)snap.chases.size()) {
+        lay.count = (int)snap.chases.size();
+    }
+    lay.cols    = state->sheet_grid_cols;
+    lay.rows    = state->sheet_grid_rows;
+    lay.cell_w  = state->sheet_cell_w;
+    lay.cell_h  = state->sheet_cell_h;
+    lay.sheet_w = state->sheet_px_w;
+    lay.sheet_h = state->sheet_px_h;
+
+    if (lay.count <= 0 || state->chase_composite_texture_id == 0) {
+        ImGui::TextDisabled("(building preview\xE2\x80\xA6 thumbnails may still "
+                            "be loading)");
+        return;
+    }
+
+    // ---- Draw the cells ----
+    const float draw_w = (avail_w - 8.f * cols) / static_cast<float>(cols);
+    const float draw_h = draw_w * (lay.cell_h / static_cast<float>(lay.cell_w));
+    const ImTextureID tex = (ImTextureID)state->chase_composite_texture_id;
+    const ImVec2 sheet_origin = ImGui::GetCursorScreenPos();
+
+    for (int k = 0; k < lay.count; ++k) {
+        if (k % lay.cols != 0) ImGui::SameLine();
+        ImGui::BeginGroup();
+        ImGui::PushID(k);
+
+        const float u0 = (k % lay.cols) * lay.cell_w / (float)lay.sheet_w;
+        const float v0 = (k / lay.cols) * lay.cell_h / (float)lay.sheet_h;
+        const float u1 = u0 + lay.cell_w / (float)lay.sheet_w;
+        const float v1 = v0 + lay.cell_h / (float)lay.sheet_h;
+
+        const Chase& c = snap.chases[k];
+        const bool checked = is_checked(c.chase_id);
+        const ImVec2 cell_min = ImGui::GetCursorScreenPos();
+        ImGui::Image(tex, ImVec2(draw_w, draw_h), ImVec2(u0, v0),
+                     ImVec2(u1, v1));
+        // A cell that won't be built goes fully black and says so. A
+        // half-dimmed preview still animates, which reads as "included
+        // but darker" at a glance across a grid; black and labelled
+        // cannot be misread. (This ImGui build's Image() takes no tint
+        // argument, hence the overlay.)
+        if (!checked) {
+            const ImVec2 cell_max(cell_min.x + draw_w, cell_min.y + draw_h);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(cell_min, cell_max, IM_COL32(0, 0, 0, 255));
+            const char* label = "DISABLED";
+            const ImVec2 tsz = ImGui::CalcTextSize(label);
+            dl->AddText(ImVec2(cell_min.x + (draw_w - tsz.x) * 0.5f,
+                               cell_min.y + (draw_h - tsz.y) * 0.5f),
+                        IM_COL32(150, 150, 155, 255), label);
+        }
+        if (ImGui::IsItemClicked()) {
+            // Jump to that chase's own tab for the full-size view.
+            state->active_chase_index = k;
+            state->want_focus_chase_index = k;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s\nClick to open this chase.", c.name.c_str());
+        }
+
+        // This cell's own transport. Chases in a set run different
+        // lengths, so each preview scrubs on its own clock.
+        {
+            float total = 0.f;
+            {
+                std::lock_guard<std::mutex> lk(state->mu);
+                if (k < (int)state->chases.size()) {
+                    total = ChaseTotalFrames(state->chases[k], *state, fps);
+                }
+            }
+            if (total < 1.f) total = 1.f;
+            const bool playing = is_playing(c.chase_id);
+            if (ImGui::SmallButton(playing ? "||" : "|>")) {
+                set_playing(c.chase_id, !playing);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s this preview (%.1f s)",
+                                  playing ? "Pause" : "Play",
+                                  total / fps);
+            }
+            ImGui::SameLine();
+            float t = playhead_of(c.chase_id);
+            const float scrub_w = (draw_w - 34.f > 90.f) ? draw_w - 34.f : 90.f;
+            // -/+ step one frame, so a hit can be inspected frame by
+            // frame; double-click types an exact frame.
+            if (CellSlider("scrub", t, 0.f, total, "%.0f f", 1.f, 0.f,
+                           scrub_w)) {
+                set_playing(c.chase_id, false);
+                playhead_of(c.chase_id) = t;
+            }
+        }
+
+        bool ck = checked;
+        if (ImGui::Checkbox("##build", &ck)) {
+            if (ck) {
+                for (auto it = state->sheet_unchecked.begin();
+                     it != state->sheet_unchecked.end(); ++it) {
+                    if (*it == c.chase_id) {
+                        state->sheet_unchecked.erase(it);
+                        break;
+                    }
+                }
+            } else {
+                state->sheet_unchecked.push_back(c.chase_id);
+            }
+        }
+        ImGui::SameLine();
+        ImVec4 col = ImColor(ColorForId(c.chase_id)).Value;
+        ImGui::TextColored(col, "%s", c.name.c_str());
+
+        // Per-chase tweaks, right under the preview, so a pass over a
+        // generated set doesn't mean opening each one. Which controls
+        // appear depends on the chase: a sweep and a Random scatter
+        // don't have the same knobs. Names match the chase editor —
+        // this is a shortcut to it, not a second vocabulary.
+        {
+            int loop_now = 0;
+            int hits = 0;
+            {
+                std::lock_guard<std::mutex> lk(state->mu);
+                if (k < (int)state->chases.size()) {
+                    const Chase& rc = state->chases[k];
+                    loop_now = ChaseLoopFrames(rc, *state, fps);
+                    hits = rc.random_scatter ? (int)rc.scatter.size()
+                                             : (int)rc.stages.size();
+                }
+            }
+            const float ctl_w = (draw_w - 70.f > 90.f) ? draw_w - 70.f : 90.f;
+
+            // The hit envelope, straight off Noah's Kbar buttons. Same
+            // four choices in the same words, so picking a hit here
+            // means the same thing it means there.
+            const bool chunked = (!c.random_scatter && c.desired_stage_count > 0);
+            {
+                int hit = NearestHitPreset(c.timing);
+                const char* hit_names[kHitPresetCount];
+                for (int hi = 0; hi < kHitPresetCount; ++hi) {
+                    hit_names[hi] = kHitPresets[hi].name;
+                }
+                ImGui::SetNextItemWidth(ctl_w);
+                if (ImGui::Combo("##hit", &hit, hit_names, kHitPresetCount)) {
+                    std::lock_guard<std::mutex> lk(state->mu);
+                    if (k < (int)state->chases.size()) {
+                        Chase& rc = state->chases[k];
+                        ApplyHitPreset(rc.timing, hit);
+                        if (!rc.random_scatter && rc.desired_stage_count > 0) {
+                            // The spacing is its own knob, so a tweaked
+                            // one survives a hit change. Only clamp it:
+                            // spacing longer than the hit would leave
+                            // the scene dark between chunks.
+                            if (rc.timing.step_duration > rc.timing.duration)
+                                rc.timing.step_duration = rc.timing.duration;
+                        }
+                        // A longer hit changes how much is lit, so the
+                        // density that was right for the old one is not
+                        // right for the new one.
+                        if (rc.random_scatter) {
+                            const int n = CountEligibleLights(*state,
+                                                              rc.tag_filter);
+                            const float lit = ScatterLightsOn(
+                                rc.scatter_density, n, loop_now,
+                                kHitPresets[hit].duration);
+                            (void)lit;
+                            RegenerateScatter(rc, *state, fps);
+                        }
+                    }
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "How long one light stays lit, and its shape.\n"
+                        "The short hits punch and decay; the long ones\n"
+                        "rise and fall evenly.");
+                }
+            }
+
+            if (c.random_scatter) {
+                // Random's one knob: how many lights are lit at any
+                // instant. It sets how many COPIES of each light get
+                // scattered across the loop — the arithmetic that used
+                // to be done by hand, differently for every scene size.
+                const int n_lights = CountEligibleLights(*state, c.tag_filter);
+                float want = ScatterLightsOn(c.scatter_density, n_lights,
+                                             loop_now, c.timing.duration);
+                // This knob is QUANTIZED and the slider has to admit
+                // it. What actually gets placed is a whole number of
+                // SLOTS across the loop, and one slot is worth
+                // hit/loop lights lit — 0.1 at Hit 30 over 10 s, 0.3 at
+                // Hit 90. Stepping in tenths regardless just rounded
+                // back to where it started on a long hit. Step by the
+                // real quantum, so every press moves by exactly one
+                // slot.
+                const float quantum =
+                    (loop_now > 0) ? (c.timing.duration / (float)loop_now)
+                                   : 1.f;
+                auto on_grid = [&](float lit) {
+                    const long m = std::lround(lit / quantum);
+                    return quantum * static_cast<float>(m < 1 ? 1 : m);
+                };
+                float hi_lit = on_grid(quantum * n_lights * 25.f);
+                if (hi_lit > 40.f) hi_lit = on_grid(40.f);
+                const float lo_lit = on_grid(0.5f);
+                if (hi_lit < lo_lit) hi_lit = lo_lit;
+                const float def_lit = on_grid(kDefaultLightsOn);
+                if (want < lo_lit) want = lo_lit;
+                if (CellSlider("lightson", want, lo_lit, hi_lit, "%.1f lit",
+                               quantum, def_lit, ctl_w)) {
+                    std::lock_guard<std::mutex> lk(state->mu);
+                    if (k < (int)state->chases.size()) {
+                        Chase& rc = state->chases[k];
+                        rc.scatter_density =
+                            DensityForLightsOn(want, n_lights, loop_now,
+                                               rc.timing.duration);
+                        RegenerateScatter(rc, *state, fps);
+                    }
+                }
+                if (ImGui::IsItemHovered()) {
+                    // Below one copy of everything, some lights don't
+                    // fire at all. Say which, and how many — going that
+                    // sparse is a real choice, not a rounding artefact.
+                    const long slots = std::lround(
+                        (double)n_lights * c.scatter_density);
+                    const int firing = (int)((slots < n_lights) ? slots
+                                                                : n_lights);
+                    if (firing < n_lights) {
+                        ImGui::SetTooltip(
+                            "How many lights are lit at any instant.\n"
+                            "%d of %d lights fire this loop; the rest\n"
+                            "stay dark. Steps of %.1f (one slot, at a\n"
+                            "%.0f-frame hit over %d frames).",
+                            firing, n_lights, quantum,
+                            c.timing.duration, loop_now);
+                    } else {
+                        ImGui::SetTooltip(
+                            "How many lights are lit at any instant.\n"
+                            "All %d fire, %.2f times each. Steps of %.1f\n"
+                            "(one slot, at a %.0f-frame hit over %d\n"
+                            "frames).",
+                            n_lights, c.scatter_density, quantum,
+                            c.timing.duration, loop_now);
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reseed")) {
+                    std::random_device rd;
+                    std::lock_guard<std::mutex> lk(state->mu);
+                    if (k < (int)state->chases.size()) {
+                        state->chases[k].random_seed = rd();
+                        RegenerateScatter(state->chases[k], *state, fps);
+                    }
+                }
+            } else if (!c.manual_stages) {
+                // A sweep's one knob: how long the whole clip runs. The
+                // stagger between lights follows from it. A chunked
+                // chase has no such knob — its hit is derived from the
+                // step so the chunks overlap.
+                if (chunked) {
+                    // No chunk-count knob here: a 3 Step is three
+                    // chunks, always. The Advanced editor still has
+                    // Chunks for anything else that groups lights.
+                    //
+                    // When the next chunk fires, in frames after the
+                    // one before. Its own knob, defaulting to
+                    // kDefaultChunkStepFrames and independent of the
+                    // hit: earlier piles the chunks up, later spreads
+                    // them out. The range stops at the end of the hit,
+                    // because past that the scene would go dark
+                    // between chunks.
+                    float trig = c.timing.step_duration;
+                    if (CellSlider("trigger", trig, 1.f, c.timing.duration,
+                                   "next after %.0f f", 1.f,
+                                   kDefaultChunkStepFrames, ctl_w)) {
+                        std::lock_guard<std::mutex> lk(state->mu);
+                        if (k < (int)state->chases.size()) {
+                            state->chases[k].timing.step_duration = trig;
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            "When the next chunk fires, in frames after\n"
+                            "the one before. Earlier piles them up,\n"
+                            "later spreads them out. The hit is %.0f f\n"
+                            "long, so past that the scene goes dark\n"
+                            "between chunks.", c.timing.duration);
+                    }
+                    // Each tag starts its own 3 Step on a chosen beat;
+                    // this rerolls those starts. The choice is balanced
+                    // by brightness and position, so a reroll moves
+                    // between good answers, not to a random one.
+                    if (ImGui::SmallButton("Reseed")) {
+                        std::random_device rd;
+                        std::lock_guard<std::mutex> lk(state->mu);
+                        if (k < (int)state->chases.size()) {
+                            Chase& rc = state->chases[k];
+                            rc.random_seed = rd();
+                            RegenerateChaseStages(rc, *state,
+                                                  rc.desired_stage_count);
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            "Which beat each tag starts its own\n"
+                            "3 Step on. Kept balanced either way.");
+                    }
+                } else if (loop_now <= 0) {
+                    const int n_st = (int)c.stages.size();
+                    float clip = ((n_st > 1 ? n_st - 1 : 1) *
+                                  c.timing.step_duration + c.timing.duration)
+                                 / (fps > 1.f ? fps : 30.f);
+                    if (CellSlider("clip", clip, 0.5f, 30.f, "%.1f s long",
+                                   0.5f, kDefaultSweepSeconds, ctl_w)) {
+                        std::lock_guard<std::mutex> lk(state->mu);
+                        if (k < (int)state->chases.size()) {
+                            Chase& rc = state->chases[k];
+                            rc.timing = FitSweepTiming((int)rc.stages.size(),
+                                                       0, rc.loop_cycles, fps,
+                                                       rc.timing, clip);
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            "How long the whole chase takes, end to end.\n"
+                            "Adding lights tightens the spacing rather\n"
+                            "than making the chase longer.");
+                    }
+                } else {
+                    ImGui::TextDisabled("%.1f s (the scene's loop)",
+                                        loop_now / (fps > 1.f ? fps : 30.f));
+                }
+
+                // Which measure of "where a light is" drives the order.
+                const bool y_axis = (c.sort_mode == SortMode::CentroidY ||
+                                     c.sort_mode == SortMode::HotspotY ||
+                                     c.sort_mode == SortMode::PeakY);
+                int basis = 1;
+                if (c.sort_mode == SortMode::CentroidX ||
+                    c.sort_mode == SortMode::CentroidY) basis = 0;
+                else if (c.sort_mode == SortMode::PeakX ||
+                         c.sort_mode == SortMode::PeakY) basis = 2;
+                static const char* kBasis[] = { "Centroid", "Hotspot", "Peak" };
+                const bool spatial =
+                    (c.sort_mode == SortMode::CentroidX ||
+                     c.sort_mode == SortMode::CentroidY ||
+                     c.sort_mode == SortMode::HotspotX ||
+                     c.sort_mode == SortMode::HotspotY ||
+                     c.sort_mode == SortMode::PeakX ||
+                     c.sort_mode == SortMode::PeakY);
+                if (spatial) {
+                    ImGui::SetNextItemWidth(ctl_w);
+                    if (ImGui::Combo("##basis", &basis, kBasis, 3)) {
+                        const SortMode want_mode =
+                            (basis == 0) ? (y_axis ? SortMode::CentroidY
+                                                   : SortMode::CentroidX)
+                          : (basis == 1) ? (y_axis ? SortMode::HotspotY
+                                                   : SortMode::HotspotX)
+                                         : (y_axis ? SortMode::PeakY
+                                                   : SortMode::PeakX);
+                        std::lock_guard<std::mutex> lk(state->mu);
+                        if (k < (int)state->chases.size()) {
+                            Chase& rc = state->chases[k];
+                            rc.sort_mode = want_mode;
+                            RegenerateChaseStages(rc, *state,
+                                                  rc.desired_stage_count);
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            "Where a light counts as being:\n"
+                            "its whole spread, its bright core, or\n"
+                            "its single brightest pixel.");
+                    }
+                }
+            }
+        }
+
+        ImGui::PopID();
+        ImGui::EndGroup();
+    }
+
+    // Over the first cell, so it sits on the picture itself.
+    DrawFpsBadge(sheet_origin, fps);
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    int n_checked = 0;
+    for (const auto& c : snap.chases) if (is_checked(c.chase_id)) ++n_checked;
+    ImGui::BeginDisabled(n_checked == 0);
+    if (ImGui::Button("Build checked in AE", ImVec2(180.f, 0.f))) {
+        std::lock_guard<std::mutex> lk(state->mu);
+        state->build_queue.clear();
+        for (int i = 0; i < (int)state->chases.size(); ++i) {
+            if (is_checked(state->chases[i].chase_id)) {
+                state->build_queue.push_back(i);
+            }
+        }
+        state->want_build_queue = !state->build_queue.empty();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d of %d chase%s selected", n_checked,
+                        (int)snap.chases.size(),
+                        snap.chases.size() == 1 ? "" : "s");
+    (void)panel_w;
+}
+
+// The export name prompt. Every route into the builder comes through
+// here, so a comp can never be created without the artist seeing the
+// name it will get.
+void DrawExportPrefixDialog(PanelState* state, const FrameSnapshot& snap)
+{
+    if (state->export_pending_index == -2) return;
+
+    static char prefix_buf[128];
+    if (ImGui::IsPopupOpen("export_prefix") == false) {
+        // Opening: prefill with the last prefix used, or the AE project
+        // name, which is what it usually wants to be.
+        std::string seed = state->export_prefix;
+        if (seed.empty()) seed = snap.ae_project_name;
+        std::snprintf(prefix_buf, sizeof(prefix_buf), "%s", seed.c_str());
+        state->export_focus_field = true;
+        ImGui::OpenPopup("export_prefix");
+    }
+    if (!ImGui::BeginPopupModal("export_prefix", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    const bool all = (state->export_pending_index == -1);
+    ImGui::TextUnformatted("Name prefix for the comps:");
+    ImGui::SetNextItemWidth(320.f);
+    // Focus the field ONCE, as the dialog opens. Calling this every
+    // frame re-grabs focus every frame, which ate the mouse-down on the
+    // Export button — the only way out was the Enter key.
+    if (state->export_focus_field) {
+        ImGui::SetKeyboardFocusHere();
+        state->export_focus_field = false;
+    }
+    const bool entered = ImGui::InputText(
+        "##prefix", prefix_buf, sizeof(prefix_buf),
+        ImGuiInputTextFlags_EnterReturnsTrue);
+
+    // Show the actual name that will come out, built the same way the
+    // builder builds it — a prefix that reads fine can still produce a
+    // name the artist didn't expect.
+    std::string sample_chase = "LeftToRight";
+    if (!all && state->export_pending_index >= 0 &&
+        state->export_pending_index < (int)snap.chases.size()) {
+        sample_chase = CompactExportName(
+            snap.chases[state->export_pending_index].name);
+    } else if (!snap.chases.empty()) {
+        sample_chase = CompactExportName(snap.chases[0].name);
+    }
+    // No separator between the artist's prefix and the chase: David's
+    // convention is "USC_Curtains3StepChase_v1". The prefix already
+    // carries whatever underscores it wants.
+    std::string base = prefix_buf;
+    base += sample_chase;
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Comps will be named:");
+    if (state->export_split_groups) {
+        ImGui::Text("  %s_<Group>_v1", base.c_str());
+        ImGui::Text("  %s_v1", base.c_str());
+        ImGui::TextDisabled("  (one per lightgroup, plus the assemble comp)");
+    } else {
+        ImGui::Text("  %s_v1", base.c_str());
+    }
+    ImGui::TextDisabled("Rebuilding bumps the version; nothing is "
+                        "overwritten.");
+
+    ImGui::Spacing();
+    ImGui::Checkbox("Split Lightgroups on Export",
+                    &state->export_split_groups);
+
+    ImGui::Spacing();
+    const bool go = ImGui::Button(all ? "Export all" : "Export",
+                                 ImVec2(130.f, 0.f)) || entered;
+    if (go) {
+        {
+            std::lock_guard<std::mutex> lk(state->mu);
+            state->export_prefix = prefix_buf;
+        }
+        if (all) {
+            state->want_build_all_chases = true;
+        } else {
+            state->want_build_chase_index = state->export_pending_index;
+        }
+        state->export_pending_index = -2;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(130.f, 0.f))) {
+        state->export_pending_index = -2;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void DrawSessionToolbar(PanelState* state, const FrameSnapshot& snap)
+{
+    // Back to a blank panel. Confirmed, because it throws away every
+    // chase and there is no undo across it.
+    if (ImGui::Button("New session")) {
+        ImGui::OpenPopup("New session?");
+    }
+    if (ImGui::BeginPopupModal("New session?", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Clear everything and start over?");
+        ImGui::Spacing();
+        ImGui::TextDisabled("%d source%s, %d chase%s and every tag, bind\n"
+                            "and exclusion will be discarded. Undo does\n"
+                            "not reach back past this.",
+                            (int)snap.source_summaries.size(),
+                            snap.source_summaries.size() == 1 ? "" : "s",
+                            (int)snap.chases.size(),
+                            snap.chases.size() == 1 ? "" : "s");
+        if (snap.session_save_path.empty() && !snap.chases.empty()) {
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.62f, 0.18f, 1.f));
+            ImGui::TextUnformatted("This session has never been saved.");
+            ImGui::PopStyleColor();
+        }
+        ImGui::Spacing();
+        if (ImGui::Button("Start over", ImVec2(120.f, 0.f))) {
+            session_io::NewSession(state);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120.f, 0.f))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::SameLine();
+    // The AE project is the store; these two are export and import.
+    if (ImGui::Button("Export file")) state->want_save_session = true;
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Write a .chasemaker.json. The session already\n"
+                          "travels inside the .aep - this is for moving\n"
+                          "a setup to another project, or as a backup.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Import file")) state->want_load_session = true;
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Replace this session with one from a\n"
+                          ".chasemaker.json file.");
+    }
+    ImGui::SameLine();
+    if (!snap.project_store_status.empty()) {
+        ImGui::TextDisabled("%s", snap.project_store_status.c_str());
+    } else if (!snap.session_save_path.empty()) {
+        ImGui::TextDisabled("File: %s",
+                            Basename(snap.session_save_path).c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", snap.session_save_path.c_str());
+    }
+    ImGui::SameLine(0.f, 20.f);
+    // Generate chases is deliberately NOT here — it lives in the
+    // Sources tab, beside the include/exclude controls it depends on.
+    // Two copies also meant generating from a toolbar that draws before
+    // the tab bar, mutating the chase list mid-frame under whichever
+    // tab was already drawing against the frame's snapshot.
     ImGui::BeginDisabled(snap.chases.empty());
     if (ImGui::Button("Build all chases")) {
-        state->want_build_all_chases = true;
+        state->export_pending_index = -1;          // -1 = every chase
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Run the dumb-comps builder for every chase\n"
-                          "in this session. One AE undo step covers\n"
+                          "in this session, except chases unchecked in\n"
+                          "the Review tab. One AE undo step covers\n"
                           "the whole build.");
     }
     ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::Checkbox("Split Lightgroups on Export",
+                    &state->export_split_groups);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "One comp per lightgroup —\n"
+            "  Prefix_LeftToRight_Spotlights_v1\n"
+            "plus an assemble comp that stacks them with Lighten:\n"
+            "  Prefix_LeftToRight_v1\n"
+            "Export only. The chases themselves are unchanged.");
+    }
     {
         std::string status;
         bool exrdemux_missing = false;
@@ -4081,6 +4762,17 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
                 state->preview_accum_ms = 0.f;
             } else if (state->active_tab == PanelTab::Chase) {
                 state->chase_preview_playing = !state->chase_preview_playing;
+            } else if (state->active_tab == PanelTab::Review) {
+                // Spacebar is pause-all / play-all; individual cells
+                // keep their own buttons.
+                state->sheet_all_paused = !state->sheet_all_paused;
+                state->sheet_paused_ids.clear();
+                if (state->sheet_all_paused) {
+                    std::lock_guard<std::mutex> lk(state->mu);
+                    for (const auto& c : state->chases) {
+                        state->sheet_paused_ids.push_back(c.chase_id);
+                    }
+                }
             }
         }
     }
@@ -4094,19 +4786,48 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
     ImGui::Spacing();
 
     // Tab bar: Sources | Staging | chase tabs... | +
-    if (ImGui::BeginTabBar("CMTabBar",
-            ImGuiTabBarFlags_AutoSelectNewTabs |
-            ImGuiTabBarFlags_FittingPolicyScroll))
+    // NOT AutoSelectNewTabs. Generating a pack creates five chase tabs,
+    // and auto-select dropped you on the last of them — over the top of
+    // the Review tab the generate step explicitly asked for, since the
+    // chase tabs are built after it. Easy mode has to work without ever
+    // opening a chase tab, so selection is only ever explicit now:
+    // want_tab for the fixed tabs, want_focus_chase_index for a chase.
+    if (ImGui::BeginTabBar("CMTabBar", ImGuiTabBarFlags_FittingPolicyScroll))
     {
-        if (ImGui::BeginTabItem("Sources")) {
+        // A tab another part of the UI asked to open (the Review tab's
+        // "Lights & scope" button). ImGui owns tab selection, so it is
+        // applied as a flag on the tab itself.
+        auto tab_flags = [&](PanelTab which) -> ImGuiTabItemFlags {
+            if (state->want_tab != (int)which) return 0;
+            state->want_tab = -1;
+            return ImGuiTabItemFlags_SetSelected;
+        };
+        if (ImGui::BeginTabItem("Sources", nullptr,
+                                tab_flags(PanelTab::Sources))) {
             state->active_tab = PanelTab::Sources;
             DrawSourcesTab(state, snap);
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Staging")) {
+        if (ImGui::BeginTabItem("Staging", nullptr,
+                                tab_flags(PanelTab::Staging))) {
             state->active_tab = PanelTab::Staging;
             DrawStagingTab(state, snap, w, h);
             ImGui::EndTabItem();
+        }
+        if (!snap.chases.empty()) {
+            // Generating asks for this tab. That request can land in
+            // the SAME frame the Sources tab generated in, so both tabs
+            // draw once — which is exactly why the cell loop below
+            // clamps to the snapshot rather than trusting the sheet's
+            // own count. If there were no chases at all a moment ago,
+            // this tab doesn't exist yet and the request simply waits
+            // for the next frame.
+            if (ImGui::BeginTabItem("Review", nullptr,
+                                    tab_flags(PanelTab::Review))) {
+                state->active_tab = PanelTab::Review;
+                DrawReviewTab(state, snap, w);
+                ImGui::EndTabItem();
+            }
         }
         for (int ci = 0; ci < (int)snap.chases.size(); ++ci) {
             char label[160];
@@ -4126,7 +4847,12 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
             ImGui::PushStyleColor(ImGuiCol_TabDimmed,          tint(0.28f));
             ImGui::PushStyleColor(ImGuiCol_TabDimmedSelected,  tint(0.50f));
             bool open = true;
-            const bool visible = ImGui::BeginTabItem(label, &open);
+            ImGuiTabItemFlags tflags = ImGuiTabItemFlags_None;
+            if (state->want_focus_chase_index == ci) {
+                tflags |= ImGuiTabItemFlags_SetSelected;
+                state->want_focus_chase_index = -1;
+            }
+            const bool visible = ImGui::BeginTabItem(label, &open, tflags);
             ImGui::PopStyleColor(5);
             if (visible) {
                 state->active_tab = PanelTab::Chase;
@@ -4148,6 +4874,9 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
             nc.timing = state->default_timing;
             state->chases.push_back(nc);
             state->active_chase_index = (int)state->chases.size() - 1;
+            // "+" is an explicit request for that chase's tab, and now
+            // has to say so: nothing auto-selects a new tab any more.
+            state->want_focus_chase_index = state->active_chase_index;
             state->active_tab = PanelTab::Chase;
             state->chase_in_wizard = true;
             // Reset wizard form
@@ -4160,6 +4889,10 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
     }
 
     // ---- Chase delete confirmation (armed by a tab's close X) ----
+    // The export name prompt, drawn after the tab bar so it can be
+    // armed from the toolbar or from inside any chase tab.
+    DrawExportPrefixDialog(state, snap);
+
     if (state->chase_pending_close_index >= 0) {
         ImGui::OpenPopup("confirm_delete_chase");
     }
@@ -4219,6 +4952,11 @@ void RenderFrame(PanelState* state, float w, float h, void* host_view,
                     state->undo_stack.erase(state->undo_stack.begin());
                 }
                 state->redo_stack.clear();
+                // The same signal drives writing the session back into
+                // the .aep — one "something the artist authored just
+                // changed" detector rather than two that can disagree.
+                state->session_dirty = true;
+                state->session_dirty_ticks = 0;
             }
         }
         state->last_stable = std::move(cur);

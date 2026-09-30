@@ -22,6 +22,21 @@ struct LayerInfo;
 
 namespace exr_scan {
 
+// Why this pass is not a chase light, or empty if it is one.
+// Cryptomattes, the beauty/alpha passes, and the environment passes
+// (World / HDRI / Ambient) — matched EXACTLY, because pass names are
+// arbitrary and a substring rule would silently drop real fixtures
+// like "World_Light".
+std::string SkipReason(const std::string& display);
+
+// A softer signal for the setup screen: names that merely LOOK like
+// scenery ("Ambient_Fill", "HDRI_Sky_001"). Returns a human-readable
+// reason, or empty. Never applied automatically — it exists so the
+// user can be shown a suggestion and confirm it in one click. Names
+// already caught by SkipReason return empty (they are not suggestions,
+// they are already excluded).
+std::string EnvironmentHint(const std::string& display);
+
 // Add a source by path, routing on file type. Video clips
 // (.mov/.mp4/.mxf) become a single-light "movie" source: a placeholder
 // Source is created immediately (so it shows in the Sources tab) and

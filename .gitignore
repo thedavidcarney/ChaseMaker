@@ -45,6 +45,9 @@ DerivedData/
 *.idb
 *.ilk
 
+# --- Local test assets (large renders + saved sessions; never commit) ---
+testdata/
+
 # --- Misc ---
 *.log
 Thumbs.db

@@ -11,8 +11,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Match vcpkg's runtime: dynamic CRT (/MD or /MDd).
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+# Static CRT (/MT or /MTd), matching the x64-windows-static vcpkg
+# triplet. AE 2024 ships its own 2019-era msvcp140.dll next to
+# AfterFX.exe, and a dynamic-CRT .aex from a newer toolset resolves to
+# that old copy and crashes AE at startup. Linking the CRT in means the
+# plugin never depends on whichever runtime a given AE version bundles.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # macOS deployment target. arm64 minimum is 11.0 (Big Sur, first OS
 # with Apple Silicon support). Must match VCPKG_OSX_DEPLOYMENT_TARGET
@@ -78,6 +82,7 @@ add_library(ChaseMaker MODULE
     src/exr_scan.cpp
     src/session_io.cpp
     src/ae_build.cpp
+    src/chase_gen.cpp
     src/panel_ui.cpp
     "${AE_SDK_UTIL}/AEGP_SuiteHandler.cpp"
     "${AE_SDK_UTIL}/AEFX_SuiteHelper.c"
@@ -262,18 +267,89 @@ endif()
 # Pass an empty string (-DCHASEMAKER_AE_PLUGIN_DIR=) to disable; CI
 # should always disable.
 if(WIN32)
-    set(CHASEMAKER_AE_PLUGIN_DIR
+    # EVERY installed AE version gets the fresh build, not just one.
+    # A single hard-coded version left a four-month-old .aex sitting in
+    # AE 2026 while every build went to 2025 — and nothing about the
+    # panel says which build you are looking at except its title stamp.
+    # Only directories that actually exist are wired up, so this list
+    # can name versions this machine doesn't have.
+    set(CHASEMAKER_AE_PLUGIN_DIRS
+        "C:/Program Files/Adobe/Adobe After Effects 2026/Support Files/Plug-ins/ChaseMaker"
         "C:/Program Files/Adobe/Adobe After Effects 2025/Support Files/Plug-ins/ChaseMaker"
-        CACHE PATH
-        "AE plug-ins subdirectory to drop ChaseMaker.aex into after each build. Empty to disable.")
+        "C:/Program Files/Adobe/Adobe After Effects 2024/Support Files/Plug-ins/ChaseMaker"
+        CACHE STRING
+        "Semicolon-separated AE plug-ins subdirectories to drop ChaseMaker.aex into after each build.")
 
-    if(CHASEMAKER_AE_PLUGIN_DIR)
+    # The documented CI switch stays: -DCHASEMAKER_AE_PLUGIN_DIR= turns
+    # the whole post-build install off.
+    if(DEFINED CHASEMAKER_AE_PLUGIN_DIR AND NOT CHASEMAKER_AE_PLUGIN_DIR)
+        set(CHASEMAKER_AE_PLUGIN_DIRS "")
+    endif()
+
+    foreach(_cm_dir IN LISTS CHASEMAKER_AE_PLUGIN_DIRS)
+        # The Plug-ins parent is what tells us the version is installed;
+        # our own subfolder may not exist yet on a first build.
+        get_filename_component(_cm_parent "${_cm_dir}" DIRECTORY)
+        if(NOT IS_DIRECTORY "${_cm_parent}")
+            message(STATUS "ChaseMaker: skipping ${_cm_dir} (not installed)")
+            continue()
+        endif()
         add_custom_command(TARGET ChaseMaker POST_BUILD
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CHASEMAKER_AE_PLUGIN_DIR}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${_cm_dir}"
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                     "$<TARGET_FILE:ChaseMaker>"
-                    "${CHASEMAKER_AE_PLUGIN_DIR}/"
-            COMMENT "Installing ChaseMaker.aex to ${CHASEMAKER_AE_PLUGIN_DIR}"
+                    "${_cm_dir}/"
+            COMMENT "Installing ChaseMaker.aex to ${_cm_dir}"
             VERBATIM)
+    endforeach()
+endif()
+
+# ----- Tests -----
+# Native test executable over the AE-free logic: metrics, hashing,
+# chase generation, envelopes, session round-trips. No AE SDK, no
+# ImGui, no GPU — runs in a fraction of a second from the build dir.
+option(CHASEMAKER_BUILD_TESTS "Build the native logic tests" ON)
+
+if(CHASEMAKER_BUILD_TESTS)
+    add_executable(chasemaker_tests
+        tests/test_main.cpp
+        tests/test_timing_model.cpp
+        tests/test_tag_chunks.cpp
+        tests/test_export_naming.cpp
+        tests/test_build_math.cpp
+        tests/test_chase.cpp
+        tests/test_contact_sheet.cpp
+        tests/test_integration.cpp
+        tests/test_pack.cpp
+        tests/test_prune.cpp
+        tests/test_scatter.cpp
+        tests/test_sort_sources.cpp
+        tests/test_metrics.cpp
+        tests/test_exr_decode.cpp
+        tests/test_session.cpp
+        tests/test_skiplist.cpp
+        tests/test_undo.cpp
+        src/hash.cpp
+        src/exr_scan.cpp
+        src/session_io.cpp
+        src/chase_gen.cpp
+    )
+    target_include_directories(chasemaker_tests PRIVATE src tests)
+    # Real saved sessions live outside the repo history (gitignored,
+    # large). Tests that use them skip when the folder is absent.
+    target_compile_definitions(chasemaker_tests PRIVATE
+        CM_TESTDATA_DIR="${CMAKE_SOURCE_DIR}/testdata"
+        CM_TEST_TMP="${CMAKE_BINARY_DIR}/testtmp"
+        CM_DIAG_DISABLE)
+    target_link_libraries(chasemaker_tests PRIVATE
+        OpenEXR::OpenEXR
+        Imath::Imath
+    )
+    if(WIN32)
+        target_compile_definitions(chasemaker_tests PRIVATE
+            MSWindows WIN32 _WINDOWS NOMINMAX)
     endif()
+
+    enable_testing()
+    add_test(NAME logic COMMAND chasemaker_tests)
 endif()

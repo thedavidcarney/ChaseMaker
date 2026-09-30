@@ -40,10 +40,18 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 namespace {
 
 constexpr UINT_PTR kRedrawTimerId = 0xC4A5E;     // arbitrary
-constexpr UINT     kRedrawIntervalMs = 33;       // ~30 Hz — halve the
-// per-frame GPU + Present pressure we put on AE's main UI thread
-// (RenderFrame runs there). 30 Hz is plenty for a tool panel and
-// markedly cuts contention with AE's own GPU rendering.
+// 31, not 33, and the exact number matters. WM_TIMER is quantized to
+// the system tick (15.6 ms by default, and we do NOT call
+// timeBeginPeriod — raising the global timer resolution from inside
+// AE's process is not ours to do). A timer fires on the first tick at
+// or past its interval, so 33 ms needs THREE ticks (46.9 ms = 21 Hz)
+// while 31 ms needs two (31.25 ms = 32 Hz). The old 33 therefore
+// capped every preview at ~21 fps — below the 30 fps sessions are
+// built at — for no saving: 31 costs the same two ticks per redraw
+// that the 30 Hz intent asked for. Deliberately just above 30 rather
+// than at 60: RenderFrame runs on AE's main UI thread and the point
+// of this timer is to stay out of AE's way.
+constexpr UINT     kRedrawIntervalMs = 31;
 constexpr char     kHostHwndProp[] = "ChaseMakerPanelRenderer";
 constexpr UINT     kMsgGrabFocus = WM_USER + 1;
 

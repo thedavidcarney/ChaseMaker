@@ -88,4 +88,11 @@ inline void logf(const char* fmt, ...)
 #  pragma warning(pop)
 #endif
 
+// The native test target defines CM_DIAG_DISABLE: its runs load real
+// sessions and would otherwise bury AE's crash trail under thousands of
+// scan lines in the same file.
+#ifdef CM_DIAG_DISABLE
+#define CM_DIAG_LOG(...) ((void)0)
+#else
 #define CM_DIAG_LOG(...) ::cm_diag::logf(__VA_ARGS__)
+#endif
