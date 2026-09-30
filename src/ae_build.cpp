@@ -259,10 +259,6 @@ A_Err EnsureFootage(AEGP_SuiteHandler& sp,
 }
 
 // ===== Effect helpers =================================================
-//
-// EffectSuite4, not 5: Suite5 only exists from AE 24.1, and every call
-// we make has the same signature in Suite4 (AE 13.0+). Keeps early
-// AE 2024 builds working.
 
 // Find an installed effect by exact match name (e.g.
 // "tdcarney EXRDemux"). Returns AEGP_InstalledEffectKey_NONE if not
@@ -275,10 +271,10 @@ A_Err FindInstalledEffectKey(AEGP_SuiteHandler& sp,
     AEGP_InstalledEffectKey key = AEGP_InstalledEffectKey_NONE;
     while (true) {
         AEGP_InstalledEffectKey next = AEGP_InstalledEffectKey_NONE;
-        if (sp.EffectSuite4()->AEGP_GetNextInstalledEffect(key, &next)) break;
+        if (sp.EffectSuite5()->AEGP_GetNextInstalledEffect(key, &next)) break;
         if (next == AEGP_InstalledEffectKey_NONE) break;
         char mn[AEGP_MAX_EFFECT_MATCH_NAME_SIZE] = {0};
-        sp.EffectSuite4()->AEGP_GetEffectMatchName(next, mn);
+        sp.EffectSuite5()->AEGP_GetEffectMatchName(next, mn);
         if (std::strcmp(mn, match_name_utf8) == 0) {
             *out_key = next;
             return A_Err_NONE;
@@ -729,7 +725,7 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
         if (ctx.demux_key != AEGP_InstalledEffectKey_NONE &&
             !ctx.movie_source_ids.count(source_id)) {
             AEGP_EffectRefH effect = nullptr;
-            if (!sp.EffectSuite4()->AEGP_ApplyEffect(
+            if (!sp.EffectSuite5()->AEGP_ApplyEffect(
                     ctx.plugin_id, layer, ctx.demux_key, &effect) &&
                 effect)
             {
@@ -744,13 +740,13 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
                 const double lo = static_cast<double>(h32 & 0xFFFF);
                 SetEffectFloatParam(sp, ctx.plugin_id, effect, 3, hi);
                 SetEffectFloatParam(sp, ctx.plugin_id, effect, 4, lo);
-                sp.EffectSuite4()->AEGP_DisposeEffect(effect);
+                sp.EffectSuite5()->AEGP_DisposeEffect(effect);
             }
         }
 
         if (ctx.exposure_key != AEGP_InstalledEffectKey_NONE) {
             AEGP_EffectRefH expo = nullptr;
-            if (!sp.EffectSuite4()->AEGP_ApplyEffect(
+            if (!sp.EffectSuite5()->AEGP_ApplyEffect(
                     ctx.plugin_id, layer, ctx.exposure_key, &expo) &&
                 expo)
             {
@@ -765,7 +761,7 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
                                        t2, chase.timing.gamma_baseline);
                     sp.StreamSuite6()->AEGP_DisposeStream(gamma);
                 }
-                sp.EffectSuite4()->AEGP_DisposeEffect(expo);
+                sp.EffectSuite5()->AEGP_DisposeEffect(expo);
             }
         }
     };
@@ -895,7 +891,7 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
         if (ctx.demux_key != AEGP_InstalledEffectKey_NONE &&
             !ctx.movie_source_ids.count(source_id)) {
             AEGP_EffectRefH effect = nullptr;
-            if (!sp.EffectSuite4()->AEGP_ApplyEffect(
+            if (!sp.EffectSuite5()->AEGP_ApplyEffect(
                     ctx.plugin_id, layer, ctx.demux_key, &effect) &&
                 effect)
             {
@@ -910,13 +906,13 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
                 const double lo = static_cast<double>(h32 & 0xFFFF);
                 SetEffectFloatParam(sp, ctx.plugin_id, effect, 3, hi);
                 SetEffectFloatParam(sp, ctx.plugin_id, effect, 4, lo);
-                sp.EffectSuite4()->AEGP_DisposeEffect(effect);
+                sp.EffectSuite5()->AEGP_DisposeEffect(effect);
             }
         }
 
         if (ctx.exposure_key != AEGP_InstalledEffectKey_NONE) {
             AEGP_EffectRefH expo = nullptr;
-            if (!sp.EffectSuite4()->AEGP_ApplyEffect(
+            if (!sp.EffectSuite5()->AEGP_ApplyEffect(
                     ctx.plugin_id, layer, ctx.exposure_key, &expo) &&
                 expo)
             {
@@ -928,7 +924,7 @@ A_Err BuildOneChase(AEGP_SuiteHandler& sp,
                     BakeKeyframes(sp, gamma, gm_kf);
                     sp.StreamSuite6()->AEGP_DisposeStream(gamma);
                 }
-                sp.EffectSuite4()->AEGP_DisposeEffect(expo);
+                sp.EffectSuite5()->AEGP_DisposeEffect(expo);
             }
         }
     };

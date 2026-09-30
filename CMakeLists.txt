@@ -11,12 +11,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Static CRT (/MT or /MTd), matching the x64-windows-static vcpkg
-# triplet. AE 2024 ships its own 2019-era msvcp140.dll next to
-# AfterFX.exe, and a dynamic-CRT .aex from a newer toolset resolves to
-# that old copy and crashes AE at startup. Linking the CRT in means the
-# plugin never depends on whichever runtime a given AE version bundles.
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+# Match vcpkg's runtime: dynamic CRT (/MD or /MDd).
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 # macOS deployment target. arm64 minimum is 11.0 (Big Sur, first OS
 # with Apple Silicon support). Must match VCPKG_OSX_DEPLOYMENT_TARGET
@@ -276,7 +272,6 @@ if(WIN32)
     set(CHASEMAKER_AE_PLUGIN_DIRS
         "C:/Program Files/Adobe/Adobe After Effects 2026/Support Files/Plug-ins/ChaseMaker"
         "C:/Program Files/Adobe/Adobe After Effects 2025/Support Files/Plug-ins/ChaseMaker"
-        "C:/Program Files/Adobe/Adobe After Effects 2024/Support Files/Plug-ins/ChaseMaker"
         CACHE STRING
         "Semicolon-separated AE plug-ins subdirectories to drop ChaseMaker.aex into after each build.")
 
